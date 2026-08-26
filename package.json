@@ -1,0 +1,15 @@
+{
+  "name": "s2d-crm",
+  "version": "1.0.0",
+  "description": "Shelves to Drawers RVA - CRM: funnel, texting, self-serve booking, job status tracking, basic finances. Zero external dependencies - pure Node.js core modules.",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "seed": "node src/db/seed.js"
+  },
+  "dependencies": {}
+}
