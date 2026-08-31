@@ -8,6 +8,10 @@ const HOURS_END = Number(process.env.BUSINESS_HOURS_END || 17);
 const BUSINESS_DAYS = (process.env.BUSINESS_DAYS || '1,2,3,4,5').split(',').map(Number); // 0=Sun..6=Sat
 const SLOT_MINUTES = Number(process.env.SLOT_MINUTES || 60);
 const BOOKING_WINDOW_DAYS = Number(process.env.BOOKING_WINDOW_DAYS || 14);
+// Keep the day picker from looking wide-open: don't offer anything sooner than
+// this many days out, and cap how many day-options show per calendar week.
+const BOOKING_MIN_LEAD_DAYS = Number(process.env.BOOKING_MIN_LEAD_DAYS || 4);
+const BOOKING_MAX_DAYS_PER_WEEK = Number(process.env.BOOKING_MAX_DAYS_PER_WEEK || 3);
 
 function pad(n) {
   return String(n).padStart(2, '0');
@@ -17,12 +21,23 @@ function dateKey(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function weekStartKey(d) {
+  const sunday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - d.getDay());
+  return dateKey(sunday);
+}
+
 function upcomingBusinessDays() {
   const days = [];
   const now = new Date();
-  for (let i = 0; days.length < BOOKING_WINDOW_DAYS && i < BOOKING_WINDOW_DAYS + 14; i++) {
+  const weekCounts = new Map();
+  for (let i = BOOKING_MIN_LEAD_DAYS; days.length < BOOKING_WINDOW_DAYS && i < BOOKING_MIN_LEAD_DAYS + 90; i++) {
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
-    if (BUSINESS_DAYS.includes(d.getDay())) days.push(d);
+    if (!BUSINESS_DAYS.includes(d.getDay())) continue;
+    const wk = weekStartKey(d);
+    const count = weekCounts.get(wk) || 0;
+    if (count >= BOOKING_MAX_DAYS_PER_WEEK) continue;
+    weekCounts.set(wk, count + 1);
+    days.push(d);
   }
   return days;
 }
@@ -51,24 +66,213 @@ function slotsForDate(dateStr, durationMin) {
 
 function durationForType(type) {
   const map = {
-    'Free Consultation': 30,
-    'In-Home Measure': 60,
+    'Short Design Consultation': 60,
+    'Long Design Consultation': 120,
     'Design Review': 45,
+    'Repair or Warranty': 60,
     Install: 240,
   };
   return map[type] || 60;
 }
 
+// Options that don't need a calendar slot at all - handled as a quick request instead of a booking.
+const REQUEST_TYPES = ['Callback by Owner', 'More Info by Email'];
+
+const TYPE_DESCRIPTIONS = {
+  'Short Design Consultation': 'Up to 1 hour. Best if you already know what you want and mainly need a quote.',
+  'Long Design Consultation': 'For larger spaces, multiple rooms, complications, highly custom work, or a design with a free organizational plan.',
+  'Design Review': 'Reviewing a proposed design before moving forward.',
+  'Repair or Warranty': 'Already a customer and need something fixed or covered under warranty.',
+  'Callback by Owner': 'Skip scheduling - Andrew calls you back directly.',
+  'More Info by Email': 'Skip scheduling - get details by email, no call needed.',
+};
+
+// Public-facing order: schedulable types (minus internal-only "Install"), then the two quick-request options.
+const PUBLIC_TYPE_ORDER = [...db.APPT_TYPES.filter((t) => t !== 'Install'), ...REQUEST_TYPES];
+
+// ---------- 5-question discovery wizard (asked on every booking / request form) ----------
+const ROOM_OPTIONS = ['Kitchen', 'Bathroom(s)', 'Garage', 'Shop', 'Studio', 'Commercial', 'Hidden kick-panel', 'Closet'];
+
+const PRODUCT_LIST = [
+  'Pull-out shelves',
+  'Premium hardwood pull-out shelves',
+  'Blind corner',
+  'Lazy Susan corner',
+  'Adjustable pantry pull-out',
+  'Under sink options',
+  'Bathroom options',
+  'Spice options',
+  'Tray options',
+  'Deeper drawers',
+  'LED cabinet lighting',
+  'Backsplash',
+  'Paint and/or new doors',
+  'Cabinet modification',
+  'Soft close hinge replacement',
+  'Soft close rail upgrade to existing drawers',
+  'Trash can pull-outs',
+  'Organizing services',
+  'Entry door refinish',
+  'Kick panel secret drawer',
+  'Not sure yet - show me what you recommend',
+];
+
+function discoveryWizard(summaryHtml, skipLabel) {
+  return `
+    <div class="wizard">
+      ${summaryHtml ? `<div class="wizard-summary">${summaryHtml}</div>` : ''}
+      <div class="wizard-progress">Question <span id="wq-num">1</span> of 5</div>
+
+      <div class="wizard-step" data-step="1">
+        <label>1. Where are you looking to make a change? (choose all that apply)</label>
+        <div class="checkbox-grid">
+          ${ROOM_OPTIONS.map(
+            (r) => `<label class="checkbox-item"><input type="checkbox" name="rooms" value="${escapeHtml(r)}"> ${escapeHtml(r)}</label>`
+          ).join('')}
+        </div>
+      </div>
+
+      <div class="wizard-step" data-step="2" hidden>
+        <label>2. Do you have any pets?</label>
+        <div class="radio-row">
+          <label class="checkbox-item"><input type="radio" name="has_pets" value="Yes" onchange="wqToggle('pets-detail', true)"> Yes</label>
+          <label class="checkbox-item"><input type="radio" name="has_pets" value="No" onchange="wqToggle('pets-detail', false)" checked> No</label>
+        </div>
+        <div id="pets-detail" hidden style="margin-top:10px">
+          <label>OK if we bring a treat?</label>
+          <div class="radio-row">
+            <label class="checkbox-item"><input type="radio" name="pet_treat_ok" value="Yes"> Yes</label>
+            <label class="checkbox-item"><input type="radio" name="pet_treat_ok" value="No"> No</label>
+          </div>
+          <label>Pet name(s) and breed(s)</label>
+          <input type="text" name="pet_details" placeholder="e.g. Biscuit, Lab mix">
+        </div>
+      </div>
+
+      <div class="wizard-step" data-step="3" hidden>
+        <label>3. Have you had pull-out shelves before?</label>
+        <div class="radio-row">
+          <label class="checkbox-item"><input type="radio" name="had_pullouts" value="Yes" onchange="wqToggle('pullout-detail', true)"> Yes</label>
+          <label class="checkbox-item"><input type="radio" name="had_pullouts" value="No" onchange="wqToggle('pullout-detail', false)" checked> No</label>
+        </div>
+        <div id="pullout-detail" hidden style="margin-top:10px">
+          <label>What did you like about them?</label>
+          <input type="text" name="pullout_liked">
+          <label>What didn't you like?</label>
+          <input type="text" name="pullout_disliked">
+        </div>
+      </div>
+
+      <div class="wizard-step" data-step="4" hidden>
+        <label>4. Which products would you like us to show you at your appointment? (choose all that apply)</label>
+        <div class="checkbox-grid">
+          ${PRODUCT_LIST.map(
+            (p) => `<label class="checkbox-item"><input type="checkbox" name="products" value="${escapeHtml(p)}"> ${escapeHtml(p)}</label>`
+          ).join('')}
+        </div>
+        <p class="subtitle" style="margin:8px 0 0">Picking several? A Long Design Consultation gives enough time to cover it all.</p>
+      </div>
+
+      <div class="wizard-step" data-step="5" hidden>
+        <label>5. Anything else we should know?</label>
+        <textarea name="notes"></textarea>
+      </div>
+
+      <div class="wizard-nav">
+        <button type="button" class="btn secondary" id="wq-back" onclick="wqNav(-1)" hidden>Back</button>
+        <button type="button" class="btn" id="wq-next" onclick="wqNav(1)">Next</button>
+      </div>
+      <div class="wizard-skip">
+        <button type="submit" class="btn-link">${escapeHtml(skipLabel || 'Skip all of this and continue')}</button>
+      </div>
+    </div>
+    <script>
+      (function() {
+        var step = 1;
+        var total = 5;
+        function show() {
+          document.querySelectorAll('.wizard-step').forEach(function(el) {
+            el.hidden = Number(el.dataset.step) !== step;
+          });
+          document.getElementById('wq-num').textContent = step;
+          document.getElementById('wq-back').hidden = step === 1;
+          var nextBtn = document.getElementById('wq-next');
+          var submitBtn = document.getElementById('wq-submit');
+          if (step === total) { nextBtn.hidden = true; submitBtn.hidden = false; }
+          else { nextBtn.hidden = false; submitBtn.hidden = true; }
+        }
+        window.wqNav = function(delta) {
+          step = Math.min(total, Math.max(1, step + delta));
+          show();
+        };
+        window.wqToggle = function(id, on) {
+          document.getElementById(id).hidden = !on;
+        };
+        show();
+      })();
+    </script>`;
+}
+
+function discoveryFromBody(body) {
+  const rooms = [].concat(body.rooms || []).filter(Boolean);
+  const products = [].concat(body.products || []).filter(Boolean);
+  const parts = [];
+  if (rooms.length) parts.push(`Rooms: ${rooms.join(', ')}`);
+  if (body.has_pets === 'Yes') {
+    parts.push(`Pets: yes${body.pet_details ? ' (' + body.pet_details + ')' : ''}, treat OK: ${body.pet_treat_ok || 'unspecified'}`);
+  }
+  if (body.had_pullouts === 'Yes') {
+    parts.push(`Prior pull-outs: liked "${body.pullout_liked || ''}", disliked "${body.pullout_disliked || ''}"`);
+  }
+  if (products.length) parts.push(`Interested in: ${products.join(', ')}`);
+  if (body.notes) parts.push(body.notes);
+  return { rooms, notesWithDiscovery: parts.join(' | ') };
+}
+
 function register(router) {
   router.get('/book', (req, res) => {
-    const type = req.query.type || db.APPT_TYPES[0];
+    const type = req.query.type || PUBLIC_TYPE_ORDER[0];
     const dateSel = req.query.date || '';
-    const days = upcomingBusinessDays();
+    const isRequestType = REQUEST_TYPES.includes(type);
+    const days = isRequestType ? [] : upcomingBusinessDays();
     const duration = durationForType(type);
 
-    const typeOptions = db.APPT_TYPES.map(
-      (t) => `<a class="btn ${t === type ? '' : 'secondary'} small" href="/book?type=${encodeURIComponent(t)}" style="margin:0 6px 6px 0">${t}</a>`
-    ).join('');
+    const typeOptions = PUBLIC_TYPE_ORDER.map((t) => {
+      const selected = t === type;
+      const prominent = t === 'Short Design Consultation';
+      const cls = ['type-card', prominent ? 'featured' : '', selected ? 'selected' : ''].filter(Boolean).join(' ');
+      return `
+        <a class="${cls}" href="/book?type=${encodeURIComponent(t)}">
+          <span class="type-name">${escapeHtml(t)}</span>${prominent ? '<span class="type-tag">Most popular</span>' : ''}
+          <div class="type-desc">${escapeHtml(TYPE_DESCRIPTIONS[t] || '')}</div>
+        </a>`;
+    }).join('');
+
+    if (isRequestType) {
+      const body = `
+        <div class="public-hero">
+          <h1>Let's Get Started</h1>
+          <div class="rule"></div>
+          <p class="subtitle">Pick a service. No account needed.</p>
+        </div>
+        <div class="panel">
+          <h3 style="margin-top:0">1. What do you need?</h3>
+          ${typeOptions}
+        </div>
+        <div class="panel">
+          <h3 style="margin-top:0">2. Your info</h3>
+          <form method="POST" action="/book/request">
+            <input type="hidden" name="type" value="${escapeHtml(type)}">
+            <label>Name *</label><input type="text" name="name" required>
+            <label>Phone *</label><input type="tel" name="phone" required placeholder="(804) 555-0100">
+            <label>Email</label><input type="email" name="email">
+            ${discoveryWizard(`${escapeHtml(type)} with <strong>Andrew</strong>`, 'Skip all of this and submit request')}
+            <div style="margin-top:14px"><button class="btn" id="wq-submit" type="submit" hidden>Submit request</button></div>
+          </form>
+        </div>
+      `;
+      return res.send(publicLayout({ title: 'Request info', body }));
+    }
 
     const dayButtons = days
       .map((d) => {
@@ -94,7 +298,8 @@ function register(router) {
 
     const body = `
       <div class="public-hero">
-        <h1>Book with ${escapeHtml(BUSINESS_NAME)}</h1>
+        <h1>Let's Get Started</h1>
+        <div class="rule"></div>
         <p class="subtitle">Pick a service, a day, then a time. No account needed.</p>
       </div>
       <div class="panel">
@@ -127,8 +332,11 @@ function register(router) {
           <label>Name *</label><input type="text" name="name" required>
           <label>Phone *</label><input type="tel" name="phone" required placeholder="(804) 555-0100">
           <label>Email</label><input type="email" name="email">
-          <label>Anything we should know?</label><textarea name="notes"></textarea>
-          <div style="margin-top:14px"><button class="btn" type="submit">Confirm booking</button></div>
+          ${discoveryWizard(
+            `${escapeHtml(type)} with <strong>Andrew</strong><br>${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
+            'Skip all of this and confirm appointment'
+          )}
+          <div style="margin-top:14px"><button class="btn" id="wq-submit" type="submit" hidden>Confirm booking</button></div>
         </form>
         <p class="subtitle" style="margin-top:10px"><a href="/book">&larr; pick a different time</a></p>
       </div>
@@ -137,16 +345,17 @@ function register(router) {
   });
 
   router.post('/book', async (req, res) => {
-    const { type, date, time, name, phone, email, notes } = req.body;
+    const { type, date, time, name, phone, email } = req.body;
     if (!name || !phone || !date || !time) {
       return res.send(publicLayout({ title: 'Booking error', body: `<div class="panel"><p>Missing required info. <a href="/book">Start over</a>.</p></div>` }));
     }
     const phoneNorm = normalizePhone(phone);
     const emailVal = isValidEmail(email) ? email : null;
+    const { notesWithDiscovery } = discoveryFromBody(req.body);
 
     let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
     if (!customer) {
-      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, notes });
+      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, notes: notesWithDiscovery });
     }
     // Make sure this customer is represented in the funnel.
     const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
@@ -161,7 +370,7 @@ function register(router) {
       type,
       scheduled_at: scheduledAt,
       duration_min: duration,
-      notes,
+      notes: notesWithDiscovery,
     });
 
     try {
@@ -181,6 +390,40 @@ function register(router) {
       </div>
     `;
     res.send(publicLayout({ title: 'Booked', body }));
+  });
+
+  router.post('/book/request', async (req, res) => {
+    const { type, name, phone, email } = req.body;
+    if (!name || !phone || !REQUEST_TYPES.includes(type)) {
+      return res.send(publicLayout({ title: 'Request error', body: `<div class="panel"><p>Missing required info. <a href="/book">Start over</a>.</p></div>` }));
+    }
+    const phoneNorm = normalizePhone(phone);
+    const emailVal = isValidEmail(email) ? email : null;
+    const { notesWithDiscovery } = discoveryFromBody(req.body);
+    const combinedNotes = [`[${type}]`, notesWithDiscovery].filter(Boolean).join(' ').trim();
+
+    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
+    if (!customer) {
+      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, notes: combinedNotes });
+    }
+    const lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: type, notes: combinedNotes });
+
+    try {
+      await automations.onLeadCreated(lead, customer);
+    } catch (e) {
+      console.error('onLeadCreated failed', e);
+    }
+
+    const body = `
+      <div class="public-hero">
+        <h1>Got it!</h1>
+        <p class="subtitle">${escapeHtml(type)}</p>
+      </div>
+      <div class="panel">
+        <p>${type === 'Callback by Owner' ? "Andrew will call you back directly." : "We'll send details to your email."} We received: ${escapeHtml(notesWithDiscovery || '(no additional notes)')}</p>
+      </div>
+    `;
+    res.send(publicLayout({ title: 'Request received', body }));
   });
 
   // ---------- Public job status page ----------
