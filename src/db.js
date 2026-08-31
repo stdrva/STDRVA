@@ -131,6 +131,17 @@ CREATE TABLE IF NOT EXISTS product_options (
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS customer_files (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id),
+  stored_name TEXT NOT NULL,
+  original_name TEXT NOT NULL,
+  mime_type TEXT,
+  size INTEGER NOT NULL DEFAULT 0,
+  note TEXT,
+  created_at TEXT NOT NULL
+);
 `);
 
 // ---- Migration: add structured spec columns to products (safe to run on an
@@ -505,6 +516,27 @@ function getProductHistory(product_id) {
   return db.prepare(`SELECT * FROM product_status_history WHERE product_id = ? ORDER BY created_at ASC`).all(product_id);
 }
 
+// ---- Customer files ----
+// Actual bytes live on disk under DATA_DIR/uploads/<customer_id>/<stored_name>
+// (see UPLOADS_DIR below); this table just tracks the metadata so it can be
+// listed/served/deleted per customer.
+function createCustomerFile({ customer_id, stored_name, original_name, mime_type, size, note }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO customer_files (id, customer_id, stored_name, original_name, mime_type, size, note, created_at) VALUES (?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
+  return id;
+}
+function listCustomerFiles(customer_id) {
+  return db.prepare(`SELECT * FROM customer_files WHERE customer_id = ? ORDER BY created_at DESC`).all(customer_id);
+}
+function getCustomerFile(id) {
+  return db.prepare(`SELECT * FROM customer_files WHERE id = ?`).get(id) || null;
+}
+function deleteCustomerFile(id) {
+  db.prepare(`DELETE FROM customer_files WHERE id = ?`).run(id);
+}
+
 // ---- Messages ----
 function logMessage({ customer_id, direction, channel, body, status }) {
   const id = newId();
@@ -680,6 +712,7 @@ function taxYearSummary(year) {
 
 module.exports = {
   db,
+  DATA_DIR,
   LEAD_STAGES,
   JOB_STAGES,
   APPT_TYPES,
@@ -720,6 +753,10 @@ module.exports = {
   listAllProductOptionsGrouped,
   createProductOption,
   deleteProductOption,
+  createCustomerFile,
+  listCustomerFiles,
+  getCustomerFile,
+  deleteCustomerFile,
   logMessage,
   listMessagesForCustomer,
   listRecentMessages,
