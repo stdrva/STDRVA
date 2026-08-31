@@ -2,6 +2,7 @@ const db = require('../db');
 const { dashboardLayout, flashFromQuery } = require('../render');
 const { escapeHtml, fmtMoney, fmtDate, fmtDateTime, normalizePhone, newId } = require('../util');
 const automations = require('../services/automations');
+const assistant = require('../services/assistant');
 
 function stageBadgeClass(stage) {
   return { 'New Lead': 'new', Contacted: 'contacted', Quoted: 'quoted', Sold: 'sold', Lost: 'lost' }[stage] || '';
@@ -986,7 +987,19 @@ function register(router, requireAuth) {
         <p class="subtitle">Set via environment variables: BUSINESS_HOURS_START, BUSINESS_HOURS_END, BUSINESS_DAYS, SLOT_MINUTES, BOOKING_WINDOW_DAYS. See README.</p>
       </div>
     `;
-    res.send(dashboardLayout({ title: 'Booking Link', active: '/dashboard/booking-link', body, flash: flashFromQuery(req.query) }));
+        res.send(dashboardLayout({ title: 'Booking Link', active: '/dashboard/booking-link', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // ---------- Office Manager Assistant (BETA - global chat box) ----------
+  router.post('/dashboard/assistant/message', requireAuth, async (req, res) => {
+    const message = (req.body.message || '').trim();
+    const redirectTo = req.body.redirect_to || '/dashboard';
+    if (!message) return res.redirect(`${redirectTo}?err=Type something for the assistant first`);
+
+    const result = await assistant.handleMessage(message);
+    const target = result.changedCustomerId ? `/dashboard/customers/${result.changedCustomerId}` : redirectTo;
+    const param = result.error ? 'err' : 'ok';
+    res.redirect(`${target}?${param}=${encodeURIComponent(result.summary)}`);
   });
 }
 
