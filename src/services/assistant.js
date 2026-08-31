@@ -14,6 +14,22 @@ function assistantConfigured() {
   return !!process.env.ANTHROPIC_API_KEY;
 }
 
+// ---------- Conversation memory ----------
+// Single running conversation, in memory only (resets on server restart/
+// redeploy - there's one admin user, so no per-session tracking needed).
+// Only the clean user/assistant text turns are kept, not the internal
+// tool_use/tool_result blocks - that keeps token growth bounded and avoids
+// ever splitting a tool_use from its matching tool_result when trimming.
+// Each new message still re-runs whatever lookups it needs via the tools,
+// so the underlying data is always fresh even though the conversation
+// itself has memory.
+let conversationHistory = [];
+const MAX_HISTORY_TURNS = 12; // keep last 12 user+assistant exchanges
+
+function resetConversation() {
+  conversationHistory = [];
+}
+
 // ---------- Tool definitions (JSON Schema, per Anthropic's tool-use format) ----------
 const TOOLS = [
   {
@@ -288,7 +304,13 @@ info (e.g. no amount for a payment), ask a short clarifying question instead of 
 Dates the user gives in local time should be treated as US Eastern time and converted to
 UTC ISO 8601 for scheduled_at. When you're done making changes, reply with a short, plain
 summary of exactly what you did (or didn't do), written for Andrew to quickly verify - not
-a chatty conversational reply.`;
+a chatty conversational reply.
+
+You can see the recent conversation, so pronouns and follow-ups ("her", "that job", "do the
+same for the other one") refer back to what was already discussed - use that context instead
+of asking Andrew to repeat himself. That history can go stale, though: always re-check current
+facts (a customer's stage, a job's balance, etc.) with the lookup tools before acting, rather
+than trusting a number or status mentioned earlier in the conversation.`;
 
 // Runs the full tool-use loop for one user message. Returns
 // { summary, changedCustomerId, toolLog } - toolLog is for debugging/display.
@@ -296,15 +318,25 @@ async function handleMessage(userMessage) {
   if (!assistantConfigured()) {
     return { summary: 'AI assistant not configured - set ANTHROPIC_API_KEY to enable it.', error: true };
   }
-  const messages = [{ role: 'user', content: userMessage }];
+  const messages = [...conversationHistory, { role: 'user', content: userMessage }];
   const toolLog = [];
   let changedCustomerId = null;
+
+  function remember(assistantText) {
+    conversationHistory.push({ role: 'user', content: userMessage });
+    conversationHistory.push({ role: 'assistant', content: assistantText });
+    const maxMessages = MAX_HISTORY_TURNS * 2;
+    if (conversationHistory.length > maxMessages) {
+      conversationHistory = conversationHistory.slice(-maxMessages);
+    }
+  }
 
   for (let i = 0; i < 6; i++) {
     let response;
     try {
       response = await callClaude(messages);
     } catch (err) {
+      remember(`(error: ${err.message})`);
       return { summary: `Assistant error: ${err.message}`, error: true, toolLog };
     }
 
@@ -312,6 +344,7 @@ async function handleMessage(userMessage) {
 
     if (response.stop_reason !== 'tool_use') {
       const text = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+      remember(text || '(no response)');
       return { summary: text || '(no response)', changedCustomerId, toolLog };
     }
 
@@ -340,7 +373,8 @@ async function handleMessage(userMessage) {
     messages.push({ role: 'user', content: toolResults });
   }
 
+  remember('(stopped after several steps without a final answer)');
   return { summary: 'Stopped after several steps without a final answer - try rephrasing.', error: true, toolLog };
 }
 
-module.exports = { handleMessage, assistantConfigured };
+module.exports = { handleMessage, assistantConfigured, resetConversation };
