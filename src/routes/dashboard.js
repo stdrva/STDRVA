@@ -1,11 +1,35 @@
+const fs = require('fs');
+const path = require('path');
 const db = require('../db');
 const { dashboardLayout, flashFromQuery } = require('../render');
 const { escapeHtml, fmtMoney, fmtDate, fmtDateTime, normalizePhone, newId } = require('../util');
 const automations = require('../services/automations');
 const assistant = require('../services/assistant');
 
+// Uploaded customer files (photos, measurement docs, contracts) live on the
+// persistent disk under data/uploads/<customer_id>/<generated-name> - never
+// under a web-servable static path, since these are private records only
+// reachable through the authenticated download route below.
+const UPLOADS_DIR = path.join(db.DATA_DIR, 'uploads');
+function customerUploadsDir(customerId) {
+  const dir = path.join(UPLOADS_DIR, customerId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function stageBadgeClass(stage) {
   return { 'New Lead': 'new', Contacted: 'contacted', Quoted: 'quoted', Sold: 'sold', Lost: 'lost' }[stage] || '';
+}
+
+// Renders a <select name="category"> populated from that category's editable
+// option list (see /dashboard/settings/product-options), plus a blank
+// "-- none --" first choice since these specs are all optional.
+function optionSelect(category, selected) {
+  const opts = db.listProductOptions(category);
+  return `<select name="${category}">
+    <option value="">-- none --</option>
+    ${opts.map((o) => `<option value="${escapeHtml(o.code)}" ${o.code === selected ? 'selected' : ''}>${escapeHtml(o.label || o.code)}</option>`).join('')}
+  </select>`;
 }
 
 function register(router, requireAuth) {
@@ -119,6 +143,7 @@ function register(router, requireAuth) {
     const jobs = db.listJobs().filter((j) => j.customer_id === c.id);
     const appts = db.listAppointments().filter((a) => a.customer_id === c.id);
     const messages = db.listMessagesForCustomer(c.id);
+    const files = db.listCustomerFiles(c.id);
 
     const body = `
       <h1>${escapeHtml(c.name)}</h1>
@@ -161,6 +186,32 @@ function register(router, requireAuth) {
               : `<p class="subtitle">No messages yet.</p>`
           }
         </div>
+      </div>
+
+      <div class="panel">
+        <h2 style="margin-top:0">Files</h2>
+        <p class="subtitle">Photos, measurement sheets, contracts - anything for this customer. Only visible here in the dashboard.</p>
+        <form method="POST" action="/dashboard/customers/${c.id}/files" enctype="multipart/form-data">
+          <div class="grid cols-2">
+            <div><label>File</label><input type="file" name="file" required></div>
+            <div><label>Note (optional)</label><input type="text" name="note" placeholder="e.g. kitchen measurements"></div>
+          </div>
+          <div style="margin-top:12px"><button class="btn secondary" type="submit">Upload</button></div>
+        </form>
+        ${
+          files.length
+            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Uploaded</th><th></th></tr>${files
+                .map(
+                  (f) => `<tr>
+                    <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a></td>
+                    <td>${escapeHtml(f.note || '')}</td>
+                    <td>${fmtDateTime(f.created_at)}</td>
+                    <td><form class="inline" method="POST" action="/dashboard/customers/${c.id}/files/${f.id}/delete" onsubmit="return confirm('Delete this file?')"><button class="btn small danger" type="submit">Delete</button></form></td>
+                  </tr>`
+                )
+                .join('')}</table>`
+            : `<p class="subtitle">No files yet.</p>`
+        }
       </div>
 
       <div class="panel">
@@ -220,6 +271,50 @@ function register(router, requireAuth) {
     const { name, phone, email, address, notes } = req.body;
     db.updateCustomer(req.params.id, { name, phone: normalizePhone(phone), email, address, notes });
     res.redirect(`/dashboard/customers/${req.params.id}?ok=Saved`);
+  });
+
+  // ---------- Customer files (photos, measurement docs, contracts) ----------
+  router.post('/dashboard/customers/:id/files', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const upload = (req.files || []).find((f) => f.fieldname === 'file');
+    if (!upload || !upload.filename) {
+      return res.redirect(`/dashboard/customers/${c.id}?err=Choose a file first`);
+    }
+    const ext = path.extname(upload.filename);
+    const storedName = `${newId()}${ext}`;
+    fs.writeFileSync(path.join(customerUploadsDir(c.id), storedName), upload.data);
+    db.createCustomerFile({
+      customer_id: c.id,
+      stored_name: storedName,
+      original_name: upload.filename,
+      mime_type: upload.mimeType,
+      size: upload.data.length,
+      note: req.body.note || null,
+    });
+    res.redirect(`/dashboard/customers/${c.id}?ok=File uploaded`);
+  });
+
+  router.get('/dashboard/customers/:id/files/:fileId', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (!f || f.customer_id !== req.params.id) return res.status(404).send('File not found');
+    const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
+    if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
+    res.writeHead(200, {
+      'Content-Type': f.mime_type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${f.original_name.replace(/"/g, '')}"`,
+    });
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  router.post('/dashboard/customers/:id/files/:fileId/delete', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (f && f.customer_id === req.params.id) {
+      const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
+      fs.existsSync(filePath) && fs.unlinkSync(filePath);
+      db.deleteCustomerFile(f.id);
+    }
+    res.redirect(`/dashboard/customers/${req.params.id}?ok=File deleted`);
   });
 
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {
@@ -486,28 +581,40 @@ function register(router, requireAuth) {
 
       <div class="panel">
         <h2 style="margin-top:0">Factory order - products</h2>
-        <p class="subtitle">Each piece sent to the factory, with its own measurements, deadline, and status. Shows up on the <a href="/dashboard/production">Factory Queue</a> until delivered.</p>
+        <p class="subtitle">Each line sent to the factory, with its own specs, deadline, and status. Shows up on the <a href="/dashboard/production">Factory Queue</a> until delivered. Need a new cabinet type, mount style, rail type, or color in the dropdowns? Add it on the <a href="/dashboard/settings/product-options">Product Options</a> page.</p>
         <form method="POST" action="/dashboard/jobs/${job.id}/products">
-          <div class="grid cols-3">
+          <div class="grid cols-4">
             <div><label>Product / piece name *</label><input type="text" name="name" placeholder="Upper pantry cabinet" required></div>
-            <div><label>Measurements</label><input type="text" name="measurements" placeholder="36&quot;W x 84&quot;H x 24&quot;D"></div>
+            <div><label>Cabinet / product type</label>${optionSelect('cabinet_type', '')}</div>
+            <div><label>Type code</label>${optionSelect('type_code', '')}</div>
+            <div><label>Mount style</label>${optionSelect('mount_style', '')}</div>
+            <div><label>Rail type</label>${optionSelect('rail_type', '')}</div>
+            <div><label>Color</label>${optionSelect('color', '')}</div>
+            <div><label>Divider</label>${optionSelect('divider', '')}</div>
+            <div><label>Opening width (mm)</label><input type="number" step="0.1" name="opening_width_mm"></div>
+            <div><label>Unit price ($)</label><input type="number" step="0.01" name="unit_price"></div>
             <div><label>Quantity</label><input type="number" name="quantity" value="1" min="1"></div>
             <div><label>Deadline</label><input type="date" name="deadline"></div>
             <div><label>Factory / vendor</label><input type="text" name="factory" placeholder="Who's building it"></div>
+            <div><label>Measurements (free text, optional)</label><input type="text" name="measurements" placeholder="36&quot;W x 84&quot;H x 24&quot;D"></div>
             <div><label>Notes</label><input type="text" name="notes"></div>
           </div>
           <div style="margin-top:12px"><button class="btn" type="submit">Add to factory order</button></div>
         </form>
         ${
           products.length
-            ? `<table style="margin-top:16px">
-                <tr><th>Product</th><th>Measurements</th><th>Qty</th><th>Deadline</th><th>Factory</th><th>Status</th></tr>
+            ? `<div style="overflow-x:auto"><table style="margin-top:16px">
+                <tr><th>Product</th><th>Type</th><th>Mount</th><th>Rail</th><th>Color</th><th>Width</th><th>Qty</th><th>Deadline</th><th>Factory</th><th>Status</th></tr>
                 ${products
                   .map((p) => {
                     const overdue = p.deadline && p.status !== 'Delivered' && new Date(p.deadline) < new Date();
                     return `<tr>
-                      <td>${escapeHtml(p.name)}</td>
-                      <td>${escapeHtml(p.measurements || '')}</td>
+                      <td>${escapeHtml(p.name)}${p.cabinet_type ? `<div class="subtitle" style="margin:0">${escapeHtml(p.cabinet_type)}</div>` : ''}${p.measurements ? `<div class="subtitle" style="margin:0">${escapeHtml(p.measurements)}</div>` : ''}</td>
+                      <td>${escapeHtml(p.type_code || '')}</td>
+                      <td>${escapeHtml(p.mount_style || '')}</td>
+                      <td>${escapeHtml(p.rail_type || '')}</td>
+                      <td>${escapeHtml(p.color || '')}</td>
+                      <td>${p.opening_width_mm ? p.opening_width_mm + 'mm' : ''}</td>
                       <td>${p.quantity}</td>
                       <td class="${overdue ? 'overdue' : ''}">${p.deadline ? fmtDate(p.deadline) : ''}${overdue ? ' (overdue)' : ''}</td>
                       <td>${escapeHtml(p.factory || '')}</td>
@@ -522,7 +629,7 @@ function register(router, requireAuth) {
                     </tr>`;
                   })
                   .join('')}
-              </table>`
+              </table></div>`
             : `<p class="subtitle">No products added to this job's factory order yet.</p>`
         }
       </div>
@@ -533,7 +640,22 @@ function register(router, requireAuth) {
   router.post('/dashboard/jobs/:id/products', requireAuth, (req, res) => {
     const job = db.getJob(req.params.id);
     if (!job) return res.status(404).send('Job not found');
-    const { name, measurements, quantity, deadline, factory, notes } = req.body;
+    const {
+      name,
+      measurements,
+      quantity,
+      deadline,
+      factory,
+      notes,
+      cabinet_type,
+      type_code,
+      mount_style,
+      rail_type,
+      color,
+      divider,
+      opening_width_mm,
+      unit_price,
+    } = req.body;
     if (!name) return res.redirect(`/dashboard/jobs/${job.id}?err=Product name is required`);
     db.createProduct({
       job_id: job.id,
@@ -543,6 +665,14 @@ function register(router, requireAuth) {
       factory,
       notes,
       deadline: deadline ? new Date(deadline).toISOString() : undefined,
+      cabinet_type,
+      type_code,
+      mount_style,
+      rail_type,
+      color,
+      divider,
+      opening_width_mm: opening_width_mm ? Number(opening_width_mm) : undefined,
+      unit_price: unit_price ? Number(unit_price) : undefined,
     });
     res.redirect(`/dashboard/jobs/${job.id}?ok=Added to factory order`);
   });
@@ -565,16 +695,20 @@ function register(router, requireAuth) {
       <p class="subtitle">Every product currently on order, across all jobs, soonest deadline first.</p>
       <p class="subtitle">${includeDelivered ? '<a href="/dashboard/production">Hide delivered</a>' : '<a href="/dashboard/production?all=1">Show delivered too</a>'}</p>
       <div class="panel">
-        <table>
-          <tr><th>Deadline</th><th>Customer</th><th>Product</th><th>Measurements</th><th>Qty</th><th>Factory</th><th>Status</th></tr>
+        <div style="overflow-x:auto"><table>
+          <tr><th>Deadline</th><th>Customer</th><th>Product</th><th>Type</th><th>Mount</th><th>Rail</th><th>Color</th><th>Width</th><th>Qty</th><th>Factory</th><th>Status</th></tr>
           ${queue
             .map((p) => {
               const overdue = p.deadline && p.status !== 'Delivered' && new Date(p.deadline) < new Date();
               return `<tr>
                 <td class="${overdue ? 'overdue' : ''}">${p.deadline ? fmtDate(p.deadline) : 'no deadline'}${overdue ? ' (overdue)' : ''}</td>
                 <td><a href="/dashboard/jobs/${p.job_id}">${escapeHtml(p.customer_name)}</a></td>
-                <td>${escapeHtml(p.name)}</td>
-                <td>${escapeHtml(p.measurements || '')}</td>
+                <td>${escapeHtml(p.name)}${p.cabinet_type ? `<div class="subtitle" style="margin:0">${escapeHtml(p.cabinet_type)}</div>` : ''}${p.measurements ? `<div class="subtitle" style="margin:0">${escapeHtml(p.measurements)}</div>` : ''}</td>
+                <td>${escapeHtml(p.type_code || '')}</td>
+                <td>${escapeHtml(p.mount_style || '')}</td>
+                <td>${escapeHtml(p.rail_type || '')}</td>
+                <td>${escapeHtml(p.color || '')}</td>
+                <td>${p.opening_width_mm ? p.opening_width_mm + 'mm' : ''}</td>
                 <td>${p.quantity}</td>
                 <td>${escapeHtml(p.factory || '')}</td>
                 <td>
@@ -588,11 +722,72 @@ function register(router, requireAuth) {
               </tr>`;
             })
             .join('')}
-        </table>
+        </table></div>
         ${queue.length === 0 ? '<p class="subtitle">Nothing in the queue right now.</p>' : ''}
       </div>
     `;
     res.send(dashboardLayout({ title: 'Factory Queue', active: '/dashboard/production', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // ---------- Product Options (editable dropdown lists) ----------
+  router.get('/dashboard/settings/product-options', requireAuth, (req, res) => {
+    const grouped = db.listAllProductOptionsGrouped();
+    const body = `
+      <h1>Product Options</h1>
+      <p class="subtitle">These are the dropdown choices on the factory order form (Job page). Add whatever your factory actually offers - mount styles, rail types, colors, cabinet types, dividers - no code changes needed.</p>
+      <div class="grid cols-2">
+        ${db.PRODUCT_OPTION_CATEGORIES.map((cat) => {
+          const opts = grouped[cat.key] || [];
+          return `<div class="panel">
+            <h2 style="margin-top:0">${escapeHtml(cat.label)}</h2>
+            <form method="POST" action="/dashboard/settings/product-options">
+              <input type="hidden" name="category" value="${cat.key}">
+              <div class="grid cols-2">
+                <div><label>Code *</label><input type="text" name="code" placeholder="e.g. FE" required></div>
+                <div><label>Display label</label><input type="text" name="label" placeholder="optional, defaults to code"></div>
+              </div>
+              <div style="margin-top:10px"><button class="btn small" type="submit">Add</button></div>
+            </form>
+            ${
+              opts.length
+                ? `<table style="margin-top:14px">
+                    <tr><th>Code</th><th>Label</th><th></th></tr>
+                    ${opts
+                      .map(
+                        (o) => `<tr>
+                          <td>${escapeHtml(o.code)}</td>
+                          <td>${escapeHtml(o.label || '')}</td>
+                          <td>
+                            <form method="POST" action="/dashboard/settings/product-options/${o.id}/delete" style="margin:0">
+                              <input type="hidden" name="return_to" value="/dashboard/settings/product-options">
+                              <button class="btn small danger" type="submit">Remove</button>
+                            </form>
+                          </td>
+                        </tr>`
+                      )
+                      .join('')}
+                  </table>`
+                : `<p class="subtitle">No options yet.</p>`
+            }
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Product Options', active: '/dashboard/settings/product-options', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/settings/product-options', requireAuth, (req, res) => {
+    const { category, code, label } = req.body;
+    if (!category || !code) return res.redirect(`/dashboard/settings/product-options?err=Category and code are required`);
+    db.createProductOption({ category, code, label });
+    res.redirect(`/dashboard/settings/product-options?ok=Option added`);
+  });
+
+  router.post('/dashboard/settings/product-options/:id/delete', requireAuth, (req, res) => {
+    db.deleteProductOption(req.params.id);
+    const base = req.body.return_to || '/dashboard/settings/product-options';
+    const sep = base.includes('?') ? '&' : '?';
+    res.redirect(`${base}${sep}ok=Option removed`);
   });
 
   router.post('/dashboard/jobs/:id/status', requireAuth, async (req, res) => {
@@ -987,7 +1182,7 @@ function register(router, requireAuth) {
         <p class="subtitle">Set via environment variables: BUSINESS_HOURS_START, BUSINESS_HOURS_END, BUSINESS_DAYS, SLOT_MINUTES, BOOKING_WINDOW_DAYS. See README.</p>
       </div>
     `;
-        res.send(dashboardLayout({ title: 'Booking Link', active: '/dashboard/booking-link', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: 'Booking Link', active: '/dashboard/booking-link', body, flash: flashFromQuery(req.query) }));
   });
 
   // ---------- Office Manager Assistant (BETA - global chat box) ----------
@@ -1000,6 +1195,12 @@ function register(router, requireAuth) {
     const target = result.changedCustomerId ? `/dashboard/customers/${result.changedCustomerId}` : redirectTo;
     const param = result.error ? 'err' : 'ok';
     res.redirect(`${target}?${param}=${encodeURIComponent(result.summary)}`);
+  });
+
+  router.post('/dashboard/assistant/reset', requireAuth, (req, res) => {
+    assistant.resetConversation();
+    const redirectTo = req.body.redirect_to || '/dashboard';
+    res.redirect(`${redirectTo}?ok=Assistant conversation cleared`);
   });
 }
 
