@@ -1,0 +1,9 @@
+node_modules/
+.env
+data/*.sqlite3
+data/*.sqlite3-*
+*.log
+data/*.xlsx
+data/*.md
+data/*.html
+data/*.txt
