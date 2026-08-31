@@ -106,7 +106,8 @@ const PRODUCT_LIST = [
   'Deeper drawers',
   'LED cabinet lighting',
   'Backsplash',
-  'Paint and/or new doors',
+  'Paint Cabinets',
+  'New Cabinet Doors',
   'Cabinet modification',
   'Soft close hinge replacement',
   'Soft close rail upgrade to existing drawers',
@@ -117,7 +118,7 @@ const PRODUCT_LIST = [
   'Not sure yet - show me what you recommend',
 ];
 
-function discoveryWizard(summaryHtml, skipLabel) {
+function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
   return `
     <div class="wizard">
       ${summaryHtml ? `<div class="wizard-summary">${summaryHtml}</div>` : ''}
@@ -181,6 +182,7 @@ function discoveryWizard(summaryHtml, skipLabel) {
       <div class="wizard-nav">
         <button type="button" class="btn secondary" id="wq-back" onclick="wqNav(-1)" hidden>Back</button>
         <button type="button" class="btn" id="wq-next" onclick="wqNav(1)">Next</button>
+        <button type="submit" class="btn" id="wq-submit" hidden>${escapeHtml(submitLabel || 'Submit')}</button>
       </div>
       <div class="wizard-skip">
         <button type="submit" class="btn-link">${escapeHtml(skipLabel || 'Skip all of this and continue')}</button>
@@ -194,19 +196,22 @@ function discoveryWizard(summaryHtml, skipLabel) {
           document.querySelectorAll('.wizard-step').forEach(function(el) {
             el.hidden = Number(el.dataset.step) !== step;
           });
-          document.getElementById('wq-num').textContent = step;
-          document.getElementById('wq-back').hidden = step === 1;
+          var numEl = document.getElementById('wq-num');
+          var backBtn = document.getElementById('wq-back');
           var nextBtn = document.getElementById('wq-next');
           var submitBtn = document.getElementById('wq-submit');
-          if (step === total) { nextBtn.hidden = true; submitBtn.hidden = false; }
-          else { nextBtn.hidden = false; submitBtn.hidden = true; }
+          if (numEl) numEl.textContent = step;
+          if (backBtn) backBtn.hidden = step === 1;
+          if (nextBtn) nextBtn.hidden = step === total;
+          if (submitBtn) submitBtn.hidden = step !== total;
         }
         window.wqNav = function(delta) {
           step = Math.min(total, Math.max(1, step + delta));
           show();
         };
         window.wqToggle = function(id, on) {
-          document.getElementById(id).hidden = !on;
+          var el = document.getElementById(id);
+          if (el) el.hidden = !on;
         };
         show();
       })();
@@ -260,14 +265,14 @@ function register(router) {
           ${typeOptions}
         </div>
         <div class="panel">
-          <h3 style="margin-top:0">2. Your info</h3>
-          <form method="POST" action="/book/request">
+          <h3 style="margin-top:0">2. What do you want to know?</h3>
+          <form method="POST" action="/book/request" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
             <input type="hidden" name="type" value="${escapeHtml(type)}">
+            <textarea name="notes" placeholder="Tell us what you're looking for..." rows="4"></textarea>
             <label>Name *</label><input type="text" name="name" required>
             <label>Phone *</label><input type="tel" name="phone" required placeholder="(804) 555-0100">
             <label>Email</label><input type="email" name="email">
-            ${discoveryWizard(`${escapeHtml(type)} with <strong>Andrew</strong>`, 'Skip all of this and submit request')}
-            <div style="margin-top:14px"><button class="btn" id="wq-submit" type="submit" hidden>Submit request</button></div>
+            <div style="margin-top:14px"><button class="btn" type="submit">${type === 'Callback by Owner' ? 'Request a callback' : 'Submit request'}</button></div>
           </form>
         </div>
       `;
@@ -325,7 +330,7 @@ function register(router) {
         <p class="subtitle">${escapeHtml(type)} &middot; ${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
       </div>
       <div class="panel">
-        <form method="POST" action="/book">
+        <form method="POST" action="/book" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
           <input type="hidden" name="type" value="${escapeHtml(type)}">
           <input type="hidden" name="date" value="${escapeHtml(date)}">
           <input type="hidden" name="time" value="${escapeHtml(time)}">
@@ -334,9 +339,9 @@ function register(router) {
           <label>Email</label><input type="email" name="email">
           ${discoveryWizard(
             `${escapeHtml(type)} with <strong>Andrew</strong><br>${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
-            'Skip all of this and confirm appointment'
+            'Skip all of this and confirm appointment',
+            'Confirm booking'
           )}
-          <div style="margin-top:14px"><button class="btn" id="wq-submit" type="submit" hidden>Confirm booking</button></div>
         </form>
         <p class="subtitle" style="margin-top:10px"><a href="/book">&larr; pick a different time</a></p>
       </div>
@@ -364,19 +369,28 @@ function register(router) {
 
     const scheduledAt = new Date(`${date}T${time}:00`).toISOString();
     const duration = durationForType(type);
-    const appt = db.createAppointment({
-      customer_id: customer.id,
-      lead_id: lead.id,
-      type,
-      scheduled_at: scheduledAt,
-      duration_min: duration,
-      notes: notesWithDiscovery,
-    });
 
-    try {
-      await automations.onAppointmentBooked(appt, customer);
-    } catch (e) {
-      console.error('onAppointmentBooked failed', e);
+    // Idempotency guard: a double-click, slow-network retry, or a resubmit via
+    // the browser's back button can all fire this same POST twice. If this
+    // customer already has an appointment at this exact time/type, treat the
+    // resubmit as a no-op instead of creating a duplicate.
+    let appt = db
+      .listAppointments()
+      .find((a) => a.customer_id === customer.id && a.scheduled_at === scheduledAt && a.type === type);
+    if (!appt) {
+      appt = db.createAppointment({
+        customer_id: customer.id,
+        lead_id: lead.id,
+        type,
+        scheduled_at: scheduledAt,
+        duration_min: duration,
+        notes: notesWithDiscovery,
+      });
+      try {
+        await automations.onAppointmentBooked(appt, customer);
+      } catch (e) {
+        console.error('onAppointmentBooked failed', e);
+      }
     }
 
     const body = `
@@ -406,12 +420,21 @@ function register(router) {
     if (!customer) {
       customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, notes: combinedNotes });
     }
-    const lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: type, notes: combinedNotes });
 
-    try {
-      await automations.onLeadCreated(lead, customer);
-    } catch (e) {
-      console.error('onLeadCreated failed', e);
+    // Idempotency guard: same reasoning as the appointment booking route -
+    // a resubmit within the last 5 minutes with identical notes is treated
+    // as a duplicate, not a second request.
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    let lead = db
+      .listLeads()
+      .find((l) => l.customer_id === customer.id && l.source === type && l.notes === combinedNotes && l.created_at >= fiveMinAgo);
+    if (!lead) {
+      lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: type, notes: combinedNotes });
+      try {
+        await automations.onLeadCreated(lead, customer);
+      } catch (e) {
+        console.error('onLeadCreated failed', e);
+      }
     }
 
     const body = `
