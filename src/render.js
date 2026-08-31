@@ -1,6 +1,12 @@
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
 
+const FAVICON_TAGS = `
+<link rel="icon" type="image/x-icon" href="/static/img/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/img/favicon-16.png">
+<link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">`;
+
 function dashboardLayout({ title, active, body, flash }) {
   const nav = [
     ['/dashboard', 'Overview'],
@@ -19,6 +25,7 @@ function dashboardLayout({ title, active, body, flash }) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title ? title + ' - ' : ''}${BUSINESS_NAME} CRM</title>
+${FAVICON_TAGS}
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -66,6 +73,7 @@ function publicLayout({ title, body }) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title ? title + ' - ' : ''}${BUSINESS_NAME}</title>
+${FAVICON_TAGS}
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
