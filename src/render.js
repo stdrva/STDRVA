@@ -1,4 +1,5 @@
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
+const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
 
 function dashboardLayout({ title, active, body, flash }) {
   const nav = [
@@ -8,6 +9,7 @@ function dashboardLayout({ title, active, body, flash }) {
     ['/dashboard/appointments', 'Appointments'],
     ['/dashboard/jobs', 'Jobs'],
     ['/dashboard/production', 'Factory Queue'],
+    ['/dashboard/settings/product-options', 'Product Options'],
     ['/dashboard/finances', 'Bookkeeping'],
     ['/dashboard/booking-link', 'Booking Link / QR'],
   ];
@@ -32,8 +34,29 @@ function dashboardLayout({ title, active, body, flash }) {
   ${flash ? `<div class="msg ${flash.type === 'err' ? 'err' : 'ok'}">${flash.text}</div>` : ''}
   ${body}
 </main>
+${assistantWidget()}
 </body>
 </html>`;
+}
+
+// Office Manager Assistant (BETA) - a small chat box on every dashboard page.
+// Submits to /dashboard/assistant/message, which redirects back with the
+// result as a flash message (to the changed customer's page when there is
+// one). See src/services/assistant.js.
+function assistantWidget() {
+  return `
+<div id="assistant-widget" style="position:fixed;bottom:16px;right:16px;z-index:999;font-family:inherit">
+  <details style="background:#1f2430;color:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.3);width:320px;max-width:90vw">
+    <summary style="padding:10px 14px;cursor:pointer;font-weight:600;list-style:none">Assistant (beta)</summary>
+    <form method="POST" action="/dashboard/assistant/message" style="padding:0 14px 14px 14px">
+      <input type="hidden" name="redirect_to" value="/dashboard">
+      <textarea name="message" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
+        style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical"></textarea>
+      <button type="submit" style="margin-top:8px;width:100%;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
+      <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - reviews and confirms on the page it changed. No deletes yet.</p>
+    </form>
+  </details>
+</div>`;
 }
 
 function publicLayout({ title, body }) {
@@ -46,10 +69,11 @@ function publicLayout({ title, body }) {
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
+<div class="public-header"><img src="/static/img/logo.png" alt="${BUSINESS_NAME}"></div>
 <main class="narrow">
   ${body}
 </main>
-<footer class="public-footer">${BUSINESS_NAME}</footer>
+<footer class="public-footer">${BUSINESS_NAME} &middot; <span class="phone">${BUSINESS_PHONE}</span></footer>
 </body>
 </html>`;
 }

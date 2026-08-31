@@ -121,7 +121,62 @@ CREATE TABLE IF NOT EXISTS product_status_history (
   note TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS product_options (
+  id TEXT PRIMARY KEY,
+  category TEXT NOT NULL,
+  code TEXT NOT NULL,
+  label TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
 `);
+
+// ---- Migration: add structured spec columns to products (safe to run on an
+// existing database that already has rows - only adds columns that are
+// missing, never touches existing data). ----
+(function migrateProductsTable() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(products)`).all().map((c) => c.name));
+  const newColumns = [
+    ['cabinet_type', 'TEXT'],
+    ['type_code', 'TEXT'],
+    ['mount_style', 'TEXT'],
+    ['rail_type', 'TEXT'],
+    ['color', 'TEXT'],
+    ['divider', 'TEXT'],
+    ['opening_width_mm', 'REAL'],
+    ['unit_price', 'REAL'],
+  ];
+  for (const [col, type] of newColumns) {
+    if (!existing.has(col)) {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+    }
+  }
+})();
+
+// ---- Seed default product option lists (mount styles, rail types, colors,
+// cabinet types) from the real G-O Manufacturing wholesale order form, so
+// the dropdowns are useful out of the box. Only seeds if a category is
+// completely empty, so it never overwrites anything you've customized. ----
+(function seedProductOptions() {
+  const defaults = {
+    cabinet_type: ['Large Food Pantry', 'Small Pantry', 'Base Cabinet', 'Upper Cabinet', 'Vanity'],
+    type_code: ['S1', 'S2', 'S3', 'S4', 'D1', 'D2', 'D3', 'D4', 'T1', 'T2', 'T3', 'T4', 'TB1', 'SM1', 'SM2'],
+    mount_style: ['ST EFS', 'ST NHS', 'ST NFS', 'FM EHS', 'FM NHS', 'BM EHS', 'BM NHS', 'SM EHS', 'OTHER'],
+    rail_type: ['FE', '0.75', 'Other', 'None'],
+    color: ['W', 'B'],
+  };
+  for (const [category, codes] of Object.entries(defaults)) {
+    const count = db.prepare(`SELECT COUNT(*) as n FROM product_options WHERE category = ?`).get(category).n;
+    if (count > 0) continue;
+    codes.forEach((code, i) => {
+      db.prepare(
+        `INSERT INTO product_options (id, category, code, label, sort_order, active, created_at) VALUES (?,?,?,?,?,1,?)`
+      ).run(newId(), category, code, code, i, nowIso());
+    });
+  }
+})();
 
 // ---- Funnel / job stage config ----
 const LEAD_STAGES = ['New Lead', 'Contacted', 'Quoted', 'Sold', 'Lost'];
@@ -134,7 +189,7 @@ const JOB_STAGES = [
   'Installing',
   'Complete',
 ];
-const APPT_TYPES = ['Free Consultation', 'In-Home Measure', 'Design Review', 'Install'];
+const APPT_TYPES = ['Short Design Consultation', 'Long Design Consultation', 'Design Review', 'Repair or Warranty', 'Install'];
 
 // Per-product factory pipeline - separate from JOB_STAGES (the coarse,
 // customer-facing status). This is the internal, per-piece tracking that
@@ -308,13 +363,50 @@ function getJobHistory(job_id) {
 }
 
 // ---- Products (factory order line items) ----
-function createProduct({ job_id, name, measurements, quantity, factory, deadline, notes }) {
+function createProduct({
+  job_id,
+  name,
+  measurements,
+  quantity,
+  factory,
+  deadline,
+  notes,
+  cabinet_type,
+  type_code,
+  mount_style,
+  rail_type,
+  color,
+  divider,
+  opening_width_mm,
+  unit_price,
+}) {
   const id = newId();
   const ts = nowIso();
   db.prepare(
-    `INSERT INTO products (id, job_id, name, measurements, quantity, factory, deadline, status, notes, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?, 'Queued for Factory', ?, ?, ?)`
-  ).run(id, job_id, name, measurements || null, quantity || 1, factory || null, deadline || null, notes || null, ts, ts);
+    `INSERT INTO products (
+       id, job_id, name, measurements, quantity, factory, deadline, status, notes, created_at, updated_at,
+       cabinet_type, type_code, mount_style, rail_type, color, divider, opening_width_mm, unit_price
+     ) VALUES (?,?,?,?,?,?,?, 'Queued for Factory', ?, ?, ?, ?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    job_id,
+    name,
+    measurements || null,
+    quantity || 1,
+    factory || null,
+    deadline || null,
+    notes || null,
+    ts,
+    ts,
+    cabinet_type || null,
+    type_code || null,
+    mount_style || null,
+    rail_type || null,
+    color || null,
+    divider || null,
+    opening_width_mm || null,
+    unit_price || null
+  );
   addProductStatusHistory(id, 'Queued for Factory', 'Added to order');
   return getProduct(id);
 }
@@ -340,11 +432,66 @@ function updateProductStatus(id, status, note) {
   addProductStatusHistory(id, status, note || null);
   return getProduct(id);
 }
-function updateProduct(id, { name, measurements, quantity, factory, deadline, notes }) {
+function updateProduct(
+  id,
+  { name, measurements, quantity, factory, deadline, notes, cabinet_type, type_code, mount_style, rail_type, color, divider, opening_width_mm, unit_price }
+) {
   db.prepare(
-    `UPDATE products SET name=?, measurements=?, quantity=?, factory=?, deadline=?, notes=?, updated_at=? WHERE id=?`
-  ).run(name, measurements || null, quantity || 1, factory || null, deadline || null, notes || null, nowIso(), id);
+    `UPDATE products SET name=?, measurements=?, quantity=?, factory=?, deadline=?, notes=?, updated_at=?,
+       cabinet_type=?, type_code=?, mount_style=?, rail_type=?, color=?, divider=?, opening_width_mm=?, unit_price=?
+     WHERE id=?`
+  ).run(
+    name,
+    measurements || null,
+    quantity || 1,
+    factory || null,
+    deadline || null,
+    notes || null,
+    nowIso(),
+    cabinet_type || null,
+    type_code || null,
+    mount_style || null,
+    rail_type || null,
+    color || null,
+    divider || null,
+    opening_width_mm || null,
+    unit_price || null,
+    id
+  );
   return getProduct(id);
+}
+
+// ---- Product options (editable dropdown lists: cabinet types, type codes,
+// mount styles, rail types, colors) - lets Andrew add/remove choices from the
+// dashboard without needing a code change. ----
+const PRODUCT_OPTION_CATEGORIES = [
+  { key: 'cabinet_type', label: 'Cabinet / Product Types' },
+  { key: 'type_code', label: 'Type Codes' },
+  { key: 'mount_style', label: 'Mount Styles' },
+  { key: 'rail_type', label: 'Rail Types' },
+  { key: 'color', label: 'Colors' },
+  { key: 'divider', label: 'Dividers' },
+];
+function listProductOptions(category) {
+  return db
+    .prepare(`SELECT * FROM product_options WHERE category = ? AND active = 1 ORDER BY sort_order ASC, code ASC`)
+    .all(category);
+}
+function listAllProductOptionsGrouped() {
+  const out = {};
+  for (const cat of PRODUCT_OPTION_CATEGORIES) out[cat.key] = listProductOptions(cat.key);
+  return out;
+}
+function createProductOption({ category, code, label }) {
+  const id = newId();
+  const maxOrder = db.prepare(`SELECT COALESCE(MAX(sort_order), -1) as m FROM product_options WHERE category = ?`).get(category).m;
+  db.prepare(
+    `INSERT INTO product_options (id, category, code, label, sort_order, active, created_at) VALUES (?,?,?,?,?,1,?)`
+  ).run(id, category, code, label || code, maxOrder + 1, nowIso());
+  return id;
+}
+function deleteProductOption(id) {
+  db.prepare(`UPDATE product_options SET active = 0 WHERE id = ?`).run(id);
 }
 function addProductStatusHistory(product_id, status, note) {
   db.prepare(`INSERT INTO product_status_history (product_id, status, note, created_at) VALUES (?,?,?,?)`).run(
@@ -568,6 +715,11 @@ module.exports = {
   updateProductStatus,
   updateProduct,
   getProductHistory,
+  PRODUCT_OPTION_CATEGORIES,
+  listProductOptions,
+  listAllProductOptionsGrouped,
+  createProductOption,
+  deleteProductOption,
   logMessage,
   listMessagesForCustomer,
   listRecentMessages,
