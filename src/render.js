@@ -60,7 +60,11 @@ function assistantWidget() {
       <textarea name="message" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
         style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical"></textarea>
       <button type="submit" style="margin-top:8px;width:100%;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
-      <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - reviews and confirms on the page it changed. No deletes yet.</p>
+      <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - reviews and confirms on the page it changed. No deletes yet. Remembers the last few messages - use "New conversation" to clear it.</p>
+    </form>
+    <form method="POST" action="/dashboard/assistant/reset" style="padding:0 14px 14px 14px">
+      <input type="hidden" name="redirect_to" value="/dashboard">
+      <button type="submit" style="width:100%;padding:6px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer">New conversation</button>
     </form>
   </details>
 </div>`;
