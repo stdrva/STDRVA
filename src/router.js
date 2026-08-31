@@ -46,6 +46,68 @@ function readBody(req) {
   });
 }
 
+// Same as readBody, but keeps raw bytes as a Buffer instead of coercing to a
+// utf8 string - required for multipart/form-data, since string concatenation
+// of binary chunks (images, PDFs) corrupts any byte that isn't valid utf8.
+function readBodyBuffer(req, maxSize = 20 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxSize) {
+        reject(new Error('Upload too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// Minimal multipart/form-data parser (no external dependency). Returns
+// { fields: {name: value}, files: [{fieldname, filename, mimeType, data: Buffer}] }.
+function parseMultipart(buffer, boundary) {
+  const boundaryBuf = Buffer.from(`--${boundary}`);
+  const fields = {};
+  const files = [];
+  let start = buffer.indexOf(boundaryBuf);
+  if (start === -1) return { fields, files };
+
+  while (true) {
+    const next = buffer.indexOf(boundaryBuf, start + boundaryBuf.length);
+    if (next === -1) break;
+    let part = buffer.slice(start + boundaryBuf.length, next);
+    if (part.slice(0, 2).toString('latin1') === '\r\n') part = part.slice(2);
+    const sep = part.indexOf('\r\n\r\n');
+    if (sep !== -1) {
+      const headerText = part.slice(0, sep).toString('utf8');
+      let body = part.slice(sep + 4);
+      if (body.slice(-2).toString('latin1') === '\r\n') body = body.slice(0, -2);
+      const nameMatch = headerText.match(/name="([^"]*)"/i);
+      const filenameMatch = headerText.match(/filename="([^"]*)"/i);
+      const ctMatch = headerText.match(/Content-Type:\s*([^\r\n]+)/i);
+      const name = nameMatch ? nameMatch[1] : null;
+      if (name) {
+        if (filenameMatch && filenameMatch[1]) {
+          files.push({
+            fieldname: name,
+            filename: filenameMatch[1],
+            mimeType: ctMatch ? ctMatch[1].trim() : 'application/octet-stream',
+            data: body,
+          });
+        } else {
+          fields[name] = body.toString('utf8');
+        }
+      }
+    }
+    start = next;
+  }
+  return { fields, files };
+}
+
 class Router {
   constructor() {
     this.routes = []; // { method, pattern, handlers: [fn...] }
@@ -87,15 +149,27 @@ class Router {
 
     req.query = Object.fromEntries(u.searchParams.entries());
     req.body = {};
+    req.files = [];
 
     if (req.method === 'POST') {
       try {
-        const raw = await readBody(req);
         const ct = req.headers['content-type'] || '';
-        if (ct.includes('application/json')) {
-          req.body = raw ? JSON.parse(raw) : {};
+        if (ct.includes('multipart/form-data')) {
+          const boundaryMatch = ct.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+          const boundary = boundaryMatch ? (boundaryMatch[1] || boundaryMatch[2]).trim() : null;
+          const raw = await readBodyBuffer(req);
+          if (boundary) {
+            const { fields, files } = parseMultipart(raw, boundary);
+            req.body = fields;
+            req.files = files;
+          }
         } else {
-          req.body = querystring.parse(raw);
+          const raw = await readBody(req);
+          if (ct.includes('application/json')) {
+            req.body = raw ? JSON.parse(raw) : {};
+          } else {
+            req.body = querystring.parse(raw);
+          }
         }
       } catch (err) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
