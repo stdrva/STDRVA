@@ -76,6 +76,58 @@ customer. Edit the pipeline in `src/db.js` (`PRODUCT_STAGES`) if your
 process differs. It doesn't currently auto-update the job status when all
 products are delivered - that's a natural next automation if you want it.
 
+### Product Options (editable dropdowns for factory specs)
+
+Each factory-order line can now carry the real manufacturing spec, not just
+a name: cabinet/product type, type code, mount style, rail type, color,
+divider, opening width (mm), and unit price - modeled on a real dealer
+wholesale order form. These show up as dropdowns on the "Add to factory
+order" form (Job page) and as their own columns on both the Job page's
+product table and the Factory Queue.
+
+The dropdown choices themselves live in the database, not the code - go to
+**Product Options** in the nav to add or remove cabinet types, mount
+styles, rail types, colors, and dividers yourself, any time your supplier's
+options change. No code change or redeploy needed for that part. Removing
+an option here doesn't touch any product that already used it - it just
+stops showing up as a future choice.
+
+The "Product / piece name" and free-text "Measurements" fields are still
+there and still optional to fill in alongside the structured fields, for
+anything that doesn't fit the dropdowns.
+
+## Office Manager Assistant (BETA)
+
+A chat box in the bottom-right corner of every dashboard page. Type a plain-language
+instruction and it makes the change directly:
+
+- "Add a lead for Jane Smith, 555-1234, met her at the home show"
+- "Update Marc Huckabone's notes - he also wants stain matching on the doors"
+- "Schedule an appointment for Jane Smith Friday at 2pm, design consultation"
+- "Log a $500 deposit from the Copeland job, paid by check"
+
+It's built on Claude's tool-use API (see `src/services/assistant.js`) - no separate AI
+product, just Claude calling a fixed set of functions that map onto the same database
+functions the dashboard forms use. It searches for an existing customer before creating
+one, asks for clarification if a name matches more than one customer, and always
+redirects to the page it changed (or back to Overview) so you can see - and undo by
+hand if needed - exactly what it did.
+
+**Setup:** get an API key at console.anthropic.com and set `ANTHROPIC_API_KEY` in `.env`
+(or your host's environment variables). Until it's set, the assistant just replies that
+it isn't configured - nothing else breaks.
+
+**v1 scope on purpose:** customers, leads, appointments, payments, and expenses - create
+and update only, no deletes. That covers everything this app has been used for
+conversationally so far. Training-session launch (pre-appointment briefing, post-
+appointment recap), voice input, and full accounting-system-level actions are planned
+but not built yet.
+
+**This is beta.** Test it on a separate beta deployment with real data before trusting it
+against your live site - see Deployment below for the staging/production split. Every
+change it makes is a normal database write, so anything wrong is fixable the same way
+you'd fix a typo from the regular dashboard forms - find the record, edit it by hand.
+
 ## Texting customers (Twilio)
 
 Until you configure this, "texts" just print to the server console/log so
@@ -199,6 +251,24 @@ Whichever you pick:
 
 I can help with any of these once you pick one - happy to just tell you the
 exact steps.
+
+### Beta vs. production (staging workflow)
+
+Once there's a live site, test risky changes (like the Assistant above) on a separate
+beta deployment before they touch production:
+
+1. In GitHub, create a `beta` branch (Branches dropdown -> "View all branches" -> "New
+   branch") off `main`.
+2. Upload the updated files to the `beta` branch instead of `main` (same "Add file ->
+   Upload files" flow, just switch the branch dropdown first).
+3. On Render, create a second free web service, same "Public Git Repository" setup as
+   your main one, but pointed at the `beta` branch. Give it its own name (e.g.
+   `s2d-crm-beta`) so it gets its own URL and its own `.env` variables - including its
+   own `DASHBOARD_PASSWORD` and a real customer database copy if you want to test
+   against real data without touching production's.
+4. Test on the beta URL. When it's solid, upload the same files to `main` (production)
+   and bump the version in `package.json`/`CHANGELOG.md` from `-beta.N` to the real
+   release number - see CHANGELOG.md for the convention.
 
 ## Project layout
 
