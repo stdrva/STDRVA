@@ -19,6 +19,41 @@ function statusUrl(token) {
   return `${baseUrl()}/status/${token}`;
 }
 
+// Notifies Andrew himself (not the customer) - used for anything that needs
+// his personal attention, like an out-of-area contact. Uses the same
+// sms/email primitives, just aimed at his own number/address instead of the
+// customer's. Safe to call even if OWNER_NOTIFY_PHONE/EMAIL aren't set - it
+// just logs to the console like every other channel in this app.
+async function notifyOwner({ smsBody, emailSubject, emailHtml }) {
+  const results = {};
+  const ownerPhone = process.env.OWNER_NOTIFY_PHONE;
+  const ownerEmail = process.env.OWNER_NOTIFY_EMAIL;
+  if (ownerPhone) {
+    results.sms = await sendSms({ to: ownerPhone, body: smsBody, logMessage: db.logMessage });
+  } else {
+    console.log(`[Owner notify - OWNER_NOTIFY_PHONE not set] Would text Andrew: ${smsBody}`);
+  }
+  if (ownerEmail) {
+    results.email = await sendEmail({ to: ownerEmail, subject: emailSubject, html: emailHtml, logMessage: db.logMessage });
+  } else {
+    console.log(`[Owner notify - OWNER_NOTIFY_EMAIL not set] Would email Andrew "${emailSubject}"`);
+  }
+  return results;
+}
+
+// Fired when a booking-page visitor's address falls outside the defined
+// service area - either they asked Andrew to reach out, or they booked a
+// real slot anyway despite being out of area. Either way he needs a heads up.
+async function onOutOfAreaContact(kind, customer, { type } = {}) {
+  const label = kind === 'booked' ? 'booked an appointment anyway' : 'asked to be contacted';
+  const body = `${BUSINESS_NAME}: ${customer.name} is outside your service area and ${label}. ${customer.phone || ''} ${customer.email || ''} - ${customer.address || 'no address on file'}`.trim();
+  return notifyOwner({
+    smsBody: body,
+    emailSubject: `Out-of-area contact: ${customer.name}`,
+    emailHtml: `<p><strong>${customer.name}</strong> is outside your defined service area and ${label}${type ? ` (${type})` : ''}.</p><p>Phone: ${customer.phone || '-'}<br>Email: ${customer.email || '-'}<br>Address: ${customer.address || '-'}</p>`,
+  });
+}
+
 async function notifyCustomer(customer, { smsBody, emailSubject, emailHtml }) {
   const results = {};
   if (customer.phone) {
@@ -114,7 +149,9 @@ module.exports = {
   onJobStatusChanged,
   onAppointmentReminder,
   onAppointmentBooked,
+  onOutOfAreaContact,
   notifyCustomer,
+  notifyOwner,
   bookingUrl,
   statusUrl,
 };
