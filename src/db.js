@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS product_options (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sales_reps (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS training_sessions (
+  id TEXT PRIMARY KEY,
+  rep_id TEXT NOT NULL REFERENCES sales_reps(id),
+  session_type TEXT NOT NULL,
+  appointment_id TEXT REFERENCES appointments(id),
+  summary TEXT,
+  techniques_json TEXT,
+  outcome TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS customer_files (
   id TEXT PRIMARY KEY,
   customer_id TEXT NOT NULL REFERENCES customers(id),
@@ -197,9 +214,17 @@ const JOB_STAGES = [
   'Measured',
   'In Production',
   'Ready for Install',
-  'Installing',
+  'Install Scheduled',
   'Complete',
 ];
+
+// ---- Migration: the "Install Scheduled" stage used to be called "Installing".
+// Rename any existing rows so old jobs still match a valid JOB_STAGES entry
+// (the public status-timeline page indexes into JOB_STAGES by name). ----
+(function migrateInstallingStatus() {
+  db.prepare(`UPDATE jobs SET status = 'Install Scheduled' WHERE status = 'Installing'`).run();
+  db.prepare(`UPDATE job_status_history SET status = 'Install Scheduled' WHERE status = 'Installing'`).run();
+})();
 const APPT_TYPES = ['Short Design Consultation', 'Long Design Consultation', 'Design Review', 'Repair or Warranty', 'Install'];
 
 // Per-product factory pipeline - separate from JOB_STAGES (the coarse,
@@ -537,6 +562,45 @@ function deleteCustomerFile(id) {
   db.prepare(`DELETE FROM customer_files WHERE id = ?`).run(id);
 }
 
+// ---- Sales training ----
+// Deliberately no separate "proficiency" table - a rep's current standing is
+// derived by reading their recent session log, not maintained as a second,
+// easily-drifting source of truth. session_type is 'roleplay' | 'quiz' |
+// 'real_sale'; outcome is only meaningful for 'real_sale' ('won'/'lost').
+function createSalesRep({ name }) {
+  const id = newId();
+  db.prepare(`INSERT INTO sales_reps (id, name, created_at) VALUES (?,?,?)`).run(id, name, nowIso());
+  return { id, name };
+}
+function listSalesReps() {
+  return db.prepare(`SELECT * FROM sales_reps ORDER BY name ASC`).all();
+}
+function findSalesRepByName(name) {
+  return db.prepare(`SELECT * FROM sales_reps WHERE name = ? COLLATE NOCASE`).get(name) || null;
+}
+function createTrainingSession({ rep_id, session_type, appointment_id, summary, techniques, outcome }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO training_sessions (id, rep_id, session_type, appointment_id, summary, techniques_json, outcome, created_at) VALUES (?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    rep_id,
+    session_type,
+    appointment_id || null,
+    summary || null,
+    techniques ? JSON.stringify(techniques) : null,
+    outcome || null,
+    nowIso()
+  );
+  return id;
+}
+function listTrainingSessions(rep_id, limit = 20) {
+  return db
+    .prepare(`SELECT * FROM training_sessions WHERE rep_id = ? ORDER BY created_at DESC LIMIT ?`)
+    .all(rep_id, limit)
+    .map((s) => ({ ...s, techniques: s.techniques_json ? JSON.parse(s.techniques_json) : null }));
+}
+
 // ---- Messages ----
 function logMessage({ customer_id, direction, channel, body, status }) {
   const id = newId();
@@ -657,6 +721,81 @@ function expensesByCategoryBetween(start, end) {
     .all(start, end);
 }
 
+// ---- Cash flow / AR ----
+// What's still owed on a job (sold_amount minus whatever's been paid against
+// it). Not a bank balance - just the gap between what was sold and what's
+// been collected so far.
+function getJobBalance(job_id) {
+  const job = getJob(job_id);
+  if (!job) return null;
+  const paid = db.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE job_id = ?`).get(job_id).total;
+  return (job.sold_amount || 0) - paid;
+}
+
+// Every job with money still owed, plus - per Andrew's rule - the balance is
+// expected the day of that job's Install appointment. If no Install is
+// scheduled yet, expected_payment_date is null and the timing is genuinely
+// unknown (flag it as such, don't guess a date).
+function listOutstandingJobBalances() {
+  const jobs = db
+    .prepare(
+      `SELECT jobs.*, customers.name as customer_name, customers.phone as customer_phone, customers.email as customer_email,
+         COALESCE((SELECT SUM(amount) FROM payments WHERE payments.job_id = jobs.id), 0) as paid_amount
+       FROM jobs JOIN customers ON customers.id = jobs.customer_id`
+    )
+    .all();
+  return jobs
+    .map((j) => {
+      const balance_due = Math.round(((j.sold_amount || 0) - j.paid_amount) * 100) / 100;
+      const installAppt = db
+        .prepare(
+          `SELECT * FROM appointments WHERE customer_id = ? AND type = 'Install' AND status = 'scheduled'
+           ORDER BY scheduled_at ASC LIMIT 1`
+        )
+        .get(j.customer_id);
+      return {
+        job_id: j.id,
+        customer_id: j.customer_id,
+        customer_name: j.customer_name,
+        customer_phone: j.customer_phone,
+        status: j.status,
+        sold_amount: j.sold_amount,
+        paid_amount: j.paid_amount,
+        balance_due,
+        expected_payment_date: installAppt ? installAppt.scheduled_at : null,
+        install_scheduled: !!installAppt,
+      };
+    })
+    .filter((j) => j.balance_due > 0.005)
+    .sort((a, b) => {
+      // Jobs with a known due date first (soonest first), then unscheduled ones.
+      if (a.expected_payment_date && b.expected_payment_date) return a.expected_payment_date.localeCompare(b.expected_payment_date);
+      if (a.expected_payment_date) return -1;
+      if (b.expected_payment_date) return 1;
+      return 0;
+    });
+}
+
+// Average monthly expense run-rate over the trailing N months (default 3) -
+// a rough baseline for projecting near-term outflow, not a guarantee future
+// spending matches the past.
+function averageMonthlyExpenses(months = 3) {
+  const end = new Date();
+  const start = new Date();
+  start.setMonth(start.getMonth() - months);
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
+  const total = totalExpensesBetween(startIso, endIso);
+  return {
+    months,
+    start: startIso,
+    end: endIso,
+    total_expenses: total,
+    average_per_month: Math.round((total / months) * 100) / 100,
+    by_category: expensesByCategoryBetween(startIso, endIso),
+  };
+}
+
 // ---- Reports ----
 // Profit & Loss for an arbitrary date range (ISO date strings, inclusive).
 function profitLoss(start, end) {
@@ -757,6 +896,11 @@ module.exports = {
   listCustomerFiles,
   getCustomerFile,
   deleteCustomerFile,
+  createSalesRep,
+  listSalesReps,
+  findSalesRepByName,
+  createTrainingSession,
+  listTrainingSessions,
   logMessage,
   listMessagesForCustomer,
   listRecentMessages,
@@ -775,4 +919,7 @@ module.exports = {
   profitLoss,
   cashFlowByMonth,
   taxYearSummary,
+  getJobBalance,
+  listOutstandingJobBalances,
+  averageMonthlyExpenses,
 };
