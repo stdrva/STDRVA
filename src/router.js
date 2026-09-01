@@ -193,6 +193,12 @@ class Router {
         res.end(JSON.stringify(obj));
       };
       res.redirect = (loc) => {
+        // Auto-append scroll position from form if it exists
+        var scroll = req.body._scroll || req.query._scroll || '';
+        if (scroll && !loc.includes('_scroll=')) {
+          var sep = loc.includes('?') ? '&' : '?';
+          loc = loc + sep + '_scroll=' + encodeURIComponent(scroll);
+        }
         res.writeHead(302, { Location: loc });
         res.end();
       };

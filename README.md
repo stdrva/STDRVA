@@ -1,6 +1,6 @@
-# Shelves to Drawers RVA - CRM
+# Shelves to Drawers RVA - The BOS
 
-A CRM built specifically for your workflow: sales funnel → texting →
+A Business Operations System built specifically for your workflow: sales funnel → texting →
 self-serve booking (QR code) → sold job production tracker (public link) →
 appointment reminders → basic income tracking.
 

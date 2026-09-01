@@ -24,22 +24,54 @@ function dashboardLayout({ title, active, body, flash, context }) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${title ? title + ' - ' : ''}${BUSINESS_NAME} CRM</title>
+<title>${title ? title + ' - ' : ''}${BUSINESS_NAME} - The BOS</title>
 ${FAVICON_TAGS}
 <link rel="stylesheet" href="/static/css/style.css">
+<script>
+  // Extract scroll position from URL immediately
+  (function() {
+    var match = window.location.search.match(/[?&]_scroll=([^&]+)/);
+    if (match) {
+      var pos = parseInt(decodeURIComponent(match[1]), 10);
+      if (!isNaN(pos)) {
+        setTimeout(function() { window.scrollTo(0, pos); }, 50);
+        setTimeout(function() { window.scrollTo(0, pos); }, 100);
+        setTimeout(function() { window.scrollTo(0, pos); }, 200);
+      }
+    }
+  })();
+</script>
 </head>
-<body>
+<body onload="(function() { var match = window.location.search.match(/[?&]_scroll=([^&]+)/); if (match) { var pos = parseInt(decodeURIComponent(match[1]), 10); if (!isNaN(pos)) { window.scrollTo(0, pos); } } })()">
+<script>
+  // Inject scroll position into every form
+  document.addEventListener('DOMContentLoaded', function() {
+    var forms = document.querySelectorAll('form');
+    forms.forEach(function(form) {
+      // Check if form already has scroll input
+      if (!form.querySelector('input[name="_scroll"]')) {
+        form.addEventListener('submit', function() {
+          var input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = '_scroll';
+          input.value = window.pageYOffset || window.scrollY || 0;
+          form.appendChild(input);
+        });
+      }
+    });
+  });
+</script>
 <div class="topnav">
   <div class="wrap">
-    <a class="brand" href="/dashboard">${BUSINESS_NAME} CRM</a>
+    <a class="brand" href="/dashboard">${BUSINESS_NAME} - The BOS</a>
     <nav>
       ${nav.map(([href, label]) => `<a href="${href}" class="${active === href ? 'active' : ''}">${label}</a>`).join('')}
     </nav>
   </div>
 </div>
 <main class="wrap">
-  ${flash ? `<div class="msg ${flash.type === 'err' ? 'err' : 'ok'}">${flash.text}</div>` : ''}
   ${body}
+  ${flash ? `<div class="msg ${flash.type === 'err' ? 'err' : 'ok'}" style="margin-top: 24px;">${flash.text}</div>` : ''}
 </main>
 ${assistantWidget(context)}
 </body>
@@ -174,8 +206,43 @@ function publicLayout({ title, body }) {
 <title>${title ? title + ' - ' : ''}${BUSINESS_NAME}</title>
 ${FAVICON_TAGS}
 <link rel="stylesheet" href="/static/css/style.css">
+<script>
+  // Restore scroll IMMEDIATELY before page renders - this runs synchronously in <head>
+  (function() {
+    var pos = localStorage.getItem('__bos_scroll');
+    if (pos !== null) {
+      localStorage.removeItem('__bos_scroll');
+      // Restore as soon as possible
+      document.addEventListener('DOMContentLoaded', function() {
+        window.scrollTo(0, parseInt(pos, 10));
+      });
+      // Also try immediately after head loads
+      window.addEventListener('load', function() {
+        window.scrollTo(0, parseInt(pos, 10));
+      });
+    }
+  })();
+</script>
 </head>
 <body>
+<script>
+  // Save scroll position before EVERY navigation
+  window.addEventListener('beforeunload', function() {
+    localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
+  });
+  // Also catch form submissions
+  document.addEventListener('submit', function(e) {
+    if (e.target && e.target.tagName === 'FORM') {
+      localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
+    }
+  }, true);
+  // And programmatic form submissions
+  var origSubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function() {
+    localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
+    origSubmit.call(this);
+  };
+</script>
 <div class="public-header"><img src="/static/img/logo.png" alt="${BUSINESS_NAME}"></div>
 <main class="narrow">
   ${body}
