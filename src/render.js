@@ -2,8 +2,10 @@ const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
 
 const FAVICON_TAGS = `
-<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-<link rel="icon" type="image/x-icon" href="/static/favicon.svg">`;
+<link rel="icon" type="image/x-icon" href="/static/img/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/img/favicon-16.png">
+<link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">`;
 
 function dashboardLayout({ title, active, body, flash, context }) {
   const nav = [
