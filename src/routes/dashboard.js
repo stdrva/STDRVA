@@ -206,7 +206,10 @@ function register(router, requireAuth) {
                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a></td>
                     <td>${escapeHtml(f.note || '')}</td>
                     <td>${fmtDateTime(f.created_at)}</td>
-                    <td><form class="inline" method="POST" action="/dashboard/customers/${c.id}/files/${f.id}/delete" onsubmit="return confirm('Delete this file?')"><button class="btn small danger" type="submit">Delete</button></form></td>
+                    <td style="white-space:nowrap">
+                      ${(f.mime_type || '').startsWith('image/') ? `<a class="btn small secondary" href="/dashboard/customers/${c.id}/files/${f.id}/sign">Sign</a> ` : ''}
+                      <form class="inline" method="POST" action="/dashboard/customers/${c.id}/files/${f.id}/delete" onsubmit="return confirm('Delete this file?')"><button class="btn small danger" type="submit">Delete</button></form>
+                    </td>
                   </tr>`
                 )
                 .join('')}</table>`
@@ -264,7 +267,7 @@ function register(router, requireAuth) {
         </div>
       </div>
     `;
-    res.send(dashboardLayout({ title: c.name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: c.name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query), context: { customerId: c.id } }));
   });
 
   router.post('/dashboard/customers/:id', requireAuth, (req, res) => {
@@ -315,6 +318,127 @@ function register(router, requireAuth) {
       db.deleteCustomerFile(f.id);
     }
     res.redirect(`/dashboard/customers/${req.params.id}?ok=File deleted`);
+  });
+
+  // ---------- Sign a drawing/photo (e.g. "sign the measure drawing") ----------
+  // Draws a free-hand signature on top of an existing image file and saves
+  // the result as a NEW file (the original stays untouched). Not a legal
+  // e-signature system - for actual contracts, keep using DocuSign and
+  // upload the signed PDF via the regular file upload above.
+  router.get('/dashboard/customers/:id/files/:fileId/sign', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    const f = db.getCustomerFile(req.params.fileId);
+    if (!c || !f || f.customer_id !== c.id) return res.status(404).send('File not found');
+    if (!(f.mime_type || '').startsWith('image/')) return res.status(400).send('Only image files can be signed');
+
+    const body = `
+      <h1>Sign: ${escapeHtml(f.original_name)}</h1>
+      <p class="subtitle">Draw a signature on top of the image below, then save. This creates a new file - the original is kept as-is.</p>
+      <div class="panel">
+        <canvas id="sign-canvas" style="max-width:100%;border:1px solid var(--line);touch-action:none;cursor:crosshair;display:block"></canvas>
+        <div style="margin-top:12px;display:flex;gap:10px">
+          <button class="btn secondary" type="button" id="sign-clear">Clear</button>
+          <button class="btn" type="button" id="sign-save">Save signed copy</button>
+        </div>
+        <p id="sign-status" class="subtitle" style="margin-top:8px"></p>
+      </div>
+      <script>
+      (function () {
+        var canvas = document.getElementById('sign-canvas');
+        var ctx = canvas.getContext('2d');
+        var img = new Image();
+        var drawing = false;
+        var last = null;
+
+        img.onload = function () {
+          var maxW = Math.min(800, img.width);
+          var scale = maxW / img.width;
+          canvas.width = maxW;
+          canvas.height = img.height * scale;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        };
+        img.src = '/dashboard/customers/${c.id}/files/${f.id}';
+
+        function posFromEvent(e) {
+          var rect = canvas.getBoundingClientRect();
+          var point = e.touches ? e.touches[0] : e;
+          return {
+            x: (point.clientX - rect.left) * (canvas.width / rect.width),
+            y: (point.clientY - rect.top) * (canvas.height / rect.height),
+          };
+        }
+        function start(e) { e.preventDefault(); drawing = true; last = posFromEvent(e); }
+        function move(e) {
+          if (!drawing) return;
+          e.preventDefault();
+          var p = posFromEvent(e);
+          ctx.strokeStyle = '#1e3d22';
+          ctx.lineWidth = 2.5;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(last.x, last.y);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+          last = p;
+        }
+        function end() { drawing = false; }
+
+        canvas.addEventListener('mousedown', start);
+        canvas.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', end);
+        canvas.addEventListener('touchstart', start);
+        canvas.addEventListener('touchmove', move);
+        canvas.addEventListener('touchend', end);
+
+        document.getElementById('sign-clear').addEventListener('click', function () {
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        });
+
+        document.getElementById('sign-save').addEventListener('click', function () {
+          var status = document.getElementById('sign-status');
+          status.textContent = 'Saving...';
+          fetch('/dashboard/customers/${c.id}/files/${f.id}/sign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data_url: canvas.toDataURL('image/png') }),
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              if (data.ok) {
+                window.location.href = '/dashboard/customers/${c.id}?ok=Signed copy saved';
+              } else {
+                status.textContent = data.error || 'Something went wrong saving.';
+              }
+            })
+            .catch(function () { status.textContent = 'Something went wrong saving.'; });
+        });
+      })();
+      </script>
+    `;
+    res.send(dashboardLayout({ title: 'Sign file', active: '/dashboard/customers', body }));
+  });
+
+  router.post('/dashboard/customers/:id/files/:fileId/sign', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    const original = db.getCustomerFile(req.params.fileId);
+    if (!c || !original || original.customer_id !== c.id) {
+      return res.status(404).json({ ok: false, error: 'File not found' });
+    }
+    const match = /^data:image\/png;base64,(.+)$/.exec(req.body.data_url || '');
+    if (!match) return res.status(400).json({ ok: false, error: 'No signature data received' });
+
+    const buffer = Buffer.from(match[1], 'base64');
+    const storedName = `${newId()}.png`;
+    fs.writeFileSync(path.join(customerUploadsDir(c.id), storedName), buffer);
+    db.createCustomerFile({
+      customer_id: c.id,
+      stored_name: storedName,
+      original_name: `signed-${original.original_name.replace(/\.[^.]+$/, '')}.png`,
+      mime_type: 'image/png',
+      size: buffer.length,
+      note: `Signed copy of "${original.original_name}"`,
+    });
+    res.json({ ok: true });
   });
 
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {
@@ -1201,6 +1325,25 @@ function register(router, requireAuth) {
     assistant.resetConversation();
     const redirectTo = req.body.redirect_to || '/dashboard';
     res.redirect(`${redirectTo}?ok=Assistant conversation cleared`);
+  });
+
+  // JSON versions of the two routes above, used by the in-widget chat log so
+  // it can show the reply without leaving/reloading the page. The form-post
+  // routes above stay as a fallback for anyone with JS off.
+  router.get('/dashboard/assistant/history', requireAuth, (req, res) => {
+    res.json({ history: assistant.getHistory() });
+  });
+
+  router.post('/dashboard/assistant/chat', requireAuth, async (req, res) => {
+    const message = (req.body.message || '').trim();
+    if (!message) return res.status(400).json({ error: 'Type something first' });
+    const context = req.body.context_customer_id ? { customerId: req.body.context_customer_id } : {};
+    const result = await assistant.handleMessage(message, context);
+    res.json({
+      summary: result.summary,
+      error: !!result.error,
+      changedCustomerId: result.changedCustomerId || null,
+    });
   });
 }
 
