@@ -7,7 +7,7 @@ const FAVICON_TAGS = `
 <link rel="icon" type="image/png" sizes="16x16" href="/static/img/favicon-16.png">
 <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">`;
 
-function dashboardLayout({ title, active, body, flash }) {
+function dashboardLayout({ title, active, body, flash, context }) {
   const nav = [
     ['/dashboard', 'Overview'],
     ['/dashboard/funnel', 'Funnel'],
@@ -41,33 +41,128 @@ ${FAVICON_TAGS}
   ${flash ? `<div class="msg ${flash.type === 'err' ? 'err' : 'ok'}">${flash.text}</div>` : ''}
   ${body}
 </main>
-${assistantWidget()}
+${assistantWidget(context)}
 </body>
 </html>`;
 }
 
 // Office Manager Assistant (BETA) - a small chat box on every dashboard page.
-// Submits to /dashboard/assistant/message, which redirects back with the
-// result as a flash message (to the changed customer's page when there is
-// one). See src/services/assistant.js.
-function assistantWidget() {
+// Talks to /dashboard/assistant/chat and /dashboard/assistant/history (JSON)
+// so replies show up inline as chat bubbles instead of reloading the page.
+// context.customerId (when the page passes one, e.g. a customer detail page)
+// rides along with each message so "update this record" resolves without
+// Andrew having to name the customer. See src/services/assistant.js.
+// (/dashboard/assistant/message and /reset still exist as plain form-post
+// fallbacks if JS is off.)
+function assistantWidget(context) {
+  const customerId = context && context.customerId ? context.customerId : '';
   return `
-<div id="assistant-widget" style="position:fixed;bottom:16px;right:16px;z-index:999;font-family:inherit">
-  <details style="background:#1f2430;color:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.3);width:320px;max-width:90vw">
+<div id="assistant-widget" data-context-customer-id="${customerId}" style="position:fixed;bottom:16px;right:16px;z-index:999;font-family:inherit">
+  <details id="assistant-details" style="background:#1f2430;color:#fff;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.3);width:340px;max-width:90vw">
     <summary style="padding:10px 14px;cursor:pointer;font-weight:600;list-style:none">Assistant (beta)</summary>
-    <form method="POST" action="/dashboard/assistant/message" style="padding:0 14px 14px 14px">
-      <input type="hidden" name="redirect_to" value="/dashboard">
-      <textarea name="message" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
-        style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical"></textarea>
-      <button type="submit" style="margin-top:8px;width:100%;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
-      <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - reviews and confirms on the page it changed. No deletes yet. Remembers the last few messages - use "New conversation" to clear it.</p>
-    </form>
-    <form method="POST" action="/dashboard/assistant/reset" style="padding:0 14px 14px 14px">
-      <input type="hidden" name="redirect_to" value="/dashboard">
-      <button type="submit" style="width:100%;padding:6px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer">New conversation</button>
-    </form>
+    <div style="padding:0 14px 14px 14px">
+      ${customerId ? `<p style="margin:0 0 6px;font-size:0.72rem;opacity:0.65">Talking about this customer's record</p>` : ''}
+      <div id="assistant-log" style="max-height:260px;overflow-y:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
+      <form id="assistant-form">
+        <textarea id="assistant-input" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
+          style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical;background:#12151c;color:#fff"></textarea>
+        <button id="assistant-send" type="submit" style="margin-top:8px;width:100%;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
+      </form>
+      <button id="assistant-reset" type="button" style="margin-top:8px;width:100%;padding:6px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer">New conversation</button>
+      <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - no deletes yet. Remembers the last few messages.</p>
+    </div>
   </details>
-</div>`;
+</div>
+<script>
+(function () {
+  var widget = document.getElementById('assistant-widget');
+  var contextCustomerId = widget.getAttribute('data-context-customer-id') || '';
+  var log = document.getElementById('assistant-log');
+  var form = document.getElementById('assistant-form');
+  var input = document.getElementById('assistant-input');
+  var sendBtn = document.getElementById('assistant-send');
+  var resetBtn = document.getElementById('assistant-reset');
+
+  function addBubble(role, text) {
+    var isUser = role === 'user';
+    var div = document.createElement('div');
+    div.style.alignSelf = isUser ? 'flex-end' : 'flex-start';
+    div.style.background = isUser ? '#4a7dfc' : '#333';
+    div.style.color = '#fff';
+    div.style.borderRadius = '10px';
+    div.style.padding = '6px 10px';
+    div.style.fontSize = '0.85rem';
+    div.style.maxWidth = '85%';
+    div.style.whiteSpace = 'pre-wrap';
+    var span = document.createElement('span');
+    span.textContent = text;
+    div.appendChild(span);
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return div;
+  }
+
+  function loadHistory() {
+    fetch('/dashboard/assistant/history')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        (data.history || []).forEach(function (m) { addBubble(m.role, m.content); });
+      })
+      .catch(function () {});
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var message = input.value.trim();
+    if (!message) return;
+    addBubble('user', message);
+    input.value = '';
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Thinking...';
+    var body = 'message=' + encodeURIComponent(message);
+    if (contextCustomerId) body += '&context_customer_id=' + encodeURIComponent(contextCustomerId);
+    fetch('/dashboard/assistant/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body,
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var bubble = addBubble('assistant', data.summary || '(no response)');
+        if (data.changedCustomerId) {
+          var note = document.createElement('div');
+          note.textContent = 'Opening that record to confirm...';
+          note.style.fontSize = '0.72rem';
+          note.style.opacity = '0.7';
+          note.style.marginTop = '4px';
+          bubble.appendChild(note);
+          setTimeout(function () {
+            window.location.href = '/dashboard/customers/' + data.changedCustomerId;
+          }, 1100);
+        }
+      })
+      .catch(function () {
+        addBubble('assistant', 'Something went wrong reaching the assistant.');
+      })
+      .finally(function () {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send';
+      });
+  });
+
+  resetBtn.addEventListener('click', function () {
+    fetch('/dashboard/assistant/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'redirect_to=' + encodeURIComponent(window.location.pathname),
+    })
+      .then(function () { log.innerHTML = ''; })
+      .catch(function () {});
+  });
+
+  loadHistory();
+})();
+</script>`;
 }
 
 function publicLayout({ title, body }) {
