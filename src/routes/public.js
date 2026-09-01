@@ -26,13 +26,142 @@ function weekStartKey(d) {
   return dateKey(sunday);
 }
 
-function upcomingBusinessDays() {
+// ---------- Service area zones ----------
+// Address is a single free-text field (no separate city/zip columns), so
+// every zone below is matched two ways against whatever the customer typed:
+// an exact 5-digit ZIP found in the text, or a known town name as a
+// substring (case-insensitive). ZIP/town lists sourced from zip-codes.com
+// county/city lookup pages, checked Aug 2026 - not guaranteed complete or
+// permanently accurate; add more as real bookings turn up a gap.
+//
+// Zone 1 - WEDNESDAY_ZONE: Caroline County / Spotsylvania County side of
+// Richmond. Andrew only runs that route on Wednesdays.
+// Fredericksburg (independent city, not technically inside Spotsylvania
+// County) is included here too since it's the same direction/route - an
+// interpretation of "that side of Richmond," not a county-line fact.
+const WEDNESDAY_WEEKDAY = 3; // 0=Sun..6=Sat
+const WEDNESDAY_ZIPS = [
+  // Caroline County, VA
+  '22546', '22580', '22427', '22428', '22514', '22535', '22538', '22446', '22552', '22501',
+  // Spotsylvania County, VA (+ Fredericksburg zips, see note above)
+  '22407', '22408', '22551', '22553', '22534', '22565', '22401', '22402', '22403', '22404', '22405', '22412',
+];
+const WEDNESDAY_TOWNS = [
+  // Caroline County, VA
+  'ruther glen', 'woodford', 'bowling green', 'milford', 'port royal', 'rappahannock academy', 'corbin', 'sparta', 'ladysmith', 'caroline county',
+  // Spotsylvania County, VA + Fredericksburg
+  'fredericksburg', 'spotsylvania', 'partlow', 'thornburg',
+];
+
+// Zone 2 - CORE_AREA: the normal Richmond metro service area, plus
+// Charlottesville/Albemarle by Andrew's explicit request ("maybe an hour
+// drive from Richmond, but include Charlottesville"). Bookable any business
+// day EXCEPT Wednesday - Andrew's up north on the Wednesday route, so the
+// rest of the area skips that day to avoid a same-day conflict.
+// Covers: Richmond City, Henrico, Chesterfield, Hanover, Goochland,
+// Powhatan, New Kent, Charles City, Albemarle County + Charlottesville,
+// Dinwiddie, Prince George, Amelia, Cumberland, King William, King & Queen,
+// Louisa, Fluvanna, Nottoway, Colonial Heights, Petersburg, Hopewell.
+const CORE_AREA_DAYS = BUSINESS_DAYS.filter((d) => d !== WEDNESDAY_WEEKDAY);
+const CORE_AREA_ZIPS = [
+  // Richmond City (incl. PO Box / unique zips shared with Henrico/Chesterfield)
+  '23219', '23220', '23221', '23222', '23223', '23224', '23225', '23226', '23227', '23228', '23229',
+  '23230', '23231', '23233', '23234', '23235', '23236', '23237', '23238', '23250', '23294', '23298',
+  '23218', '23241', '23242', '23255', '23260', '23261', '23284', '23285', '23173', '23249', '23269',
+  '23273', '23274', '23276', '23278', '23279', '23282', '23286', '23288', '23289', '23290', '23291',
+  '23292', '23293', '23295', '23297', '23232',
+  // Henrico County
+  '23059', '23060', '23058', '23075', '23150',
+  // Chesterfield County
+  '23112', '23113', '23114', '23832', '23831', '23838', '23120', '23836',
+  // Hanover County
+  '23111', '23116', '23005', '23192', '23015', '23146', '23069', '23047', '23162',
+  // Goochland County
+  '23103', '23063', '23102', '23153', '23065', '23160', '23039', '23129', '23014', '23067',
+  // Powhatan County
+  '23139',
+  // New Kent County
+  '23141', '23140', '23124', '23089', '23011',
+  // Charles City County
+  '23030', '23147',
+  // Albemarle County + Charlottesville
+  '22901', '22902', '22903', '22904', '22905', '22906', '22907', '22908', '22909', '22910', '22911',
+  '22932', '24590', '22936', '22947', '22959', '22937', '22940', '22943', '22946', '22931', '22924', '22945', '22987',
+  // Louisa County
+  '23093', '23024', '23117', '23170',
+  // Prince George County
+  '23875', '23801', '23842',
+  // Dinwiddie County
+  '23885', '23841', '23872', '23833', '23840', '23830', '23850', '23894', '23822',
+  // Amelia County
+  '23002', '23083', '23105',
+  // Cumberland County
+  '23040', '23027',
+  // Fluvanna County
+  '22963', '22974', '23084', '23038', '23022', '23055',
+  // King William County
+  '23009', '23181', '23086', '23106',
+  // King and Queen County
+  '23148', '23156', '23110', '23177', '23091', '23023', '23126', '23085', '23161', '23108',
+  // Nottoway County
+  '23824', '23930', '23922', '23955',
+  // Colonial Heights (independent city)
+  '23834',
+  // Petersburg (independent city)
+  '23803', '23805', '23804', '23806',
+  // Hopewell (independent city)
+  '23860',
+];
+const CORE_AREA_TOWNS = [
+  'richmond', 'henrico', 'glen allen', 'sandston',
+  'midlothian', 'chester', 'chesterfield', 'moseley',
+  'mechanicsville', 'ashland', 'montpelier', 'beaverdam', 'rockville', 'hanover', 'doswell', 'studley',
+  'manakin sabot', 'goochland', 'maidens', 'sandy hook', 'gum spring', 'crozier', 'oilville', 'beaumont', 'hadensville',
+  'powhatan',
+  'quinton', 'providence forge', 'new kent', 'lanexa', 'barhamsville',
+  'charles city', 'ruthville',
+  'charlottesville', 'albemarle', 'crozet', 'scottsville', 'earlysville', 'keswick', 'north garden',
+  'esmont', 'free union', 'greenwood', 'keene', 'covesville', 'batesville', 'ivy', 'white hall',
+  'louisa', 'bumpass', 'mineral', 'trevilians',
+  'prince george', 'fort lee', 'fort gregg-adams', 'disputanta',
+  'dinwiddie', 'sutherland', 'mckenney', 'mc kenney', 'church road', 'dewitt', 'wilsons', 'ammon',
+  'amelia court house', 'jetersville', 'mannboro',
+  'cumberland', 'cartersville',
+  'fluvanna', 'palmyra', 'kents store', 'bremo bluff', 'fork union',
+  'king william', 'aylett', 'west point va', 'manquin',
+  'king and queen', 'saint stephens church', 'shacklefords', 'mattaponi', 'walkerton', 'little plymouth', 'bruington', 'stevensville', 'mascot',
+  'nottoway', 'blackstone', 'crewe', 'burkeville',
+  'colonial heights',
+  'petersburg',
+  'hopewell',
+];
+
+function zoneForAddress(address) {
+  if (!address) return null;
+  const text = String(address).toLowerCase();
+  const zipsInText = text.match(/\b\d{5}\b/g) || [];
+  const hasZip = (list) => zipsInText.some((z) => list.includes(z));
+  const hasTown = (list) => list.some((t) => text.includes(t));
+  if (hasZip(WEDNESDAY_ZIPS) || hasTown(WEDNESDAY_TOWNS)) return 'wednesday';
+  if (hasZip(CORE_AREA_ZIPS) || hasTown(CORE_AREA_TOWNS)) return 'core';
+  return 'out-of-area';
+}
+
+function allowedDaysForAddress(address) {
+  const zone = zoneForAddress(address);
+  if (zone === 'wednesday') return [WEDNESDAY_WEEKDAY];
+  if (zone === 'core') return CORE_AREA_DAYS;
+  return [];
+}
+
+function upcomingBusinessDays(allowedDays) {
+  const allowed = allowedDays && allowedDays.length ? allowedDays : BUSINESS_DAYS;
   const days = [];
   const now = new Date();
   const weekCounts = new Map();
   for (let i = BOOKING_MIN_LEAD_DAYS; days.length < BOOKING_WINDOW_DAYS && i < BOOKING_MIN_LEAD_DAYS + 90; i++) {
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
-    if (!BUSINESS_DAYS.includes(d.getDay())) continue;
+    if (!allowed.includes(d.getDay())) continue;
     const wk = weekStartKey(d);
     const count = weekCounts.get(wk) || 0;
     if (count >= BOOKING_MAX_DAYS_PER_WEEK) continue;
@@ -239,8 +368,29 @@ function register(router) {
     const type = req.query.type || PUBLIC_TYPE_ORDER[0];
     const dateSel = req.query.date || '';
     const isRequestType = REQUEST_TYPES.includes(type);
-    const days = isRequestType ? [] : upcomingBusinessDays();
+    // Name/phone/address are collected here, BEFORE any day or time is
+    // offered - Andrew needs the physical address up front since these are
+    // in-home appointments. Threaded through as query params on every link
+    // (same stateless pattern as `type`/`date` already used on this page).
+    const name = (req.query.name || '').trim();
+    const phone = (req.query.phone || '').trim();
+    const email = (req.query.email || '').trim();
+    const address = (req.query.address || '').trim();
+    // All four are required at once (name/phone/email/address) so a lead is
+    // never lost for missing contact info - including out-of-area visitors,
+    // who get no day picker at all and need to be reachable another way.
+    const hasContact = Boolean(name && phone && address && isValidEmail(email));
+    const zone = hasContact ? zoneForAddress(address) : null; // 'wednesday' | 'core' | 'out-of-area' | null
+    // "Book anyway" lets an out-of-area visitor push through to a real time
+    // slot instead of just leaving contact info - they still get flagged to
+    // Andrew (see POST /book), just via a real appointment instead of a lead.
+    const forced = req.query.force === '1';
+    const outOfAreaBlocked = zone === 'out-of-area' && !forced;
+    const days = isRequestType || !hasContact || outOfAreaBlocked ? [] : upcomingBusinessDays(forced && zone === 'out-of-area' ? BUSINESS_DAYS : allowedDaysForAddress(address));
     const duration = durationForType(type);
+    const contactQS =
+      `&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}` +
+      `&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}${forced ? '&force=1' : ''}`;
 
     const typeOptions = PUBLIC_TYPE_ORDER.map((t) => {
       const selected = t === type;
@@ -283,84 +433,158 @@ function register(router) {
       .map((d) => {
         const key = dateKey(d);
         const label = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-        return `<a class="btn ${key === dateSel ? '' : 'secondary'} small" href="/book?type=${encodeURIComponent(type)}&date=${key}" style="margin:0 6px 6px 0">${label}</a>`;
+        return `<a class="btn ${key === dateSel ? '' : 'secondary'} small" href="/book?type=${encodeURIComponent(type)}&date=${key}${contactQS}" style="margin:0 6px 6px 0">${label}</a>`;
       })
       .join('');
 
     let slotsHtml = '';
-    if (dateSel) {
+    if (dateSel && hasContact) {
       const slots = slotsForDate(dateSel, duration);
       slotsHtml = slots.length
         ? `<div class="slot-grid">${slots
             .map((s) => {
               const hhmm = `${pad(s.getHours())}:${pad(s.getMinutes())}`;
               const label = s.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-              return `<a class="slot-btn" href="/book/confirm?type=${encodeURIComponent(type)}&date=${dateSel}&time=${hhmm}">${label}</a>`;
+              return `<a class="slot-btn" href="/book/confirm?type=${encodeURIComponent(type)}&date=${dateSel}&time=${hhmm}${contactQS}">${label}</a>`;
             })
             .join('')}</div>`
         : `<p class="subtitle">No open times that day - try another date.</p>`;
     }
 
+    const contactPanel = `
+      <div class="panel">
+        <h3 style="margin-top:0">2. Your info</h3>
+        <form method="GET" action="/book">
+          <input type="hidden" name="type" value="${escapeHtml(type)}">
+          <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" required>
+          <label>Phone *</label><input type="tel" name="phone" value="${escapeHtml(phone)}" required placeholder="(804) 555-0100">
+          <label>Email *</label><input type="email" name="email" value="${escapeHtml(email)}" required>
+          <label>Home address *</label><input type="text" name="address" value="${escapeHtml(address)}" required placeholder="Street, city, state, zip - we're coming to your home">
+          <div style="margin-top:14px"><button class="btn" type="submit">${hasContact ? 'Update info' : 'Continue'}</button></div>
+        </form>
+      </div>`;
+
+    const outOfAreaPanel = `
+      <div class="panel">
+        <h3 style="margin-top:0">3. Your area</h3>
+        <p>That address is outside our normal service area. You can have Andrew reach out to see if a visit can be arranged, or book a time anyway and he'll be notified it's outside the usual area.</p>
+        <form method="POST" action="/book/out-of-area" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';" style="margin-bottom:10px">
+          <input type="hidden" name="type" value="${escapeHtml(type)}">
+          <input type="hidden" name="name" value="${escapeHtml(name)}">
+          <input type="hidden" name="phone" value="${escapeHtml(phone)}">
+          <input type="hidden" name="email" value="${escapeHtml(email)}">
+          <input type="hidden" name="address" value="${escapeHtml(address)}">
+          <button class="btn" type="submit">Have Andrew reach out to me</button>
+        </form>
+        <a class="btn secondary" href="/book?type=${encodeURIComponent(type)}${contactQS}">Book anyway</a>
+      </div>`;
+
+    const outOfAreaBanner = `
+      <div class="panel" style="border-left:3px solid #b54f1e">
+        <p style="margin:0">This address is outside the normal service area &mdash; booking anyway. Andrew will be notified.</p>
+      </div>`;
+
+    const showScheduler = hasContact && !outOfAreaBlocked;
+
     const body = `
       <div class="public-hero">
         <h1>Let's Get Started</h1>
         <div class="rule"></div>
-        <p class="subtitle">Pick a service, a day, then a time. No account needed.</p>
+        <p class="subtitle">Pick a service, tell us where you are, then choose a day and time. No account needed.</p>
       </div>
       <div class="panel">
         <h3 style="margin-top:0">1. What do you need?</h3>
         ${typeOptions}
       </div>
-      <div class="panel">
-        <h3 style="margin-top:0">2. Choose a day</h3>
-        ${dayButtons}
-      </div>
-      ${dateSel ? `<div class="panel"><h3 style="margin-top:0">3. Choose a time</h3>${slotsHtml}</div>` : ''}
+      ${contactPanel}
+      ${hasContact && outOfAreaBlocked ? outOfAreaPanel : ''}
+      ${hasContact && forced && zone === 'out-of-area' ? outOfAreaBanner : ''}
+      ${showScheduler ? `<div class="panel"><h3 style="margin-top:0">3. Choose a day</h3>${dayButtons}</div>` : ''}
+      ${showScheduler && dateSel ? `<div class="panel"><h3 style="margin-top:0">4. Choose a time</h3>${slotsHtml}</div>` : ''}
     `;
     res.send(publicLayout({ title: 'Book an appointment', body }));
   });
 
   router.get('/book/confirm', (req, res) => {
     const { type, date, time } = req.query;
-    if (!type || !date || !time) return res.redirect('/book');
+    const name = (req.query.name || '').trim();
+    const phone = (req.query.phone || '').trim();
+    const email = (req.query.email || '').trim();
+    const address = (req.query.address || '').trim();
+    const forced = req.query.force === '1';
+    // Full contact info is required before a time is ever offered on /book,
+    // but guard here too in case someone lands on this URL directly without
+    // it - including a stale out-of-area address, unless they came through
+    // the "book anyway" flow (force=1).
+    const zone = zoneForAddress(address);
+    if (!type || !date || !time || !name || !phone || !email || !address || (zone === 'out-of-area' && !forced)) {
+      return res.redirect('/book');
+    }
     const when = new Date(`${date}T${time}:00`);
+    const backQS =
+      `type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}` +
+      `&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}${forced ? '&force=1' : ''}`;
     const body = `
       <div class="public-hero">
         <h1>Confirm your appointment</h1>
         <p class="subtitle">${escapeHtml(type)} &middot; ${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
       </div>
+      ${zone === 'out-of-area' ? `<div class="panel" style="border-left:3px solid #b54f1e"><p style="margin:0">This address is outside the normal service area &mdash; Andrew will be notified this was booked anyway.</p></div>` : ''}
       <div class="panel">
         <form method="POST" action="/book" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
           <input type="hidden" name="type" value="${escapeHtml(type)}">
           <input type="hidden" name="date" value="${escapeHtml(date)}">
           <input type="hidden" name="time" value="${escapeHtml(time)}">
-          <label>Name *</label><input type="text" name="name" required>
-          <label>Phone *</label><input type="tel" name="phone" required placeholder="(804) 555-0100">
-          <label>Email</label><input type="email" name="email">
+          <input type="hidden" name="force" value="${forced ? '1' : '0'}">
+          <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" required>
+          <label>Phone *</label><input type="tel" name="phone" value="${escapeHtml(phone)}" required placeholder="(804) 555-0100">
+          <label>Email *</label><input type="email" name="email" value="${escapeHtml(email)}" required>
+          <label>Home address *</label><input type="text" name="address" value="${escapeHtml(address)}" required>
           ${discoveryWizard(
             `${escapeHtml(type)} with <strong>Andrew</strong><br>${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
             'Skip all of this and confirm appointment',
             'Confirm booking'
           )}
         </form>
-        <p class="subtitle" style="margin-top:10px"><a href="/book">&larr; pick a different time</a></p>
+        <p class="subtitle" style="margin-top:10px"><a href="/book?${backQS}">&larr; pick a different time</a></p>
       </div>
     `;
     res.send(publicLayout({ title: 'Confirm appointment', body }));
   });
 
   router.post('/book', async (req, res) => {
-    const { type, date, time, name, phone, email } = req.body;
-    if (!name || !phone || !date || !time) {
-      return res.send(publicLayout({ title: 'Booking error', body: `<div class="panel"><p>Missing required info. <a href="/book">Start over</a>.</p></div>` }));
+    const { type, date, time, name, phone, email, address, force } = req.body;
+    if (!name || !phone || !email || !address || !date || !time) {
+      return res.send(publicLayout({ title: 'Booking error', body: `<div class="panel"><p>Missing required info (we need a name, phone, email, and home address to schedule an in-home visit). <a href="/book">Start over</a>.</p></div>` }));
+    }
+    const outOfArea = zoneForAddress(address) === 'out-of-area';
+    if (outOfArea && force !== '1') {
+      // Belt-and-suspenders: the day/time picker never offers slots for an
+      // out-of-area address unless "book anyway" was used (force=1), so
+      // reaching here without it means a crafted URL. Bounce to the normal
+      // out-of-area flow instead of booking a real slot.
+      return res.redirect(`/book?type=${encodeURIComponent(type || '')}&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}`);
     }
     const phoneNorm = normalizePhone(phone);
     const emailVal = isValidEmail(email) ? email : null;
-    const { notesWithDiscovery } = discoveryFromBody(req.body);
+    const { notesWithDiscovery: discoveryNotes } = discoveryFromBody(req.body);
+    const notesWithDiscovery = outOfArea ? ['[OUT OF AREA - booked anyway]', discoveryNotes].filter(Boolean).join(' | ') : discoveryNotes;
 
     let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
     if (!customer) {
-      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, notes: notesWithDiscovery });
+      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, address, notes: notesWithDiscovery });
+    } else if (!customer.address && address) {
+      // Existing record with no address on file yet - fill it in from this
+      // booking rather than leaving it blank. Never overwrites an address
+      // that's already there.
+      db.updateCustomer(customer.id, {
+        name: customer.name,
+        phone: customer.phone,
+        email: customer.email,
+        address,
+        notes: customer.notes,
+      });
+      customer = db.getCustomer(customer.id);
     }
     // Make sure this customer is represented in the funnel.
     const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
@@ -388,6 +612,7 @@ function register(router) {
       });
       try {
         await automations.onAppointmentBooked(appt, customer);
+        if (outOfArea) await automations.onOutOfAreaContact('booked', customer, { type });
       } catch (e) {
         console.error('onAppointmentBooked failed', e);
       }
@@ -444,6 +669,60 @@ function register(router) {
       </div>
       <div class="panel">
         <p>${type === 'Callback by Owner' ? "Andrew will call you back directly." : "We'll send details to your email."} We received: ${escapeHtml(notesWithDiscovery || '(no additional notes)')}</p>
+      </div>
+    `;
+    res.send(publicLayout({ title: 'Request received', body }));
+  });
+
+  // A visitor whose address fell outside the service area (see zoneForAddress
+  // above) never gets a day/time picker - this saves their full contact info
+  // as a lead instead, so it's not just lost when they close the tab. Andrew
+  // follows up manually to see if a visit can be arranged.
+  router.post('/book/out-of-area', async (req, res) => {
+    const { type, name, phone, email, address } = req.body;
+    if (!name || !phone || !email || !address) {
+      return res.send(publicLayout({ title: 'Request error', body: `<div class="panel"><p>Missing required info. <a href="/book">Start over</a>.</p></div>` }));
+    }
+    const phoneNorm = normalizePhone(phone);
+    const emailVal = isValidEmail(email) ? email : null;
+    const notes = `[Out of area request${type ? ' - ' + type : ''}]`;
+
+    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
+    if (!customer) {
+      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, address, notes });
+    } else if (!customer.address && address) {
+      db.updateCustomer(customer.id, {
+        name: customer.name,
+        phone: customer.phone,
+        email: customer.email,
+        address,
+        notes: customer.notes,
+      });
+      customer = db.getCustomer(customer.id);
+    }
+
+    // Idempotency guard, same reasoning as /book/request.
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    let lead = db
+      .listLeads()
+      .find((l) => l.customer_id === customer.id && l.source === 'Out of area' && l.created_at >= fiveMinAgo);
+    if (!lead) {
+      lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: 'Out of area', notes });
+      try {
+        await automations.onLeadCreated(lead, customer);
+        await automations.onOutOfAreaContact('lead', customer, { type });
+      } catch (e) {
+        console.error('onLeadCreated failed', e);
+      }
+    }
+
+    const body = `
+      <div class="public-hero">
+        <h1>Got it!</h1>
+        <p class="subtitle">We have your info</p>
+      </div>
+      <div class="panel">
+        <p>Your address is outside our normal service area, but Andrew has your contact info and will reach out directly to see if a visit can be arranged.</p>
       </div>
     `;
     res.send(publicLayout({ title: 'Request received', body }));
