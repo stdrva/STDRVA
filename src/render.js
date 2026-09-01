@@ -95,10 +95,16 @@ function assistantWidget(context) {
     <div style="padding:0 14px 14px 14px">
       ${customerId ? `<p style="margin:0 0 6px;font-size:0.72rem;opacity:0.65">Talking about this customer's record</p>` : ''}
       <div id="assistant-log" style="max-height:260px;overflow-y:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
-      <form id="assistant-form">
+      <form id="assistant-form" enctype="multipart/form-data">
         <textarea id="assistant-input" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
           style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical;background:#12151c;color:#fff"></textarea>
-        <button id="assistant-send" type="submit" style="margin-top:8px;width:100%;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button id="assistant-send" type="submit" style="flex:1;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
+          <label style="flex:0;padding:8px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer;display:flex;align-items:center">
+            <input type="file" name="assistant-file" accept=".pdf,.doc,.docx,.txt,.jpg,.png,.xlsx,.csv" style="display:none">
+            📎
+          </label>
+        </div>
       </form>
       <button id="assistant-reset" type="button" style="margin-top:8px;width:100%;padding:6px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer">New conversation</button>
       <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - no deletes yet. Remembers the last few messages.</p>
@@ -114,6 +120,15 @@ function assistantWidget(context) {
   var input = document.getElementById('assistant-input');
   var sendBtn = document.getElementById('assistant-send');
   var resetBtn = document.getElementById('assistant-reset');
+  var fileInput = form.querySelector('input[name="assistant-file"]');
+  var selectedFile = null;
+
+  fileInput.addEventListener('change', function () {
+    selectedFile = this.files[0] || null;
+    if (selectedFile) {
+      addBubble('user', '📎 ' + selectedFile.name);
+    }
+  });
 
   function addBubble(role, text) {
     var isUser = role === 'user';
@@ -146,17 +161,28 @@ function assistantWidget(context) {
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     var message = input.value.trim();
-    if (!message) return;
-    addBubble('user', message);
+    if (!message && !selectedFile) return;
+    
+    if (selectedFile) {
+      addBubble('user', '📎 ' + selectedFile.name);
+    } else if (message) {
+      addBubble('user', message);
+    }
+    
     input.value = '';
+    selectedFile = null;
+    fileInput.value = '';
     sendBtn.disabled = true;
     sendBtn.textContent = 'Thinking...';
-    var body = 'message=' + encodeURIComponent(message);
-    if (contextCustomerId) body += '&context_customer_id=' + encodeURIComponent(contextCustomerId);
+    
+    var formData = new FormData();
+    formData.append('message', message);
+    if (contextCustomerId) formData.append('context_customer_id', contextCustomerId);
+    if (selectedFile) formData.append('file', selectedFile);
+    
     fetch('/dashboard/assistant/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body,
+      body: formData,
     })
       .then(function (r) { return r.json(); })
       .then(function (data) {
