@@ -252,20 +252,29 @@ ${FAVICON_TAGS}
 </head>
 <body>
 <script>
-  // Save scroll position before EVERY navigation
-  window.addEventListener('beforeunload', function() {
-    localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
-  });
-  // Also catch form submissions
-  document.addEventListener('submit', function(e) {
-    if (e.target && e.target.tagName === 'FORM') {
+  // Save scroll position. beforeunload alone isn't reliable on mobile
+  // Safari/Chrome - it's often skipped or fires too late for a plain link
+  // tap, which is why the page kept snapping back to the top on phones.
+  // Saving at the moment of the click/submit (before navigation starts) is
+  // reliable on every browser; beforeunload/pagehide stay as a fallback.
+  function saveScrollPos() {
+    try {
       localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
-    }
+    } catch (e) {}
+  }
+  document.addEventListener('click', function(e) {
+    var link = e.target.closest && e.target.closest('a[href]');
+    if (link) saveScrollPos();
   }, true);
+  document.addEventListener('submit', function(e) {
+    if (e.target && e.target.tagName === 'FORM') saveScrollPos();
+  }, true);
+  window.addEventListener('pagehide', saveScrollPos);
+  window.addEventListener('beforeunload', saveScrollPos);
   // And programmatic form submissions
   var origSubmit = HTMLFormElement.prototype.submit;
   HTMLFormElement.prototype.submit = function() {
-    localStorage.setItem('__bos_scroll', window.pageYOffset || window.scrollY || 0);
+    saveScrollPos();
     origSubmit.call(this);
   };
 </script>
