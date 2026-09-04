@@ -476,12 +476,12 @@ function register(router) {
           <input type="hidden" name="address" value="${escapeHtml(address)}">
           <button class="btn" type="submit">Have Andrew reach out to me</button>
         </form>
-        <a class="btn secondary" href="/book?type=${encodeURIComponent(type)}${contactQS}">Book anyway</a>
+        <a class="btn secondary" href="/book?type=${encodeURIComponent(type)}${contactQS}&force=1">Book anyway</a>
       </div>`;
 
     const outOfAreaBanner = `
       <div class="panel" style="border-left:3px solid #b54f1e">
-        <p style="margin:0">This address is outside the normal service area &mdash; booking anyway. Andrew will be notified.</p>
+        <p style="margin:0">This address may be outside the normal service area &mdash; booking anyway. Andrew will be notified. This may also be a glitch, book anyway works.</p>
       </div>`;
 
     const showScheduler = hasContact && !outOfAreaBlocked;
