@@ -12,6 +12,7 @@ function dashboardLayout({ title, active, body, flash, context }) {
     ['/dashboard', 'Overview'],
     ['/dashboard/funnel', 'Funnel'],
     ['/dashboard/customers', 'Customers'],
+    ['/dashboard/files', 'Files'],
     ['/dashboard/appointments', 'Appointments'],
     ['/dashboard/jobs', 'Jobs'],
     ['/dashboard/production', 'Factory Queue'],
@@ -96,15 +97,16 @@ function assistantWidget(context) {
       ${customerId ? `<p style="margin:0 0 6px;font-size:0.72rem;opacity:0.65">Talking about this customer's record</p>` : ''}
       <div id="assistant-log" style="max-height:260px;overflow-y:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
       <form id="assistant-form" enctype="multipart/form-data">
-        <textarea id="assistant-input" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show" required
+        <textarea id="assistant-input" rows="3" placeholder="e.g. add a lead for Jane Smith, 555-1234, met her at the home show"
           style="width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #444;padding:8px;font:inherit;resize:vertical;background:#12151c;color:#fff"></textarea>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button id="assistant-send" type="submit" style="flex:1;padding:8px;border:0;border-radius:6px;background:#4a7dfc;color:#fff;font-weight:600;cursor:pointer">Send</button>
           <label style="flex:0;padding:8px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer;display:flex;align-items:center">
-            <input type="file" name="assistant-file" accept=".pdf,.doc,.docx,.txt,.jpg,.png,.xlsx,.csv" style="display:none">
+            <input type="file" name="file" accept=".pdf,.txt,.csv,.jpg,.jpeg,.png,.webp,.gif" style="display:none">
             📎
           </label>
         </div>
+        <p id="assistant-file-label" style="margin:6px 0 0;font-size:0.72rem;opacity:0.7"></p>
       </form>
       <button id="assistant-reset" type="button" style="margin-top:8px;width:100%;padding:6px;border:1px solid #555;border-radius:6px;background:transparent;color:#ccc;font-size:0.8rem;cursor:pointer">New conversation</button>
       <p style="margin:8px 0 0;font-size:0.75rem;opacity:0.7">Beta - no deletes yet. Remembers the last few messages.</p>
@@ -120,14 +122,13 @@ function assistantWidget(context) {
   var input = document.getElementById('assistant-input');
   var sendBtn = document.getElementById('assistant-send');
   var resetBtn = document.getElementById('assistant-reset');
-  var fileInput = form.querySelector('input[name="assistant-file"]');
+  var fileInput = form.querySelector('input[name="file"]');
+  var fileLabel = document.getElementById('assistant-file-label');
   var selectedFile = null;
 
   fileInput.addEventListener('change', function () {
     selectedFile = this.files[0] || null;
-    if (selectedFile) {
-      addBubble('user', '📎 ' + selectedFile.name);
-    }
+    fileLabel.textContent = selectedFile ? '📎 ' + selectedFile.name + ' (sends with your next message)' : '';
   });
 
   function addBubble(role, text) {
@@ -161,25 +162,27 @@ function assistantWidget(context) {
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     var message = input.value.trim();
-    if (!message && !selectedFile) return;
-    
-    if (selectedFile) {
-      addBubble('user', '📎 ' + selectedFile.name);
-    } else if (message) {
+    var fileToSend = selectedFile;
+    if (!message && !fileToSend) return;
+
+    if (fileToSend) {
+      addBubble('user', (message ? message + '\n' : '') + '📎 ' + fileToSend.name);
+    } else {
       addBubble('user', message);
     }
-    
+
     input.value = '';
     selectedFile = null;
     fileInput.value = '';
+    fileLabel.textContent = '';
     sendBtn.disabled = true;
     sendBtn.textContent = 'Thinking...';
-    
+
     var formData = new FormData();
     formData.append('message', message);
     if (contextCustomerId) formData.append('context_customer_id', contextCustomerId);
-    if (selectedFile) formData.append('file', selectedFile);
-    
+    if (fileToSend) formData.append('file', fileToSend);
+
     fetch('/dashboard/assistant/chat', {
       method: 'POST',
       body: formData,

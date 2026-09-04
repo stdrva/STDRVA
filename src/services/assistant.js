@@ -10,6 +10,17 @@
 const https = require('https');
 const db = require('../db');
 
+// Sales-training (reps, roleplay/quiz/real-sale logging) was scaffolded -
+// tables, tools, and prompt text - but never finished with a UI and isn't in
+// use. Flipped off here: the tools are withheld from the model and the
+// training section is dropped from the system prompt. The db tables and the
+// runTool cases stay in place so turning this back on is a one-line change.
+const SALES_TRAINING_ENABLED = false;
+
+// Anthropic's per-request payload ceiling for base64 file content. Images and
+// PDFs larger than this are stored but not sent to the model for analysis.
+const MAX_ANALYZE_BYTES = 4.5 * 1024 * 1024;
+
 function assistantConfigured() {
   return !!process.env.ANTHROPIC_API_KEY;
 }
@@ -37,7 +48,7 @@ function getHistory() {
 }
 
 // ---------- Tool definitions (JSON Schema, per Anthropic's tool-use format) ----------
-const TOOLS = [
+const BASE_TOOLS = [
   {
     name: 'find_customers',
     description:
@@ -269,6 +280,106 @@ const TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'search_files',
+    description:
+      'Full-text search across every uploaded file - by filename, its note, and any text previously extracted from it (order forms, invoices the assistant has read). Use this to find "the signed order for the Walker job" or "that invoice from the hinge supplier".',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'list_files',
+    description: 'List uploaded files, optionally filtered to one customer or one job.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        job_id: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'get_file',
+    description:
+      'Get one file: its metadata, the job/customer it belongs to, and anything already extracted from it (extracted_json / extracted_text).',
+    input_schema: {
+      type: 'object',
+      properties: { file_id: { type: 'string' } },
+      required: ['file_id'],
+    },
+  },
+  {
+    name: 'attach_file_to_job',
+    description: 'Tag an existing file to a job so it also shows on that job page. The file still belongs to its customer.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string' },
+        job_id: { type: 'string' },
+      },
+      required: ['file_id', 'job_id'],
+    },
+  },
+  {
+    name: 'save_file_extraction',
+    description:
+      "After reading an uploaded file, record what you found on it so it's searchable later. Pass a compact JSON object of the key fields (products and quantities, unit/total pricing, date sold, promised/due dates, customer name/address, invoice number, etc.) plus a plain-text version. This does NOT create any CRM records - it only annotates the file.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string' },
+        extracted_json: { type: 'object', description: 'Key fields you read off the document.' },
+        extracted_text: { type: 'string', description: 'A plain-text summary of the document contents, for search.' },
+      },
+      required: ['file_id', 'extracted_text'],
+    },
+  },
+  {
+    name: 'create_product',
+    description:
+      'Add a product / factory-order line to a job (a cabinet, a set of pull-outs, etc). Like log_payment/log_expense, this writes real data: state the exact line(s) back to Andrew and wait for his explicit confirmation, then call with confirmed:true. Never create products straight from a document without his yes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string' },
+        name: { type: 'string' },
+        quantity: { type: 'number' },
+        unit_price: { type: 'number' },
+        deadline: { type: 'string', description: 'ISO date' },
+        factory: { type: 'string' },
+        measurements: { type: 'string' },
+        notes: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only true once Andrew has explicitly confirmed this exact line in the conversation.' },
+      },
+      required: ['job_id', 'name', 'confirmed'],
+    },
+  },
+  {
+    name: 'update_job',
+    description:
+      "Update a job's sold amount and/or its customer-facing status. This writes real data: state the change back to Andrew and wait for his explicit confirmation, then call with confirmed:true. Changing status to a value that notifies the customer is not done here - that stays a manual dashboard action.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string' },
+        sold_amount: { type: 'number' },
+        status: {
+          type: 'string',
+          description: 'One of the job stages, e.g. "Order Confirmed", "Measured", "In Production", "Install Scheduled", "Complete".',
+        },
+        note: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only true once Andrew has explicitly confirmed this exact change.' },
+      },
+      required: ['job_id', 'confirmed'],
+    },
+  },
+];
+
+// Withheld from the model unless SALES_TRAINING_ENABLED (see top of file).
+const SALES_TRAINING_TOOLS = [
+  {
     name: 'list_sales_reps',
     description: 'List all sales reps who have a training record.',
     input_schema: { type: 'object', properties: {} },
@@ -314,6 +425,8 @@ const TOOLS = [
     },
   },
 ];
+
+const TOOLS = [...BASE_TOOLS, ...(SALES_TRAINING_ENABLED ? SALES_TRAINING_TOOLS : [])];
 
 // ---------- Tool execution - thin wrappers around db.js ----------
 function runTool(name, input) {
@@ -420,6 +533,79 @@ function runTool(name, input) {
     case 'list_production_queue': {
       return { queue: db.listProductionQueue({ includeDelivered: input.includeDelivered }) };
     }
+    case 'search_files': {
+      return { files: db.searchFiles(input.query) };
+    }
+    case 'list_files': {
+      if (input.job_id) return { files: db.listJobFiles(input.job_id) };
+      if (input.customer_id) return { files: db.listCustomerFiles(input.customer_id) };
+      return { error: 'Pass a customer_id or job_id, or use search_files.' };
+    }
+    case 'get_file': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file) return { error: 'File not found' };
+      let extracted_json = null;
+      try {
+        extracted_json = file.extracted_json ? JSON.parse(file.extracted_json) : null;
+      } catch (e) {
+        extracted_json = file.extracted_json;
+      }
+      return { file: { ...file, extracted_json } };
+    }
+    case 'attach_file_to_job': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file) return { error: 'File not found' };
+      const job = db.getJob(input.job_id);
+      if (!job) return { error: 'Job not found' };
+      db.attachFileToJob(input.file_id, input.job_id);
+      return { ok: true, file_id: input.file_id, job_id: input.job_id, customer_id: file.customer_id };
+    }
+    case 'save_file_extraction': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file) return { error: 'File not found' };
+      db.setFileExtraction(input.file_id, {
+        extracted_text: input.extracted_text || '',
+        extracted_json: input.extracted_json || null,
+        status: 'done',
+      });
+      return { ok: true, file_id: input.file_id, customer_id: file.customer_id };
+    }
+    case 'create_product': {
+      if (input.confirmed !== true) {
+        return { error: 'Not created - restate the exact product line (name, quantity, price, deadline) and wait for Andrew to confirm before calling this again.' };
+      }
+      const job = db.getJob(input.job_id);
+      if (!job) return { error: 'Job not found' };
+      const product = db.createProduct({
+        job_id: input.job_id,
+        name: input.name,
+        quantity: input.quantity || 1,
+        unit_price: input.unit_price,
+        deadline: input.deadline,
+        factory: input.factory,
+        measurements: input.measurements,
+        notes: input.notes,
+      });
+      return { product, customer_id: job.customer_id };
+    }
+    case 'update_job': {
+      if (input.confirmed !== true) {
+        return { error: 'Not changed - restate the exact change (sold amount and/or status) and wait for Andrew to confirm before calling this again.' };
+      }
+      const job = db.getJob(input.job_id);
+      if (!job) return { error: 'Job not found' };
+      if (input.sold_amount !== undefined && input.sold_amount !== null) {
+        db.db.prepare(`UPDATE jobs SET sold_amount = ?, updated_at = ? WHERE id = ?`).run(
+          Number(input.sold_amount),
+          new Date().toISOString(),
+          input.job_id
+        );
+      }
+      if (input.status && input.status !== job.status) {
+        db.updateJobStatus(input.job_id, input.status, input.note || 'Updated via assistant');
+      }
+      return { ok: true, job: db.getJob(input.job_id), customer_id: job.customer_id };
+    }
     case 'get_upcoming_appointment_briefing': {
       const upcoming = db.listAppointments({ upcomingOnly: true });
       if (!upcoming.length) return { message: 'No upcoming appointments scheduled.' };
@@ -454,8 +640,8 @@ function callClaude(messages) {
     const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
     const body = JSON.stringify({
       model,
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      max_tokens: 2048,
+      system: systemPrompt(),
       tools: TOOLS,
       messages,
     });
@@ -492,8 +678,9 @@ function callClaude(messages) {
 }
 
 const SYSTEM_PROMPT = `You are the office manager AND financial analyst for the Shelves to Drawers RVA CRM.
-You have tools to look up and change customers, leads, appointments, payments, and expenses,
-plus reporting tools for cash flow, P&L, accounts receivable, expense run-rate, and the
+You have tools to look up and change customers, leads, appointments, payments, expenses,
+jobs, and product/factory-order lines; to search and read uploaded files; plus reporting
+tools for cash flow, P&L, accounts receivable, expense run-rate, and the
 production queue. Andrew wants to be able to actually talk through business questions with
 you - "can I afford to buy the truck this month," "why does next month look tight," "which
 customers still owe me money" - not just issue one-line commands. Use the reporting tools
@@ -525,18 +712,24 @@ Financial reasoning rules - these matter more than being fast:
   that a job's remaining balance is due the day of its Install appointment. A job with no
   Install scheduled yet has no known due date - report that plainly ("no install scheduled,
   timing unknown") instead of estimating one.
-- log_payment and log_expense are real entries in the books. Before calling either, state
-  the exact amount, category/vendor, method, and date back to Andrew in plain text and wait
-  for him to confirm in a later message - then, and only then, call the tool with
-  confirmed:true. Never set confirmed:true on your own inference that he agreed; it needs an
-  actual yes from him in this conversation. This applies even if he was the one who told you
-  the numbers in the first place - stating a number isn't the same as confirming the entry.
+- log_payment, log_expense, create_product, and update_job are real writes. Before calling
+  any of them, state the exact entry (amount, category/vendor, method, date; or the product
+  line; or the job change) back to Andrew in plain text and wait for him to confirm in a
+  later message - then, and only then, call the tool with confirmed:true. Never set
+  confirmed:true on your own inference that he agreed; it needs an actual yes from him in
+  this conversation. This applies even if he was the one who told you the numbers in the
+  first place - stating a number isn't the same as confirming the entry.
 
-You can see the recent conversation, so pronouns and follow-ups ("her", "that job", "do the
-same for the other one") refer back to what was already discussed - use that context instead
-of asking Andrew to repeat himself. That history can go stale, though: always re-check current
-facts (a customer's stage, a job's balance, etc.) with the lookup tools before acting, rather
-than trusting a number or status mentioned earlier in the conversation.
+Files: when Andrew uploads a file it has already been saved and its id is given to you in
+the message. Read it, then call save_file_extraction with a compact JSON of the key fields
+(products and quantities, unit and total pricing, date sold, promised or due dates, customer
+name and address, invoice or order number) and a short plain-text summary - this only
+annotates the file so it's searchable later, it creates nothing. If the document implies CRM
+records - a signed order means a job sold_amount plus product lines plus deadlines; a
+supplier invoice means an expense - propose each entry in plain text and wait for Andrew's
+explicit confirmation before any confirmed:true call. Never create records straight from a
+document. Use attach_file_to_job to tie a file to the right job. Use search_files to find an
+existing document Andrew refers to.
 
 You can see the recent conversation, so pronouns and follow-ups ("her", "that job", "do the
 same for the other one") refer back to what was already discussed - use that context instead
@@ -550,41 +743,87 @@ deleting it (like blanking out its fields, marking it some improvised "deleted" 
 moving it somewhere), and do not imply you handled it. Just say plainly that deletions aren't
 something you can do and have to be done manually in the dashboard.
 
-You also have sales-training tools: get_upcoming_appointment_briefing (pulls the next
-appointment and that customer's notes/discovery answers, for prepping a pitch beforehand),
-list_sales_reps / create_sales_rep, get_training_history (a rep's past role-plays, quizzes, and
-real-sale outcomes), and log_training_session. The single most important use of these: right
-after Andrew reports how an actual sales call went, log it as a real_sale session with a
-specific, honest summary of what worked and what didn't and an outcome of won/lost - that real
-feedback matters more than role-play. Only pull get_training_history when it's actually relevant
-(prepping a briefing, discussing a rep's progress) - don't fetch it on unrelated requests.`;
+You also have get_upcoming_appointment_briefing - it pulls the next appointment and that
+customer's notes and discovery-wizard answers (rooms, pets, prior experience, product
+interest), for prepping a pitch beforehand. Only use it when Andrew is actually prepping for
+a visit.`;
+
+// Appended to SYSTEM_PROMPT only when SALES_TRAINING_ENABLED (see top of file).
+const SALES_TRAINING_PROMPT = `
+
+You also have sales-training tools: list_sales_reps / create_sales_rep, get_training_history
+(a rep's past role-plays, quizzes, and real-sale outcomes), and log_training_session. The
+single most important use: right after Andrew reports how an actual sales call went, log it
+as a real_sale session with a specific, honest summary of what worked and what didn't and an
+outcome of won/lost. Only pull get_training_history when it's actually relevant.`;
+
+function systemPrompt() {
+  return SYSTEM_PROMPT + (SALES_TRAINING_ENABLED ? SALES_TRAINING_PROMPT : '');
+}
 
 // Runs the full tool-use loop for one user message. Returns
 // { summary, changedCustomerId, toolLog } - toolLog is for debugging/display.
-async function handleMessage(userMessage, context = {}) {
+async function handleMessage(userMessage, context = {}, opts = {}) {
   if (!assistantConfigured()) {
     return { summary: 'AI assistant not configured - set ANTHROPIC_API_KEY to enable it.', error: true };
   }
 
+  const file = opts.file || null;
+
   // If Andrew is looking at a specific customer's page when he sends a
   // message, tell the model that directly - otherwise "update the phone
-  // number" has no idea who "the record" means. This note is only sent to
+  // number" has no idea who "the record" means. These notes are only sent to
   // the model for this turn; the clean userMessage (no note) is what gets
   // persisted to conversationHistory and shown back in the chat log.
-  let modelMessage = userMessage;
+  const notes = [];
   if (context.customerId) {
     const currentCustomer = db.getCustomer(context.customerId);
     if (currentCustomer) {
-      modelMessage = `[Andrew is currently viewing the record for customer "${currentCustomer.name}" (id: ${currentCustomer.id}). If his message below refers to "this customer," "this record," "them," etc. without naming someone else, it means this one.]\n\n${userMessage}`;
+      notes.push(
+        `[Andrew is currently viewing the record for customer "${currentCustomer.name}" (id: ${currentCustomer.id}). If his message below refers to "this customer," "this record," "them," etc. without naming someone else, it means this one.]`
+      );
     }
   }
 
-  const messages = [...conversationHistory, { role: 'user', content: modelMessage }];
+  // An uploaded file has already been saved (see the route). Build the first
+  // user turn as content blocks so the model can actually read images / PDFs;
+  // text files are inlined. conversationHistory still only ever stores the
+  // plain userMessage string (see remember()), so binary never enters history.
+  let userContent = [notes.join('\n'), userMessage].filter(Boolean).join('\n\n') || '(no message)';
+  if (file) {
+    let mime = (file.mimeType || '').toLowerCase();
+    if (mime === 'image/jpg') mime = 'image/jpeg'; // Anthropic wants image/jpeg
+    const tooBig = file.buffer.length > MAX_ANALYZE_BYTES;
+    const blocks = [];
+    let fileNote = `[Andrew uploaded a file: "${file.filename}" (${mime || 'unknown type'}, ${Math.round(file.buffer.length / 1024)} KB). It is already saved as file_id ${file.id}.`;
+
+    if (tooBig) {
+      fileNote += ` It is too large to analyze here (${Math.round(file.buffer.length / 1024 / 1024)} MB) - it is stored, tell Andrew it needs to be reviewed by hand.]`;
+      db.setFileExtraction(file.id, { status: 'unsupported', extracted_text: '', extracted_json: null });
+    } else if (mime.startsWith('image/')) {
+      fileNote += ` Read it below, then follow the Files instructions.]`;
+      blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data: file.buffer.toString('base64') } });
+    } else if (mime === 'application/pdf') {
+      fileNote += ` Read it below, then follow the Files instructions.]`;
+      blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: file.buffer.toString('base64') } });
+    } else if (mime.startsWith('text/') || mime === 'application/csv' || /\.(txt|csv|md)$/i.test(file.filename)) {
+      const text = file.buffer.toString('utf-8').slice(0, 100000);
+      fileNote += ` Its contents:]\n\n${text}`;
+    } else {
+      fileNote += ` This file type can't be read here - it is stored; tell Andrew it needs manual review.]`;
+      db.setFileExtraction(file.id, { status: 'unsupported', extracted_text: '', extracted_json: null });
+    }
+
+    blocks.unshift({ type: 'text', text: [userContent === '(no message)' ? '' : userContent, fileNote].filter(Boolean).join('\n\n') });
+    userContent = blocks;
+  }
+
+  const messages = [...conversationHistory, { role: 'user', content: userContent }];
   const toolLog = [];
   let changedCustomerId = null;
 
   function remember(assistantText) {
-    conversationHistory.push({ role: 'user', content: userMessage });
+    conversationHistory.push({ role: 'user', content: userMessage || (file ? `(uploaded file: ${file.filename})` : '(no message)') });
     conversationHistory.push({ role: 'assistant', content: assistantText });
     const maxMessages = MAX_HISTORY_TURNS * 2;
     if (conversationHistory.length > maxMessages) {

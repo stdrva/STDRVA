@@ -183,6 +183,48 @@ CREATE TABLE IF NOT EXISTS customer_files (
   }
 })();
 
+// ---- Migration: customer_files gains a job link + AI-extraction columns.
+// Additive only, same guarded pattern as migrateProductsTable above. A file
+// always belongs to a customer; job_id is an optional tag so it also shows up
+// on that job's page. The extracted_* columns hold whatever the Office Manager
+// Assistant mines out of an uploaded order form / invoice, so it's searchable
+// later. ----
+(function migrateCustomerFilesTable() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
+  const newColumns = [
+    ['job_id', 'TEXT'],
+    ['extracted_text', 'TEXT'],
+    ['extracted_json', 'TEXT'],
+    ['extraction_status', 'TEXT'],
+    ['extracted_at', 'TEXT'],
+  ];
+  for (const [col, type] of newColumns) {
+    if (!existing.has(col)) db.exec(`ALTER TABLE customer_files ADD COLUMN ${col} ${type}`);
+  }
+})();
+
+// ---- Full-text search over uploaded files (filename, manual note, and any
+// text the Assistant extracted from the file). Standalone FTS5 table kept in
+// sync by hand inside the file functions below - the rest of this codebase
+// uses no triggers, so neither does this. ----
+db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5(
+  file_id UNINDEXED, original_name, note, extracted_text
+);`);
+(function backfillFileSearch() {
+  const indexed = db.prepare(`SELECT COUNT(*) as n FROM file_search`).get().n;
+  const files = db.prepare(`SELECT COUNT(*) as n FROM customer_files`).get().n;
+  if (indexed > 0 || files === 0) return;
+  const rows = db.prepare(`SELECT id, original_name, note, extracted_text FROM customer_files`).all();
+  for (const r of rows) {
+    db.prepare(`INSERT INTO file_search (file_id, original_name, note, extracted_text) VALUES (?,?,?,?)`).run(
+      r.id,
+      r.original_name || '',
+      r.note || '',
+      r.extracted_text || ''
+    );
+  }
+})();
+
 // ---- Seed default product option lists (mount styles, rail types, colors,
 // cabinet types) from the real G-O Manufacturing wholesale order form, so
 // the dropdowns are useful out of the box. Only seeds if a category is
@@ -545,21 +587,89 @@ function getProductHistory(product_id) {
 // Actual bytes live on disk under DATA_DIR/uploads/<customer_id>/<stored_name>
 // (see UPLOADS_DIR below); this table just tracks the metadata so it can be
 // listed/served/deleted per customer.
-function createCustomerFile({ customer_id, stored_name, original_name, mime_type, size, note }) {
+function syncFileSearch(id) {
+  const f = db.prepare(`SELECT id, original_name, note, extracted_text FROM customer_files WHERE id = ?`).get(id);
+  db.prepare(`DELETE FROM file_search WHERE file_id = ?`).run(id);
+  if (!f) return;
+  db.prepare(`INSERT INTO file_search (file_id, original_name, note, extracted_text) VALUES (?,?,?,?)`).run(
+    f.id,
+    f.original_name || '',
+    f.note || '',
+    f.extracted_text || ''
+  );
+}
+function createCustomerFile({ customer_id, job_id, stored_name, original_name, mime_type, size, note }) {
   const id = newId();
   db.prepare(
-    `INSERT INTO customer_files (id, customer_id, stored_name, original_name, mime_type, size, note, created_at) VALUES (?,?,?,?,?,?,?,?)`
-  ).run(id, customer_id, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
+    `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, job_id || null, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
+  syncFileSearch(id);
   return id;
 }
 function listCustomerFiles(customer_id) {
-  return db.prepare(`SELECT * FROM customer_files WHERE customer_id = ? ORDER BY created_at DESC`).all(customer_id);
+  return db
+    .prepare(
+      `SELECT customer_files.*, jobs.status as job_status
+       FROM customer_files LEFT JOIN jobs ON jobs.id = customer_files.job_id
+       WHERE customer_files.customer_id = ? ORDER BY customer_files.created_at DESC`
+    )
+    .all(customer_id);
+}
+function listJobFiles(job_id) {
+  return db.prepare(`SELECT * FROM customer_files WHERE job_id = ? ORDER BY created_at DESC`).all(job_id);
 }
 function getCustomerFile(id) {
   return db.prepare(`SELECT * FROM customer_files WHERE id = ?`).get(id) || null;
 }
+function attachFileToJob(id, job_id) {
+  db.prepare(`UPDATE customer_files SET job_id = ? WHERE id = ?`).run(job_id || null, id);
+  return getCustomerFile(id);
+}
+function setFileExtraction(id, { extracted_text, extracted_json, status }) {
+  db.prepare(
+    `UPDATE customer_files SET extracted_text = ?, extracted_json = ?, extraction_status = ?, extracted_at = ? WHERE id = ?`
+  ).run(
+    extracted_text || null,
+    extracted_json ? (typeof extracted_json === 'string' ? extracted_json : JSON.stringify(extracted_json)) : null,
+    status || 'done',
+    nowIso(),
+    id
+  );
+  syncFileSearch(id);
+  return getCustomerFile(id);
+}
+// Turns free user text into a safe FTS5 MATCH string: each whitespace-separated
+// token becomes a quoted prefix term, so punctuation in the query can't produce
+// an FTS syntax error. Empty query -> null (caller should skip the search).
+function toFtsQuery(raw) {
+  const tokens = String(raw || '')
+    .split(/\s+/)
+    .map((t) => t.replace(/"/g, '').trim())
+    .filter(Boolean);
+  if (!tokens.length) return null;
+  return tokens.map((t) => `"${t}"*`).join(' ');
+}
+function searchFiles(query) {
+  const match = toFtsQuery(query);
+  if (!match) return [];
+  return db
+    .prepare(
+      `SELECT customer_files.*, customers.name as customer_name, jobs.status as job_status,
+         snippet(file_search, 3, '[', ']', ' … ', 12) as snippet
+       FROM file_search
+       JOIN customer_files ON customer_files.id = file_search.file_id
+       LEFT JOIN customers ON customers.id = customer_files.customer_id
+       LEFT JOIN jobs ON jobs.id = customer_files.job_id
+       WHERE file_search MATCH ?
+       ORDER BY rank
+       LIMIT 50`
+    )
+    .all(match);
+}
 function deleteCustomerFile(id) {
   db.prepare(`DELETE FROM customer_files WHERE id = ?`).run(id);
+  db.prepare(`DELETE FROM file_search WHERE file_id = ?`).run(id);
 }
 
 // ---- Sales training ----
@@ -894,7 +1004,11 @@ module.exports = {
   deleteProductOption,
   createCustomerFile,
   listCustomerFiles,
+  listJobFiles,
   getCustomerFile,
+  attachFileToJob,
+  setFileExtraction,
+  searchFiles,
   deleteCustomerFile,
   createSalesRep,
   listSalesReps,

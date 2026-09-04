@@ -1,7 +1,31 @@
 # Changelog
 
-Version numbers follow semver (MAJOR.MINOR.PATCH), with a `-beta.N` suffix for anything
-being tested on a beta deployment before it's promoted to the regular/production one.
+Version numbers follow semver: MAJOR.MINOR.PATCH. Bump PATCH for fixes, MINOR for a new
+feature, MAJOR only for a big breaking change. Changes are tested locally and then deployed
+straight to the live site - there's no separate beta/staging deployment, and older entries
+below that carry a `-beta.N` suffix predate that decision.
+
+## 1.3.0 (2026-09-03)
+- Added: files can now be attached to a **job**, not just a customer. Every file still
+  belongs to a customer; a job tag makes it show on that job's page too. New Files panel on
+  the job page (`src/routes/dashboard.js`), a Job selector on the customer upload form, and
+  a new **Files** nav item / `/dashboard/files` page that full-text searches every file by
+  name, note, and extracted contents (SQLite FTS5, `file_search` table in `src/db.js`).
+- Added: the Office Manager Assistant's file-upload button actually works now. An uploaded
+  file is stored immediately (kept whether or not the assistant is configured), then images
+  and PDFs are sent to Claude for reading, text/CSV files are inlined. New assistant tools:
+  `search_files`, `list_files`, `get_file`, `attach_file_to_job`, `save_file_extraction`
+  (annotates a file with what was read off it, for later search), plus `create_product` and
+  `update_job` (both `confirmed:true`-gated like `log_payment`/`log_expense`). The assistant
+  proposes CRM records from a document and waits for Andrew's yes before writing anything.
+- Fixed: the assistant upload was doubly broken - the browser cleared the file before
+  sending it, and the server read every file (image, PDF) as UTF-8 text. Both fixed.
+- Changed: sales-training scaffolding (reps, roleplay/quiz/real-sale logging) is disabled -
+  `SALES_TRAINING_ENABLED = false` in `src/services/assistant.js` withholds those tools and
+  drops the training section from the system prompt. Tables and code stay in place; it was
+  never finished with a UI or used.
+- Removed: dead `npm run seed` script (pointed at a file that never existed).
+- Fixed: duplicated paragraph in the assistant system prompt.
 
 ## 1.2.0-beta.1 (2026-09-01)
 - Added: public booking page now requires a customer's name, phone, email, and full home

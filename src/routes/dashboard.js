@@ -12,9 +12,29 @@ const assistant = require('../services/assistant');
 // reachable through the authenticated download route below.
 const UPLOADS_DIR = path.join(db.DATA_DIR, 'uploads');
 function customerUploadsDir(customerId) {
-  const dir = path.join(UPLOADS_DIR, customerId);
+  const dir = path.join(UPLOADS_DIR, customerId || '_unassigned');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// Writes an uploaded file (from router's multipart parser - { filename,
+// mimeType, data: Buffer }) to disk under the owning customer's folder and
+// records it in customer_files, optionally tagged to a job. Returns the new
+// file id. Shared by the customer Files panel, the job Files panel, and the
+// Assistant chat upload.
+function saveUpload({ customer_id, job_id, upload, note }) {
+  const ext = path.extname(upload.filename || '') || '';
+  const storedName = `${newId()}${ext}`;
+  fs.writeFileSync(path.join(customerUploadsDir(customer_id), storedName), upload.data);
+  return db.createCustomerFile({
+    customer_id,
+    job_id: job_id || null,
+    stored_name: storedName,
+    original_name: upload.filename || storedName,
+    mime_type: upload.mimeType || null,
+    size: upload.data.length,
+    note: note || null,
+  });
 }
 
 function stageBadgeClass(stage) {
@@ -192,19 +212,23 @@ function register(router, requireAuth) {
         <h2 style="margin-top:0">Files</h2>
         <p class="subtitle">Photos, measurement sheets, contracts - anything for this customer. Only visible here in the dashboard.</p>
         <form method="POST" action="/dashboard/customers/${c.id}/files" enctype="multipart/form-data">
-          <div class="grid cols-2">
+          <div class="grid cols-3">
             <div><label>File</label><input type="file" name="file" required></div>
             <div><label>Note (optional)</label><input type="text" name="note" placeholder="e.g. kitchen measurements"></div>
+            <div><label>Job (optional)</label><select name="job_id"><option value="">- not job-specific -</option>${jobs
+              .map((j) => `<option value="${j.id}">${escapeHtml(j.status)}${j.sold_amount ? ' · ' + fmtMoney(j.sold_amount) : ''}</option>`)
+              .join('')}</select></div>
           </div>
           <div style="margin-top:12px"><button class="btn secondary" type="submit">Upload</button></div>
         </form>
         ${
           files.length
-            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Uploaded</th><th></th></tr>${files
+            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
                 .map(
                   (f) => `<tr>
-                    <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a></td>
+                    <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
                     <td>${escapeHtml(f.note || '')}</td>
+                    <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
                     <td>${fmtDateTime(f.created_at)}</td>
                     <td style="white-space:nowrap">
                       ${(f.mime_type || '').startsWith('image/') ? `<a class="btn small secondary" href="/dashboard/customers/${c.id}/files/${f.id}/sign">Sign</a> ` : ''}
@@ -284,17 +308,12 @@ function register(router, requireAuth) {
     if (!upload || !upload.filename) {
       return res.redirect(`/dashboard/customers/${c.id}?err=Choose a file first`);
     }
-    const ext = path.extname(upload.filename);
-    const storedName = `${newId()}${ext}`;
-    fs.writeFileSync(path.join(customerUploadsDir(c.id), storedName), upload.data);
-    db.createCustomerFile({
-      customer_id: c.id,
-      stored_name: storedName,
-      original_name: upload.filename,
-      mime_type: upload.mimeType,
-      size: upload.data.length,
-      note: req.body.note || null,
-    });
+    let jobId = req.body.job_id || null;
+    if (jobId) {
+      const job = db.getJob(jobId);
+      if (!job || job.customer_id !== c.id) jobId = null;
+    }
+    saveUpload({ customer_id: c.id, job_id: jobId, upload, note: req.body.note || null });
     res.redirect(`/dashboard/customers/${c.id}?ok=File uploaded`);
   });
 
@@ -656,6 +675,7 @@ function register(router, requireAuth) {
     const paidTotal = payments.reduce((s, p) => s + Number(p.amount), 0);
     const statusUrl = automations.statusUrl(job.public_token);
     const products = db.listProductsForJob(job.id);
+    const jobFiles = db.listJobFiles(job.id);
 
     const body = `
       <h1>Job for ${escapeHtml(customer.name)}</h1>
@@ -757,8 +777,92 @@ function register(router, requireAuth) {
             : `<p class="subtitle">No products added to this job's factory order yet.</p>`
         }
       </div>
+
+      <div class="panel">
+        <h2 style="margin-top:0">Files</h2>
+        <p class="subtitle">Order forms, measurement sheets, invoices, install photos - anything for this job. Also shows on <a href="/dashboard/customers/${customer.id}">${escapeHtml(customer.name)}</a>'s page and is searchable from <a href="/dashboard/files">Files</a>.</p>
+        <form method="POST" action="/dashboard/jobs/${job.id}/files" enctype="multipart/form-data">
+          <div class="grid cols-2">
+            <div><label>File</label><input type="file" name="file" required></div>
+            <div><label>Note (optional)</label><input type="text" name="note" placeholder="e.g. signed order form"></div>
+          </div>
+          <div style="margin-top:12px"><button class="btn secondary" type="submit">Upload</button></div>
+        </form>
+        ${
+          jobFiles.length
+            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Uploaded</th><th></th></tr>${jobFiles
+                .map(
+                  (f) => `<tr>
+                    <td><a href="/dashboard/customers/${customer.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
+                    <td>${escapeHtml(f.note || '')}</td>
+                    <td>${fmtDateTime(f.created_at)}</td>
+                    <td style="white-space:nowrap">
+                      <form class="inline" method="POST" action="/dashboard/jobs/${job.id}/files/${f.id}/delete" onsubmit="return confirm('Delete this file?')"><button class="btn small danger" type="submit">Delete</button></form>
+                    </td>
+                  </tr>`
+                )
+                .join('')}</table>`
+            : `<p class="subtitle">No files on this job yet.</p>`
+        }
+      </div>
     `;
     res.send(dashboardLayout({ title: 'Job', active: '/dashboard/jobs', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/jobs/:id/files', requireAuth, (req, res) => {
+    const job = db.getJob(req.params.id);
+    if (!job) return res.status(404).send('Job not found');
+    const upload = (req.files || []).find((f) => f.fieldname === 'file');
+    if (!upload || !upload.filename) return res.redirect(`/dashboard/jobs/${job.id}?err=Choose a file first`);
+    saveUpload({ customer_id: job.customer_id, job_id: job.id, upload, note: req.body.note || null });
+    res.redirect(`/dashboard/jobs/${job.id}?ok=File uploaded`);
+  });
+
+  router.post('/dashboard/jobs/:id/files/:fileId/delete', requireAuth, (req, res) => {
+    const job = db.getJob(req.params.id);
+    const f = db.getCustomerFile(req.params.fileId);
+    if (job && f && f.job_id === job.id) {
+      const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
+      fs.existsSync(filePath) && fs.unlinkSync(filePath);
+      db.deleteCustomerFile(f.id);
+    }
+    res.redirect(`/dashboard/jobs/${req.params.id}?ok=File deleted`);
+  });
+
+  // ---------- Files search (across all customers + jobs) ----------
+  router.get('/dashboard/files', requireAuth, (req, res) => {
+    const q = (req.query.q || '').trim();
+    const results = q ? db.searchFiles(q) : [];
+    const body = `
+      <h1>Files</h1>
+      <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents.</p>
+      <div class="panel">
+        <form method="GET" action="/dashboard/files">
+          <div class="grid cols-3">
+            <div style="grid-column: span 2"><label>Search</label><input type="text" name="q" value="${escapeHtml(q)}" placeholder="customer name, product, invoice number, amount..." autofocus></div>
+            <div style="align-self:end"><button class="btn" type="submit">Search</button></div>
+          </div>
+        </form>
+        ${
+          !q
+            ? '<p class="subtitle">Type something above to search.</p>'
+            : results.length
+              ? `<table style="margin-top:14px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${results
+                  .map(
+                    (f) => `<tr>
+                      <td><a href="/dashboard/customers/${f.customer_id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a></td>
+                      <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : ''}</td>
+                      <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
+                      <td class="subtitle" style="margin:0">${escapeHtml(f.snippet || f.note || '')}</td>
+                      <td>${fmtDate(f.created_at)}</td>
+                    </tr>`
+                  )
+                  .join('')}</table>`
+              : '<p class="subtitle">No files matched.</p>'
+        }
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Files', active: '/dashboard/files', body, flash: flashFromQuery(req.query) }));
   });
 
   router.post('/dashboard/jobs/:id/products', requireAuth, (req, res) => {
@@ -1332,15 +1436,32 @@ function register(router, requireAuth) {
 
   router.post('/dashboard/assistant/chat', requireAuth, async (req, res) => {
     const message = (req.body.message || '').trim();
-    const file = req.files && req.files[0] ? req.files[0] : null;
-    if (!message && !file) return res.status(400).json({ error: 'Type something or upload a file' });
-    
-    const context = req.body.context_customer_id ? { customerId: req.body.context_customer_id } : {};
-    let fileContent = '';
-    if (file) {
-      fileContent = file.data.toString('utf-8');
+    const upload = req.files && req.files[0] ? req.files[0] : null;
+    if (!message && !upload) return res.status(400).json({ error: 'Type something or upload a file' });
+
+    const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
+    const context = ctxCustomer ? { customerId: ctxCustomer.id } : {};
+
+    // The uploaded file is stored immediately, whether or not the assistant is
+    // configured - "keep every file" is the point. It's tagged to the customer
+    // whose page Andrew is on (if any); the assistant can re-tag it to a job.
+    let file = null;
+    if (upload && upload.filename) {
+      const fileId = saveUpload({
+        customer_id: ctxCustomer ? ctxCustomer.id : null,
+        job_id: null,
+        upload,
+        note: 'Uploaded via assistant chat',
+      });
+      file = {
+        id: fileId,
+        filename: upload.filename,
+        mimeType: upload.mimeType || 'application/octet-stream',
+        buffer: upload.data,
+      };
     }
-    const result = await assistant.handleMessage(message, context, { file, fileContent });
+
+    const result = await assistant.handleMessage(message, context, { file });
     res.json({
       summary: result.summary,
       error: !!result.error,
