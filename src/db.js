@@ -3,9 +3,11 @@ const fs = require('fs');
 const { DatabaseSync } = require('node:sqlite');
 const { newId, newToken, nowIso } = require('./util');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+// DB location is overridable via BOS_DB_PATH so the test suite can run against
+// a throwaway file instead of the live database. Production/dev leave it unset.
+const DB_PATH = process.env.BOS_DB_PATH || path.join(__dirname, '..', 'data', 's2d-crm.sqlite3');
+const DATA_DIR = path.dirname(DB_PATH);
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, 's2d-crm.sqlite3');
 
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
@@ -248,8 +250,256 @@ db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5(
   }
 })();
 
+// ============================================================================
+// Phase 2 (Customer Operations + KPI/marketing/bookkeeping capture) schema.
+// All additive. New tables use CREATE TABLE IF NOT EXISTS; new columns on
+// existing tables use the same guarded ALTER pattern as migrateProductsTable
+// so a populated production database upgrades in place with no data loss.
+// ============================================================================
+db.exec(`
+CREATE TABLE IF NOT EXISTS activity_log (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,           -- 'customer' | 'appointment' | 'job' | 'followup' | 'expense' | ...
+  entity_id TEXT NOT NULL,
+  customer_id TEXT,                    -- denormalized so a customer's whole history is one indexed query
+  field TEXT,                          -- what changed, e.g. 'sales_stage'
+  old_value TEXT,
+  new_value TEXT,
+  note TEXT,
+  actor TEXT NOT NULL DEFAULT 'system', -- 'user:andrew' | 'assistant' | 'system' | 'public'
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_customer ON activity_log(customer_id, created_at);
+
+CREATE TABLE IF NOT EXISTS followups (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id),
+  kind TEXT NOT NULL DEFAULT 'next_action',  -- next_action | follow_up | estimate | referrals | reschedule | custom
+  title TEXT NOT NULL,
+  detail TEXT,
+  due_at TEXT,
+  status TEXT NOT NULL DEFAULT 'open',        -- open | done | dismissed
+  created_by TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  completed_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_followups_customer ON followups(customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_followups_open ON followups(status, due_at);
+
+CREATE TABLE IF NOT EXISTS marketing_sources (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  notes TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS marketing_campaigns (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES marketing_sources(id),
+  name TEXT NOT NULL,
+  tracking_phone TEXT,                 -- dedicated inbound number; stored normalized (+1XXXXXXXXXX)
+  start_date TEXT,
+  end_date TEXT,
+  cost REAL,                           -- total spend for the campaign
+  status TEXT NOT NULL DEFAULT 'active', -- active | ended | planned
+  notes TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_tracking_phone ON marketing_campaigns(tracking_phone);
+
+-- Append-only. The FIRST row for a customer is their original attribution and
+-- is never rewritten; later rows record re-attribution with who/when/why.
+CREATE TABLE IF NOT EXISTS customer_attribution (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL REFERENCES customers(id),
+  source_id TEXT REFERENCES marketing_sources(id),
+  campaign_id TEXT REFERENCES marketing_campaigns(id),
+  tracking_phone TEXT,
+  note TEXT,
+  actor TEXT NOT NULL DEFAULT 'system',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attribution_customer ON customer_attribution(customer_id, created_at);
+
+CREATE TABLE IF NOT EXISTS chart_of_accounts (
+  id TEXT PRIMARY KEY,
+  code TEXT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'expense', -- expense | income | asset | liability | equity
+  active INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+`);
+
+(function migrateCustomersTable() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(customers)`).all().map((c) => c.name));
+  const cols = [
+    ['sales_stage', 'TEXT'],
+    ['stage_substatus', 'TEXT'],
+    ['dormant', 'INTEGER NOT NULL DEFAULT 0'],
+    ['updated_at', 'TEXT'],
+    ['source_id', 'TEXT'],
+    ['campaign_id', 'TEXT'],
+    ['first_contact_at', 'TEXT'], // when they became a Bona Fide Lead (KPI denominator anchor)
+  ];
+  for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE customers ADD COLUMN ${col} ${type}`);
+})();
+
+(function migrateAppointmentsTable() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(appointments)`).all().map((c) => c.name));
+  const cols = [
+    ['updated_at', 'TEXT'],
+    ['completed_at', 'TEXT'],
+    ['google_event_id', 'TEXT'], // reserved: Google Calendar becomes authoritative later
+    ['created_by', 'TEXT'],
+  ];
+  for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE appointments ADD COLUMN ${col} ${type}`);
+})();
+
+(function migrateExpensesTable() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(expenses)`).all().map((c) => c.name));
+  const cols = [
+    ['merchant', 'TEXT'],
+    ['memo', 'TEXT'],
+    ['coa_account', 'TEXT'],           // Chart of Accounts name; null => needs review
+    ['payment_account', 'TEXT'],       // "Business checking", "Amex", etc.
+    ['entry_source', 'TEXT'],          // manual | voice | upload | assistant | email | bank_import
+    ['reconciliation_status', "TEXT NOT NULL DEFAULT 'unreconciled'"], // unreconciled | matched | reconciled
+    ['receipt_file_id', 'TEXT'],       // customer_files.id of an attached receipt
+    ['external_ref', 'TEXT'],          // bank/card transaction id, for future match-not-duplicate
+    ['expense_at', 'TEXT'],            // full timestamp (expense_date stays for back-compat)
+    ['needs_review', 'INTEGER NOT NULL DEFAULT 0'],
+    ['created_by', 'TEXT'],
+  ];
+  for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE expenses ADD COLUMN ${col} ${type}`);
+})();
+
+(function migrateCustomerFilesSoftDelete() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
+  if (!existing.has('deleted_at')) db.exec(`ALTER TABLE customer_files ADD COLUMN deleted_at TEXT`);
+  if (!existing.has('deleted_by')) db.exec(`ALTER TABLE customer_files ADD COLUMN deleted_by TEXT`);
+})();
+
+// ---- Chart of Accounts seed (only if empty). Small-shop Schedule-C shaped
+// buckets; editable later. ----
+(function seedChartOfAccounts() {
+  const n = db.prepare(`SELECT COUNT(*) as n FROM chart_of_accounts`).get().n;
+  if (n > 0) return;
+  const accounts = [
+    ['4000', 'Job Revenue', 'income'],
+    ['4100', 'Other Income', 'income'],
+    ['5000', 'Materials & Supplies', 'expense'],
+    ['5100', 'Subcontractors & Labor', 'expense'],
+    ['5200', 'Cabinet Hardware', 'expense'],
+    ['5300', 'Tools & Equipment', 'expense'],
+    ['6000', 'Vehicle & Fuel', 'expense'],
+    ['6100', 'Insurance', 'expense'],
+    ['6200', 'Rent & Utilities', 'expense'],
+    ['6300', 'Marketing & Advertising', 'expense'],
+    ['6400', 'Software & Office', 'expense'],
+    ['6500', 'Professional Fees (legal/accounting)', 'expense'],
+    ['6600', 'Bank & Merchant Fees', 'expense'],
+    ['6700', 'Meals', 'expense'],
+    ['6800', 'Shipping & Freight', 'expense'],
+    ['9000', 'Uncategorized / Needs Review', 'expense'],
+    ['9900', 'Other', 'expense'],
+  ];
+  accounts.forEach(([code, name, type], i) => {
+    db.prepare(`INSERT INTO chart_of_accounts (id, code, name, type, active, sort_order, created_at) VALUES (?,?,?,?,1,?,?)`)
+      .run(newId(), code, name, type, i, nowIso());
+  });
+})();
+
 // ---- Funnel / job stage config ----
+// LEGACY lead stages - kept so the old leads table + funnel keep working while
+// the customer-level sales model (SALES_STAGES below) becomes the source of truth.
 const LEAD_STAGES = ['New Lead', 'Contacted', 'Quoted', 'Sold', 'Lost'];
+
+// ---- Sales model (Phase 2) -------------------------------------------------
+// The PRIMARY, measurable stage of the opportunity. There is deliberately no
+// generic "Lost": a customer that hasn't bought is still active/dormant, not
+// lost. The only terminal negative is an explicit mutual "Closed / We Declined".
+const SALES_STAGES = [
+  'Bona Fide Lead',
+  'Design Appointment Set',
+  'Design Appointment Completed',
+  'Estimate Presented',
+  'Sold',
+  'Closed / We Declined Customer',
+];
+// The forward funnel for KPI conversion math (excludes the terminal disposition).
+const SALES_FUNNEL = SALES_STAGES.slice(0, 5);
+
+// Attention sub-statuses are advisory and stage-scoped. They say what needs
+// doing; they do NOT move the KPI stage. '' / null means "nothing flagged".
+const STAGE_SUBSTATUSES = {
+  'Bona Fide Lead': ['New - needs first contact', 'Attempting contact', 'Waiting on customer', 'Dormant'],
+  'Design Appointment Set': ['Upcoming', 'Past / Missed', 'Reschedule Needed'],
+  'Design Appointment Completed': [
+    'Estimate Promised',
+    'Estimate Being Prepared',
+    'Estimate Due Soon',
+    'Estimate Overdue',
+    'No Estimate Required',
+  ],
+  'Estimate Presented': [
+    'Needs Further Action',
+    'Follow-up Scheduled',
+    'Follow-up Due',
+    'Follow-up Overdue',
+    'Revision Needed',
+    'Customer Requested Information',
+    'Send Referrals',
+    'Waiting on Customer',
+    'No Further Action / Dormant',
+  ],
+  Sold: [],
+  'Closed / We Declined Customer': [],
+};
+
+// ---- One-time backfill: derive each customer's sales_stage from whatever
+// signal we already have (jobs > completed design appt > scheduled design
+// appt > legacy lead stage). Only runs for customers whose sales_stage is
+// still NULL, so it never overwrites a stage that's been set intentionally. ----
+(function backfillSalesStage() {
+  const legacyMap = {
+    'New Lead': 'Bona Fide Lead',
+    Contacted: 'Bona Fide Lead',
+    Quoted: 'Estimate Presented',
+    Sold: 'Sold',
+    Lost: 'Closed / We Declined Customer',
+  };
+  const rows = db.prepare(`SELECT id, created_at FROM customers WHERE sales_stage IS NULL`).all();
+  for (const c of rows) {
+    let stage = 'Bona Fide Lead';
+    const legacy = db
+      .prepare(`SELECT stage FROM leads WHERE customer_id = ? ORDER BY updated_at DESC LIMIT 1`)
+      .get(c.id);
+    if (legacy && legacyMap[legacy.stage]) stage = legacyMap[legacy.stage];
+    const hasJob = db.prepare(`SELECT 1 FROM jobs WHERE customer_id = ? LIMIT 1`).get(c.id);
+    const designTypes = "('Short Design Consultation','Long Design Consultation','Design Review','Design Appointment','Consultation')";
+    const completedDesign = db
+      .prepare(`SELECT 1 FROM appointments WHERE customer_id = ? AND status = 'completed' AND type IN ${designTypes} LIMIT 1`)
+      .get(c.id);
+    const scheduledDesign = db
+      .prepare(`SELECT 1 FROM appointments WHERE customer_id = ? AND status = 'scheduled' AND type IN ${designTypes} LIMIT 1`)
+      .get(c.id);
+    const order = SALES_STAGES;
+    const atLeast = (candidate) => {
+      if (order.indexOf(candidate) > order.indexOf(stage)) stage = candidate;
+    };
+    if (scheduledDesign) atLeast('Design Appointment Set');
+    if (completedDesign) atLeast('Design Appointment Completed');
+    if (hasJob) atLeast('Sold');
+    db.prepare(`UPDATE customers SET sales_stage = ?, updated_at = COALESCE(updated_at, ?), first_contact_at = COALESCE(first_contact_at, ?) WHERE id = ?`)
+      .run(stage, c.created_at, c.created_at, c.id);
+  }
+})();
+
 const JOB_STAGES = [
   'Order Confirmed',
   'Measuring Scheduled',
@@ -293,11 +543,40 @@ const EXPENSE_CATEGORIES = [
 ];
 
 // ---- Customers ----
-function createCustomer({ name, phone, email, address, notes }) {
+function createCustomer({ name, phone, email, address, notes, sales_stage, source_id, campaign_id, actor }) {
   const id = newId();
+  const ts = nowIso();
+  const stage = sales_stage && SALES_STAGES.includes(sales_stage) ? sales_stage : 'Bona Fide Lead';
   db.prepare(
-    `INSERT INTO customers (id, name, phone, email, address, notes, created_at) VALUES (?,?,?,?,?,?,?)`
-  ).run(id, name, phone || null, email || null, address || null, notes || null, nowIso());
+    `INSERT INTO customers (id, name, phone, email, address, notes, created_at, sales_stage, stage_substatus,
+       dormant, updated_at, source_id, campaign_id, first_contact_at)
+     VALUES (?,?,?,?,?,?,?,?,?, 0, ?, ?, ?, ?)`
+  ).run(
+    id,
+    name,
+    phone || null,
+    email || null,
+    address || null,
+    notes || null,
+    ts,
+    stage,
+    null,
+    ts,
+    source_id || null,
+    campaign_id || null,
+    ts
+  );
+  logActivity({
+    entity_type: 'customer',
+    entity_id: id,
+    customer_id: id,
+    field: 'created',
+    new_value: name,
+    actor: actor || 'user',
+  });
+  if (source_id || campaign_id) {
+    setCustomerAttribution({ customer_id: id, source_id, campaign_id, note: 'set at customer creation', actor: actor || 'user' });
+  }
   return getCustomer(id);
 }
 function getCustomer(id) {
@@ -317,10 +596,19 @@ function findCustomerByPhoneOrEmail(phone, email) {
 function listCustomers() {
   return db.prepare(`SELECT * FROM customers ORDER BY created_at DESC`).all();
 }
-function updateCustomer(id, { name, phone, email, address, notes }) {
+function updateCustomer(id, { name, phone, email, address, notes }, { actor } = {}) {
+  const prev = getCustomer(id);
   db.prepare(
-    `UPDATE customers SET name=?, phone=?, email=?, address=?, notes=? WHERE id=?`
-  ).run(name, phone || null, email || null, address || null, notes || null, id);
+    `UPDATE customers SET name=?, phone=?, email=?, address=?, notes=?, updated_at=? WHERE id=?`
+  ).run(name, phone || null, email || null, address || null, notes || null, nowIso(), id);
+  if (prev) {
+    for (const f of ['name', 'phone', 'email', 'address']) {
+      const nv = { name, phone, email, address }[f] || null;
+      if ((prev[f] || null) !== (nv || null)) {
+        logActivity({ entity_type: 'customer', entity_id: id, customer_id: id, field: f, old_value: prev[f], new_value: nv, actor: actor || 'user' });
+      }
+    }
+  }
   return getCustomer(id);
 }
 
@@ -361,12 +649,21 @@ function updateLead(id, { estimate_value, notes, source }) {
 }
 
 // ---- Appointments ----
-function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes }) {
+function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes, created_by }) {
   const id = newId();
+  const ts = nowIso();
   db.prepare(
-    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at)
-     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?)`
-  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, nowIso());
+    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at, updated_at, created_by)
+     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?, ?, ?)`
+  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, ts, ts, created_by || 'user');
+  logActivity({
+    entity_type: 'appointment',
+    entity_id: id,
+    customer_id,
+    field: 'created',
+    new_value: `${type || 'Consultation'} @ ${scheduled_at}`,
+    actor: created_by || 'user',
+  });
   return getAppointment(id);
 }
 function getAppointment(id) {
@@ -588,9 +885,9 @@ function getProductHistory(product_id) {
 // (see UPLOADS_DIR below); this table just tracks the metadata so it can be
 // listed/served/deleted per customer.
 function syncFileSearch(id) {
-  const f = db.prepare(`SELECT id, original_name, note, extracted_text FROM customer_files WHERE id = ?`).get(id);
+  const f = db.prepare(`SELECT id, original_name, note, extracted_text, deleted_at FROM customer_files WHERE id = ?`).get(id);
   db.prepare(`DELETE FROM file_search WHERE file_id = ?`).run(id);
-  if (!f) return;
+  if (!f || f.deleted_at) return;
   db.prepare(`INSERT INTO file_search (file_id, original_name, note, extracted_text) VALUES (?,?,?,?)`).run(
     f.id,
     f.original_name || '',
@@ -607,17 +904,20 @@ function createCustomerFile({ customer_id, job_id, stored_name, original_name, m
   syncFileSearch(id);
   return id;
 }
-function listCustomerFiles(customer_id) {
+function listCustomerFiles(customer_id, { includeDeleted } = {}) {
   return db
     .prepare(
       `SELECT customer_files.*, jobs.status as job_status
        FROM customer_files LEFT JOIN jobs ON jobs.id = customer_files.job_id
-       WHERE customer_files.customer_id = ? ORDER BY customer_files.created_at DESC`
+       WHERE customer_files.customer_id = ?${includeDeleted ? '' : ' AND customer_files.deleted_at IS NULL'}
+       ORDER BY customer_files.created_at DESC`
     )
     .all(customer_id);
 }
 function listJobFiles(job_id) {
-  return db.prepare(`SELECT * FROM customer_files WHERE job_id = ? ORDER BY created_at DESC`).all(job_id);
+  return db
+    .prepare(`SELECT * FROM customer_files WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC`)
+    .all(job_id);
 }
 function getCustomerFile(id) {
   return db.prepare(`SELECT * FROM customer_files WHERE id = ?`).get(id) || null;
@@ -789,12 +1089,143 @@ function incomeByCategoryBetween(start, end) {
 }
 
 // ---- Expenses ----
-function createExpense({ job_id, expense_date, category, amount, vendor, method, note }) {
+// Back-compat: old callers pass { job_id, expense_date, category, amount, vendor, method, note }.
+// New capture callers also pass { merchant, memo, coa_account, payment_account, entry_source,
+// receipt_file_id, external_ref, expense_at, needs_review, created_by }. `coa_account` null
+// => the row is flagged needs_review and categorized 'Uncategorized / Needs Review'.
+function createExpense(input) {
+  const {
+    job_id,
+    expense_date,
+    category,
+    amount,
+    vendor,
+    method,
+    note,
+    merchant,
+    memo,
+    coa_account,
+    payment_account,
+    entry_source,
+    receipt_file_id,
+    external_ref,
+    expense_at,
+    needs_review,
+    created_by,
+  } = input;
   const id = newId();
+  const when = expense_at || expense_date || nowIso();
+  // Single place the "suggest a category when it's obvious, else flag for
+  // review, never guess" rule lives - the route and the assistant both rely
+  // on it. An explicit coa_account always wins.
+  const acct = coa_account || suggestExpenseAccount(`${merchant || vendor || ''} ${memo || note || ''}`) || null;
+  const review = needs_review === undefined ? (acct ? 0 : 1) : needs_review ? 1 : 0;
+  const cat = category || acct || 'Uncategorized / Needs Review';
   db.prepare(
-    `INSERT INTO expenses (id, job_id, expense_date, category, amount, vendor, method, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)`
-  ).run(id, job_id || null, expense_date || nowIso(), category || 'Other', amount, vendor || null, method || null, note || null, nowIso());
+    `INSERT INTO expenses (id, job_id, expense_date, category, amount, vendor, method, note, created_at,
+       merchant, memo, coa_account, payment_account, entry_source, reconciliation_status, receipt_file_id,
+       external_ref, expense_at, needs_review, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?, ?,?,?,?,?, 'unreconciled', ?,?,?,?,?)`
+  ).run(
+    id,
+    job_id || null,
+    when,
+    cat,
+    Number(amount),
+    vendor || merchant || null,
+    method || null,
+    note || memo || null,
+    nowIso(),
+    merchant || vendor || null,
+    memo || note || null,
+    acct,
+    payment_account || null,
+    entry_source || 'manual',
+    receipt_file_id || null,
+    external_ref || null,
+    when,
+    review,
+    created_by || 'user'
+  );
+  logActivity({
+    entity_type: 'expense',
+    entity_id: id,
+    field: 'created',
+    new_value: `$${Number(amount).toFixed(2)} ${merchant || vendor || ''}`.trim(),
+    note: acct ? acct : 'needs review',
+    actor: created_by || 'user',
+  });
   return id;
+}
+function getExpense(id) {
+  return db.prepare(`SELECT * FROM expenses WHERE id = ?`).get(id) || null;
+}
+function updateExpense(id, fields, { actor } = {}) {
+  const e = getExpense(id);
+  if (!e) return null;
+  const m = {
+    amount: fields.amount === undefined ? e.amount : Number(fields.amount),
+    merchant: fields.merchant === undefined ? e.merchant : fields.merchant || null,
+    memo: fields.memo === undefined ? e.memo : fields.memo || null,
+    coa_account: fields.coa_account === undefined ? e.coa_account : fields.coa_account || null,
+    category: fields.coa_account === undefined ? e.category : fields.coa_account || 'Uncategorized / Needs Review',
+    payment_account: fields.payment_account === undefined ? e.payment_account : fields.payment_account || null,
+    job_id: fields.job_id === undefined ? e.job_id : fields.job_id || null,
+    receipt_file_id: fields.receipt_file_id === undefined ? e.receipt_file_id : fields.receipt_file_id || null,
+    reconciliation_status: fields.reconciliation_status || e.reconciliation_status,
+    expense_at: fields.expense_at || e.expense_at || e.expense_date,
+    needs_review:
+      fields.needs_review === undefined
+        ? fields.coa_account
+          ? 0
+          : e.needs_review
+        : fields.needs_review
+          ? 1
+          : 0,
+  };
+  db.prepare(
+    `UPDATE expenses SET amount=?, merchant=?, memo=?, coa_account=?, category=?, payment_account=?, job_id=?,
+       receipt_file_id=?, reconciliation_status=?, expense_at=?, expense_date=?, needs_review=?, vendor=?, note=? WHERE id=?`
+  ).run(
+    m.amount,
+    m.merchant,
+    m.memo,
+    m.coa_account,
+    m.category,
+    m.payment_account,
+    m.job_id,
+    m.receipt_file_id,
+    m.reconciliation_status,
+    m.expense_at,
+    m.expense_at,
+    m.needs_review,
+    m.merchant || e.vendor,
+    m.memo || e.note,
+    id
+  );
+  logActivity({ entity_type: 'expense', entity_id: id, field: 'updated', new_value: m.coa_account || 'needs review', actor: actor || 'user' });
+  return getExpense(id);
+}
+function listUncategorizedExpenses() {
+  return db.prepare(`SELECT * FROM expenses WHERE needs_review = 1 ORDER BY expense_at DESC, expense_date DESC`).all();
+}
+// Future-facing: when a bank/card import lands, match a manually-captured
+// expense instead of duplicating it. Match = same signed amount within a few
+// days and no external_ref yet. Returns candidates, does not auto-apply.
+function findExpenseMatchCandidates({ amount, date, days = 4 }) {
+  const amt = Number(amount);
+  const d = new Date(date || nowIso());
+  const lo = new Date(d.getTime() - days * 86400000).toISOString();
+  const hi = new Date(d.getTime() + days * 86400000).toISOString();
+  return db
+    .prepare(
+      `SELECT * FROM expenses
+       WHERE external_ref IS NULL
+         AND ABS(amount - ?) < 0.005
+         AND COALESCE(expense_at, expense_date) BETWEEN ? AND ?
+       ORDER BY COALESCE(expense_at, expense_date) DESC`
+    )
+    .all(amt, lo, hi);
 }
 function listExpenses({ start, end } = {}) {
   let sql = `SELECT expenses.*, jobs.customer_id as job_customer_id, customers.name as job_customer_name
@@ -959,6 +1390,612 @@ function taxYearSummary(year) {
   return { year: Number(year), ...profitLoss(start, end) };
 }
 
+// ============================================================================
+// Phase 2 query layer. Every write that matters for KPI or history also writes
+// an activity_log row, so the "who changed what, when, from what, to what"
+// requirement holds regardless of whether the change came from a form or the
+// assistant. Callers pass an `actor` string ('user' | 'assistant' | 'public').
+// ============================================================================
+
+// ---- Activity log ----
+function logActivity({ entity_type, entity_id, customer_id, field, old_value, new_value, note, actor }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO activity_log (id, entity_type, entity_id, customer_id, field, old_value, new_value, note, actor, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    entity_type,
+    entity_id,
+    customer_id || null,
+    field || null,
+    old_value === undefined || old_value === null ? null : String(old_value),
+    new_value === undefined || new_value === null ? null : String(new_value),
+    note || null,
+    actor || 'system',
+    nowIso()
+  );
+  return id;
+}
+function listActivityForCustomer(customer_id, limit = 100) {
+  return db
+    .prepare(`SELECT * FROM activity_log WHERE customer_id = ? ORDER BY created_at DESC LIMIT ?`)
+    .all(customer_id, limit);
+}
+function listRecentActivity(limit = 50) {
+  return db
+    .prepare(
+      `SELECT activity_log.*, customers.name as customer_name
+       FROM activity_log LEFT JOIN customers ON customers.id = activity_log.customer_id
+       ORDER BY activity_log.created_at DESC LIMIT ?`
+    )
+    .all(limit);
+}
+
+// ---- Customer: sales stage + attention ----
+function touchCustomer(id) {
+  db.prepare(`UPDATE customers SET updated_at = ? WHERE id = ?`).run(nowIso(), id);
+}
+function setSalesStage(customer_id, stage, { substatus, actor, note } = {}) {
+  const c = getCustomer(customer_id);
+  if (!c) return null;
+  if (!SALES_STAGES.includes(stage)) throw new Error(`Unknown sales stage: ${stage}`);
+  const prev = c.sales_stage || null;
+  const prevSub = c.stage_substatus || null;
+  const nextSub = substatus === undefined ? c.stage_substatus : substatus || null;
+  const firstContact = c.first_contact_at || (stage === 'Bona Fide Lead' ? nowIso() : c.created_at);
+  db.prepare(
+    `UPDATE customers SET sales_stage = ?, stage_substatus = ?, first_contact_at = COALESCE(first_contact_at, ?), updated_at = ? WHERE id = ?`
+  ).run(stage, nextSub, firstContact, nowIso(), customer_id);
+  if (prev !== stage) {
+    logActivity({
+      entity_type: 'customer',
+      entity_id: customer_id,
+      customer_id,
+      field: 'sales_stage',
+      old_value: prev,
+      new_value: stage,
+      note: note || null,
+      actor: actor || 'user',
+    });
+  }
+  if ((prevSub || null) !== (nextSub || null)) {
+    logActivity({
+      entity_type: 'customer',
+      entity_id: customer_id,
+      customer_id,
+      field: 'stage_substatus',
+      old_value: prevSub,
+      new_value: nextSub,
+      actor: actor || 'user',
+    });
+  }
+  return getCustomer(customer_id);
+}
+function setStageSubstatus(customer_id, substatus, { actor } = {}) {
+  const c = getCustomer(customer_id);
+  if (!c) return null;
+  return setSalesStage(customer_id, c.sales_stage || 'Bona Fide Lead', { substatus, actor });
+}
+function setCustomerDormant(customer_id, dormant, { actor } = {}) {
+  const c = getCustomer(customer_id);
+  if (!c) return null;
+  const val = dormant ? 1 : 0;
+  db.prepare(`UPDATE customers SET dormant = ?, updated_at = ? WHERE id = ?`).run(val, nowIso(), customer_id);
+  logActivity({
+    entity_type: 'customer',
+    entity_id: customer_id,
+    customer_id,
+    field: 'dormant',
+    old_value: c.dormant,
+    new_value: val,
+    actor: actor || 'user',
+  });
+  return getCustomer(customer_id);
+}
+function getCustomerStageHistory(customer_id) {
+  return db
+    .prepare(
+      `SELECT * FROM activity_log WHERE customer_id = ? AND field IN ('sales_stage','stage_substatus','dormant')
+       ORDER BY created_at ASC`
+    )
+    .all(customer_id);
+}
+
+// ---- Follow-ups / next actions ----
+function createFollowup({ customer_id, kind, title, detail, due_at, created_by }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO followups (id, customer_id, kind, title, detail, due_at, status, created_by, created_at)
+     VALUES (?,?,?,?,?,?, 'open', ?, ?)`
+  ).run(id, customer_id, kind || 'next_action', title, detail || null, due_at || null, created_by || 'user', nowIso());
+  logActivity({
+    entity_type: 'followup',
+    entity_id: id,
+    customer_id,
+    field: 'created',
+    new_value: title,
+    note: due_at ? `due ${due_at}` : null,
+    actor: created_by || 'user',
+  });
+  return getFollowup(id);
+}
+function getFollowup(id) {
+  return db.prepare(`SELECT * FROM followups WHERE id = ?`).get(id) || null;
+}
+function listFollowups(customer_id, { includeClosed } = {}) {
+  let sql = `SELECT * FROM followups WHERE customer_id = ?`;
+  if (!includeClosed) sql += ` AND status = 'open'`;
+  sql += ` ORDER BY (due_at IS NULL), due_at ASC, created_at ASC`;
+  return db.prepare(sql).all(customer_id);
+}
+// All open follow-ups across every customer, soonest/overdue first - the raw
+// material for the attention lists on Overview and the customer header.
+function listOpenFollowups() {
+  return db
+    .prepare(
+      `SELECT followups.*, customers.name as customer_name, customers.phone as customer_phone
+       FROM followups JOIN customers ON customers.id = followups.customer_id
+       WHERE followups.status = 'open'
+       ORDER BY (followups.due_at IS NULL), followups.due_at ASC`
+    )
+    .all();
+}
+function closeFollowup(id, status, actor) {
+  const f = getFollowup(id);
+  if (!f) return null;
+  db.prepare(`UPDATE followups SET status = ?, completed_at = ?, completed_by = ? WHERE id = ?`).run(
+    status,
+    nowIso(),
+    actor || 'user',
+    id
+  );
+  logActivity({
+    entity_type: 'followup',
+    entity_id: id,
+    customer_id: f.customer_id,
+    field: 'status',
+    old_value: f.status,
+    new_value: status,
+    note: f.title,
+    actor: actor || 'user',
+  });
+  return getFollowup(id);
+}
+
+// ---- Marketing sources & campaigns ----
+function createSource({ name, notes }) {
+  const id = newId();
+  db.prepare(`INSERT INTO marketing_sources (id, name, notes, active, created_at) VALUES (?,?,?,1,?)`).run(
+    id,
+    name,
+    notes || null,
+    nowIso()
+  );
+  return getSource(id);
+}
+function getSource(id) {
+  return db.prepare(`SELECT * FROM marketing_sources WHERE id = ?`).get(id) || null;
+}
+function listSources({ includeInactive } = {}) {
+  let sql = `SELECT * FROM marketing_sources`;
+  if (!includeInactive) sql += ` WHERE active = 1`;
+  sql += ` ORDER BY name ASC`;
+  return db.prepare(sql).all();
+}
+function updateSource(id, { name, notes, active }) {
+  const s = getSource(id);
+  if (!s) return null;
+  db.prepare(`UPDATE marketing_sources SET name = ?, notes = ?, active = ? WHERE id = ?`).run(
+    name ?? s.name,
+    notes ?? s.notes,
+    active === undefined ? s.active : active ? 1 : 0,
+    id
+  );
+  return getSource(id);
+}
+function createCampaign({ source_id, name, tracking_phone, start_date, end_date, cost, status, notes }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO marketing_campaigns (id, source_id, name, tracking_phone, start_date, end_date, cost, status, notes, active, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,1,?)`
+  ).run(
+    id,
+    source_id,
+    name,
+    tracking_phone || null,
+    start_date || null,
+    end_date || null,
+    cost === undefined || cost === '' ? null : Number(cost),
+    status || 'active',
+    notes || null,
+    nowIso()
+  );
+  return getCampaign(id);
+}
+function getCampaign(id) {
+  return db
+    .prepare(
+      `SELECT marketing_campaigns.*, marketing_sources.name as source_name
+       FROM marketing_campaigns LEFT JOIN marketing_sources ON marketing_sources.id = marketing_campaigns.source_id
+       WHERE marketing_campaigns.id = ?`
+    )
+    .get(id) || null;
+}
+function listCampaigns({ includeInactive } = {}) {
+  let sql = `SELECT marketing_campaigns.*, marketing_sources.name as source_name
+             FROM marketing_campaigns LEFT JOIN marketing_sources ON marketing_sources.id = marketing_campaigns.source_id`;
+  if (!includeInactive) sql += ` WHERE marketing_campaigns.active = 1`;
+  sql += ` ORDER BY (marketing_campaigns.start_date IS NULL), marketing_campaigns.start_date DESC, marketing_campaigns.name ASC`;
+  return db.prepare(sql).all();
+}
+function updateCampaign(id, fields) {
+  const c = getCampaign(id);
+  if (!c) return null;
+  const merged = {
+    source_id: fields.source_id ?? c.source_id,
+    name: fields.name ?? c.name,
+    tracking_phone: fields.tracking_phone === undefined ? c.tracking_phone : fields.tracking_phone || null,
+    start_date: fields.start_date === undefined ? c.start_date : fields.start_date || null,
+    end_date: fields.end_date === undefined ? c.end_date : fields.end_date || null,
+    cost: fields.cost === undefined ? c.cost : fields.cost === '' ? null : Number(fields.cost),
+    status: fields.status ?? c.status,
+    notes: fields.notes === undefined ? c.notes : fields.notes || null,
+    active: fields.active === undefined ? c.active : fields.active ? 1 : 0,
+  };
+  db.prepare(
+    `UPDATE marketing_campaigns SET source_id=?, name=?, tracking_phone=?, start_date=?, end_date=?, cost=?, status=?, notes=?, active=? WHERE id=?`
+  ).run(
+    merged.source_id,
+    merged.name,
+    merged.tracking_phone,
+    merged.start_date,
+    merged.end_date,
+    merged.cost,
+    merged.status,
+    merged.notes,
+    merged.active,
+    id
+  );
+  return getCampaign(id);
+}
+// Given an inbound number a call arrived on, find the campaign that owns it.
+// This is the hook a future answering-AI uses to auto-attribute a lead.
+function findCampaignByTrackingPhone(phone) {
+  if (!phone) return null;
+  return db.prepare(`SELECT * FROM marketing_campaigns WHERE tracking_phone = ? AND active = 1 LIMIT 1`).get(phone) || null;
+}
+
+// ---- Customer attribution (append-only history; original is never rewritten) ----
+function setCustomerAttribution({ customer_id, source_id, campaign_id, tracking_phone, note, actor }) {
+  const id = newId();
+  db.prepare(
+    `INSERT INTO customer_attribution (id, customer_id, source_id, campaign_id, tracking_phone, note, actor, created_at)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, source_id || null, campaign_id || null, tracking_phone || null, note || null, actor || 'user', nowIso());
+  // Keep the fast-path columns on customers pointing at the CURRENT attribution.
+  db.prepare(`UPDATE customers SET source_id = ?, campaign_id = ?, updated_at = ? WHERE id = ?`).run(
+    source_id || null,
+    campaign_id || null,
+    nowIso(),
+    customer_id
+  );
+  logActivity({
+    entity_type: 'customer',
+    entity_id: customer_id,
+    customer_id,
+    field: 'attribution',
+    new_value: [source_id, campaign_id].filter(Boolean).join(' / ') || tracking_phone || 'set',
+    note: note || null,
+    actor: actor || 'user',
+  });
+  return id;
+}
+function getCustomerAttribution(customer_id) {
+  const history = db
+    .prepare(
+      `SELECT ca.*, s.name as source_name, mc.name as campaign_name
+       FROM customer_attribution ca
+       LEFT JOIN marketing_sources s ON s.id = ca.source_id
+       LEFT JOIN marketing_campaigns mc ON mc.id = ca.campaign_id
+       WHERE ca.customer_id = ? ORDER BY ca.created_at ASC`
+    )
+    .all(customer_id);
+  return {
+    original: history[0] || null,
+    current: history[history.length - 1] || null,
+    history,
+  };
+}
+
+// ---- Chart of Accounts + expense categorization ----
+function chartOfAccounts({ type } = {}) {
+  let sql = `SELECT * FROM chart_of_accounts WHERE active = 1`;
+  const params = [];
+  if (type) {
+    sql += ` AND type = ?`;
+    params.push(type);
+  }
+  sql += ` ORDER BY sort_order ASC, name ASC`;
+  return db.prepare(sql).all(...params);
+}
+// Deliberately conservative keyword matcher. Returns an account NAME when a
+// merchant/memo pretty clearly implies one, else null => caller stores it as
+// "Uncategorized / Needs Review". Never guesses a category it isn't sure of.
+const EXPENSE_KEYWORDS = [
+  [/lowe'?s|home depot|menards|ace hardware|hardware|screws?|hinges?|drawer slide|blum|rev-?a-?shelf/i, 'Cabinet Hardware'],
+  [/lumber|plywood|mdf|baltic birch|wood|stain|paint|primer|sandpaper|glue|finish/i, 'Materials & Supplies'],
+  [/gas|fuel|shell|exxon|chevron|bp |wawa|sheetz|sunoco/i, 'Vehicle & Fuel'],
+  [/uship|freight|shipping|fedex|ups |usps|postage/i, 'Shipping & Freight'],
+  [/insurance|geico|state farm|progressive|hiscox|next insurance/i, 'Insurance'],
+  [/facebook|meta|google ads|adwords|yelp|angi|thumbtack|nextdoor|mailer|postcard|printing|vistaprint/i, 'Marketing & Advertising'],
+  [/adobe|microsoft|google workspace|quickbooks|dropbox|zoom|godaddy|namecheap|render\.com|twilio|anthropic|openai/i, 'Software & Office'],
+  [/accountant|cpa|bookkeep|attorney|lawyer|legal/i, 'Professional Fees (legal/accounting)'],
+  [/bank fee|wire fee|stripe|square fee|merchant fee|interest charge/i, 'Bank & Merchant Fees'],
+  [/restaurant|cafe|coffee|starbucks|mcdonald|chipotle|lunch|dinner/i, 'Meals'],
+  [/dewalt|milwaukee|makita|festool|tool|sawstop|blade|router bit/i, 'Tools & Equipment'],
+  [/sub ?contractor|installer|helper|1099|labor/i, 'Subcontractors & Labor'],
+];
+function suggestExpenseAccount(text) {
+  const t = String(text || '');
+  if (!t.trim()) return null;
+  for (const [re, name] of EXPENSE_KEYWORDS) if (re.test(t)) return name;
+  return null;
+}
+
+// ---- Appointments: edit / reschedule / complete ----
+function updateAppointment(id, { type, scheduled_at, duration_min, notes }, { actor } = {}) {
+  const a = getAppointment(id);
+  if (!a) return null;
+  const next = {
+    type: type ?? a.type,
+    scheduled_at: scheduled_at ?? a.scheduled_at,
+    duration_min: duration_min === undefined ? a.duration_min : Number(duration_min) || 60,
+    notes: notes === undefined ? a.notes : notes || null,
+  };
+  const rescheduled = next.scheduled_at !== a.scheduled_at;
+  db.prepare(
+    `UPDATE appointments SET type=?, scheduled_at=?, duration_min=?, notes=?, reminder_sent = CASE WHEN ? THEN 0 ELSE reminder_sent END, updated_at=? WHERE id=?`
+  ).run(next.type, next.scheduled_at, next.duration_min, next.notes, rescheduled ? 1 : 0, nowIso(), id);
+  logActivity({
+    entity_type: 'appointment',
+    entity_id: id,
+    customer_id: a.customer_id,
+    field: rescheduled ? 'rescheduled' : 'edited',
+    old_value: rescheduled ? a.scheduled_at : null,
+    new_value: rescheduled ? next.scheduled_at : next.type,
+    actor: actor || 'user',
+  });
+  return getAppointment(id);
+}
+function setAppointmentStatusTracked(id, status, { actor, note } = {}) {
+  const a = getAppointment(id);
+  if (!a) return null;
+  db.prepare(`UPDATE appointments SET status=?, completed_at = CASE WHEN ?='completed' THEN ? ELSE completed_at END, updated_at=? WHERE id=?`)
+    .run(status, status, nowIso(), nowIso(), id);
+  logActivity({
+    entity_type: 'appointment',
+    entity_id: id,
+    customer_id: a.customer_id,
+    field: 'status',
+    old_value: a.status,
+    new_value: status,
+    note: note || null,
+    actor: actor || 'user',
+  });
+  return getAppointment(id);
+}
+function listAppointmentsForCustomer(customer_id) {
+  return db.prepare(`SELECT * FROM appointments WHERE customer_id = ? ORDER BY scheduled_at DESC`).all(customer_id);
+}
+// A scheduled appointment whose time has passed and that was never
+// completed/cancelled/rescheduled - the "missed appointment" attention item.
+function listPastUncompletedAppointments() {
+  return db
+    .prepare(
+      `SELECT appointments.*, customers.name as customer_name, customers.phone as customer_phone
+       FROM appointments JOIN customers ON customers.id = appointments.customer_id
+       WHERE appointments.status = 'scheduled' AND appointments.scheduled_at < datetime('now')
+       ORDER BY appointments.scheduled_at DESC`
+    )
+    .all();
+}
+
+// ---- Files: soft delete ----
+function softDeleteCustomerFile(id, actor) {
+  const f = getCustomerFile(id);
+  if (!f) return null;
+  db.prepare(`UPDATE customer_files SET deleted_at = ?, deleted_by = ? WHERE id = ?`).run(nowIso(), actor || 'user', id);
+  db.prepare(`DELETE FROM file_search WHERE file_id = ?`).run(id); // hide from search while deleted
+  logActivity({
+    entity_type: 'file',
+    entity_id: id,
+    customer_id: f.customer_id,
+    field: 'deleted',
+    new_value: f.original_name,
+    actor: actor || 'user',
+  });
+  return getCustomerFile(id);
+}
+function restoreCustomerFile(id, actor) {
+  const f = getCustomerFile(id);
+  if (!f) return null;
+  db.prepare(`UPDATE customer_files SET deleted_at = NULL, deleted_by = NULL WHERE id = ?`).run(id);
+  syncFileSearch(id);
+  logActivity({
+    entity_type: 'file',
+    entity_id: id,
+    customer_id: f.customer_id,
+    field: 'restored',
+    new_value: f.original_name,
+    actor: actor || 'user',
+  });
+  return getCustomerFile(id);
+}
+function listDeletedFiles() {
+  return db
+    .prepare(
+      `SELECT customer_files.*, customers.name as customer_name
+       FROM customer_files LEFT JOIN customers ON customers.id = customer_files.customer_id
+       WHERE customer_files.deleted_at IS NOT NULL ORDER BY customer_files.deleted_at DESC`
+    )
+    .all();
+}
+
+// ---- KPI: primary funnel with DOCUMENTED denominators ----
+//
+// COHORT: customers whose first_contact_at (fallback created_at) is in
+//   [start, end]. Every cohort member is, by definition, a Bona Fide Lead.
+//
+// "REACHED stage X": the customer's FURTHEST FORWARD forward-funnel stage is at
+//   or past X. Furthest forward = max over (current sales_stage, every
+//   sales_stage value ever recorded in activity_log for that customer),
+//   restricted to the 5 forward stages. "Closed / We Declined Customer" is a
+//   terminal disposition, NOT forward progress: a customer we closed still
+//   counts toward whatever forward stage they had reached before we closed
+//   them (e.g. a closed customer who had a completed design appt counts in
+//   design_appointments_completed but not in sales).
+//
+// REVENUE: payments.paid_at in [start, end] (cash basis). sold_contract_value
+//   and jobs_created use jobs.created_at in [start, end]. Revenue is NOT
+//   filtered to the cohort - it answers "what came in during this window".
+//
+// Every conversion rate below is numerator / denominator * 100 and ships its
+// own `denominator_label` so the meaning can't drift.
+function kpiFunnel({ start, end } = {}) {
+  const s = start || '0000-01-01';
+  const e = end || '9999-12-31';
+  const customers = db
+    .prepare(`SELECT * FROM customers WHERE COALESCE(first_contact_at, created_at) BETWEEN ? AND ?`)
+    .all(s, e);
+  const fwdIdx = (stage) => SALES_FUNNEL.indexOf(stage); // -1 for Closed or unknown
+  const historyByCustomer = {};
+  if (customers.length) {
+    const rows = db
+      .prepare(`SELECT customer_id, new_value FROM activity_log WHERE field = 'sales_stage'`)
+      .all();
+    for (const r of rows) {
+      (historyByCustomer[r.customer_id] = historyByCustomer[r.customer_id] || []).push(r.new_value);
+    }
+  }
+  const furthest = (c) => {
+    let best = fwdIdx(c.sales_stage);
+    for (const v of historyByCustomer[c.id] || []) best = Math.max(best, fwdIdx(v));
+    // Closed customers: current stage is Closed (idx -1) but their history may
+    // hold the forward stage they'd reached. best already reflects that.
+    return best;
+  };
+  const withStage = customers.map((c) => ({ ...c, _fwd: furthest(c) }));
+  const reachedIdx = (i) => withStage.filter((c) => c._fwd >= i).length;
+
+  const bonaFide = customers.length;
+  const apptSet = reachedIdx(fwdIdx('Design Appointment Set'));
+  const apptDone = reachedIdx(fwdIdx('Design Appointment Completed'));
+  const estPresented = reachedIdx(fwdIdx('Estimate Presented'));
+  const soldCount = withStage.filter((c) => c.sales_stage === 'Sold').length;
+  const closedDeclined = customers.filter((c) => c.sales_stage === 'Closed / We Declined Customer').length;
+
+  const revenueRow = db
+    .prepare(`SELECT COALESCE(SUM(amount),0) as total, COUNT(DISTINCT job_id) as jobs FROM payments WHERE paid_at BETWEEN ? AND ?`)
+    .get(s, e);
+  const soldJobsRow = db
+    .prepare(
+      `SELECT COUNT(*) as n, COALESCE(SUM(sold_amount),0) as total FROM jobs
+       WHERE created_at BETWEEN ? AND ?`
+    )
+    .get(s, e);
+
+  const pct = (num, den) => (den > 0 ? Math.round((num / den) * 1000) / 10 : null);
+  return {
+    window: { start: s, end: e },
+    counts: {
+      bona_fide_leads: bonaFide,
+      design_appointments_set: apptSet,
+      design_appointments_completed: apptDone,
+      estimates_presented: estPresented,
+      sales: soldCount,
+      closed_we_declined: closedDeclined,
+    },
+    revenue: {
+      collected: revenueRow.total,                 // sum of payments.paid_at in window
+      sold_contract_value: soldJobsRow.total,      // sum of jobs.sold_amount created in window
+      jobs_created: soldJobsRow.n,
+      average_sale: soldJobsRow.n > 0 ? Math.round((soldJobsRow.total / soldJobsRow.n) * 100) / 100 : 0,
+    },
+    conversion: {
+      // Each rate is num / den * 100. Denominator named explicitly.
+      lead_to_appointment: { rate: pct(apptSet, bonaFide), numerator: apptSet, denominator: bonaFide, denominator_label: 'bona fide leads in cohort' },
+      appointment_to_completed: { rate: pct(apptDone, apptSet), numerator: apptDone, denominator: apptSet, denominator_label: 'design appointments set' },
+      completed_to_estimate: { rate: pct(estPresented, apptDone), numerator: estPresented, denominator: apptDone, denominator_label: 'design appointments completed' },
+      appointment_to_sale: { rate: pct(soldCount, apptSet), numerator: soldCount, denominator: apptSet, denominator_label: 'design appointments set' },
+      estimate_to_sale: { rate: pct(soldCount, estPresented), numerator: soldCount, denominator: estPresented, denominator_label: 'estimates presented' },
+      lead_to_sale: { rate: pct(soldCount, bonaFide), numerator: soldCount, denominator: bonaFide, denominator_label: 'bona fide leads in cohort' },
+    },
+  };
+}
+
+// KPI broken out by marketing source/campaign. Cohort = customers whose
+// first_contact_at is in the window, grouped by their CURRENT attribution.
+function kpiByCampaign({ start, end } = {}) {
+  const s = start || '0000-01-01';
+  const e = end || '9999-12-31';
+  const rows = db
+    .prepare(
+      `SELECT c.id, c.sales_stage, c.campaign_id, c.source_id,
+              s.name as source_name, mc.name as campaign_name, mc.cost as campaign_cost
+       FROM customers c
+       LEFT JOIN marketing_sources s ON s.id = c.source_id
+       LEFT JOIN marketing_campaigns mc ON mc.id = c.campaign_id
+       WHERE COALESCE(c.first_contact_at, c.created_at) BETWEEN ? AND ?`
+    )
+    .all(s, e);
+  const idx = (stage) => SALES_STAGES.indexOf(stage);
+  const groups = new Map();
+  for (const r of rows) {
+    const key = r.campaign_id || r.source_id || '_none';
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label: r.campaign_name ? `${r.source_name || '?'} — ${r.campaign_name}` : r.source_name || 'Unattributed',
+        campaign_cost: r.campaign_cost || 0,
+        leads: 0,
+        appointments: 0,
+        sales: 0,
+        revenue: 0,
+      });
+    }
+    const g = groups.get(key);
+    g.leads += 1;
+    if (r.sales_stage && (idx(r.sales_stage) >= idx('Design Appointment Set')) && r.sales_stage !== 'Closed / We Declined Customer') g.appointments += 1;
+    if (r.sales_stage === 'Sold') g.sales += 1;
+  }
+  // Revenue per group: payments in the window for jobs whose customer is in the group.
+  for (const g of groups.values()) {
+    if (g.key === '_none') continue;
+  }
+  const revRows = db
+    .prepare(
+      `SELECT c.campaign_id, c.source_id, COALESCE(SUM(p.amount),0) as revenue
+       FROM payments p
+       JOIN jobs j ON j.id = p.job_id
+       JOIN customers c ON c.id = j.customer_id
+       WHERE p.paid_at BETWEEN ? AND ?
+       GROUP BY c.campaign_id, c.source_id`
+    )
+    .all(s, e);
+  for (const rr of revRows) {
+    const key = rr.campaign_id || rr.source_id || '_none';
+    if (groups.has(key)) groups.get(key).revenue += rr.revenue;
+  }
+  return [...groups.values()].map((g) => ({
+    ...g,
+    cost_per_lead: g.leads > 0 && g.campaign_cost ? Math.round((g.campaign_cost / g.leads) * 100) / 100 : null,
+    cost_per_appointment: g.appointments > 0 && g.campaign_cost ? Math.round((g.campaign_cost / g.appointments) * 100) / 100 : null,
+    customer_acquisition_cost: g.sales > 0 && g.campaign_cost ? Math.round((g.campaign_cost / g.sales) * 100) / 100 : null,
+    roas: g.campaign_cost > 0 ? Math.round((g.revenue / g.campaign_cost) * 100) / 100 : null,
+  }));
+}
+
 module.exports = {
   db,
   DATA_DIR,
@@ -968,6 +2005,56 @@ module.exports = {
   PRODUCT_STAGES,
   INCOME_CATEGORIES,
   EXPENSE_CATEGORIES,
+  SALES_STAGES,
+  SALES_FUNNEL,
+  STAGE_SUBSTATUSES,
+  // activity log
+  logActivity,
+  listActivityForCustomer,
+  listRecentActivity,
+  // sales stage / attention
+  setSalesStage,
+  setStageSubstatus,
+  setCustomerDormant,
+  getCustomerStageHistory,
+  touchCustomer,
+  // follow-ups
+  createFollowup,
+  getFollowup,
+  listFollowups,
+  listOpenFollowups,
+  closeFollowup,
+  // marketing
+  createSource,
+  getSource,
+  listSources,
+  updateSource,
+  createCampaign,
+  getCampaign,
+  listCampaigns,
+  updateCampaign,
+  findCampaignByTrackingPhone,
+  setCustomerAttribution,
+  getCustomerAttribution,
+  // bookkeeping capture
+  chartOfAccounts,
+  suggestExpenseAccount,
+  getExpense,
+  updateExpense,
+  listUncategorizedExpenses,
+  findExpenseMatchCandidates,
+  // appointments
+  updateAppointment,
+  setAppointmentStatusTracked,
+  listAppointmentsForCustomer,
+  listPastUncompletedAppointments,
+  // files soft-delete
+  softDeleteCustomerFile,
+  restoreCustomerFile,
+  listDeletedFiles,
+  // KPI
+  kpiFunnel,
+  kpiByCampaign,
   createCustomer,
   getCustomer,
   findCustomerByPhoneOrEmail,

@@ -1,10 +1,64 @@
 const fs = require('fs');
 const path = require('path');
 const db = require('../db');
-const { dashboardLayout, flashFromQuery } = require('../render');
-const { escapeHtml, fmtMoney, fmtDate, fmtDateTime, normalizePhone, newId } = require('../util');
+const { dashboardLayout, flashFromQuery, quickActions, section, backLink, phone } = require('../render');
+const {
+  escapeHtml,
+  fmtMoney,
+  fmtDate,
+  fmtDateTime,
+  fmtRelativeDue,
+  normalizePhone,
+  formatPhone,
+  telHref,
+  newId,
+} = require('../util');
 const automations = require('../services/automations');
 const assistant = require('../services/assistant');
+const sms = require('../services/sms');
+const email = require('../services/email');
+
+// Who's making this change - for the activity log. Session middleware sets
+// req.authUser; assistant calls pass their own actor directly to db.*.
+function actorOf(req) {
+  return `user:${(req && req.authUser) || 'andrew'}`;
+}
+
+// Derives the "what needs attention" list for a customer from open follow-ups,
+// past-due appointments, and attention sub-statuses. Pure read - it never
+// changes state. Returns [{ text, overdue, href? }].
+function attentionForCustomer(c) {
+  const items = [];
+  for (const f of db.listFollowups(c.id)) {
+    const overdue = f.due_at && new Date(f.due_at) < new Date();
+    items.push({
+      text: `${f.title}${f.due_at ? ' — ' + fmtRelativeDue(f.due_at) : ''}`,
+      overdue: !!overdue,
+      followupId: f.id,
+    });
+  }
+  const appts = db.listAppointmentsForCustomer(c.id);
+  for (const a of appts) {
+    if (a.status === 'scheduled' && new Date(a.scheduled_at) < new Date()) {
+      items.push({ text: `Missed appointment: ${a.type} on ${fmtDateTime(a.scheduled_at)} — needs complete / reschedule / cancel`, overdue: true, apptId: a.id });
+    }
+  }
+  const sub = (c.stage_substatus || '').toLowerCase();
+  if (sub.includes('overdue') || sub.includes('missed') || sub.includes('reschedule')) {
+    items.push({ text: `Stage flag: ${c.stage_substatus}`, overdue: true });
+  } else if (sub.includes('due')) {
+    items.push({ text: `Stage flag: ${c.stage_substatus}`, overdue: false });
+  }
+  return items;
+}
+
+function attentionBanner(items) {
+  if (!items.length) return '';
+  return `<div class="attention">
+    <h3>Needs attention</h3>
+    <ul>${items.map((i) => `<li class="${i.overdue ? 'overdue' : ''}">${escapeHtml(i.text)}</li>`).join('')}</ul>
+  </div>`;
+}
 
 // Uploaded customer files (photos, measurement docs, contracts) live on the
 // persistent disk under data/uploads/<customer_id>/<generated-name> - never
@@ -37,9 +91,6 @@ function saveUpload({ customer_id, job_id, upload, note }) {
   });
 }
 
-function stageBadgeClass(stage) {
-  return { 'New Lead': 'new', Contacted: 'contacted', Quoted: 'quoted', Sold: 'sold', Lost: 'lost' }[stage] || '';
-}
 
 // Renders a <select name="category"> populated from that category's editable
 // option list (see /dashboard/settings/product-options), plus a blank
@@ -56,25 +107,51 @@ function register(router, requireAuth) {
   // ---------- Overview ----------
   router.get('/dashboard', requireAuth, (req, res) => {
     const customers = db.listCustomers();
-    const leads = db.listLeads();
-    const openLeads = leads.filter((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
     const jobs = db.listJobs();
     const activeJobs = jobs.filter((j) => j.status !== 'Complete');
+    const openOpps = customers.filter((c) => c.sales_stage && c.sales_stage !== 'Sold' && c.sales_stage !== 'Closed / We Declined Customer');
     const upcoming = db.listAppointments({ upcomingOnly: true }).slice(0, 6);
-    const recentMsgs = db.listRecentMessages(8);
     const incomeMonth = db.totalIncomeThisMonth();
     const incomeTotal = db.totalIncome();
     const expenseMonth = db.totalExpensesThisMonth();
     const expenseTotal = db.totalExpenses();
+    const needsReview = db.listUncategorizedExpenses().length;
+
+    // Attention: open follow-ups (overdue first) + missed appointments.
+    const openF = db.listOpenFollowups();
+    const missed = db.listPastUncompletedAppointments();
+    const attn = [
+      ...openF.map((f) => ({
+        overdue: f.due_at && new Date(f.due_at) < new Date(),
+        html: `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name)}</a> — ${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}`,
+      })),
+      ...missed.map((a) => ({
+        overdue: true,
+        html: `<a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a> — missed ${escapeHtml(a.type)} ${fmtDateTime(a.scheduled_at)} · <a href="/dashboard/appointments/${a.id}/edit">resolve</a>`,
+      })),
+    ].sort((x, y) => (y.overdue ? 1 : 0) - (x.overdue ? 1 : 0));
 
     const body = `
       <h1>Overview</h1>
       <p class="subtitle">${escapeHtml(require('../render').BUSINESS_NAME)} at a glance</p>
       <div class="grid cols-4">
         <div class="stat"><div class="num">${customers.length}</div><div class="label">Customers</div></div>
-        <div class="stat"><div class="num">${openLeads.length}</div><div class="label">Open leads in funnel</div></div>
+        <div class="stat"><div class="num">${openOpps.length}</div><div class="label">Open opportunities</div></div>
         <div class="stat"><div class="num">${activeJobs.length}</div><div class="label">Active jobs</div></div>
         <div class="stat"><div class="num">${fmtMoney(incomeMonth - expenseMonth)}</div><div class="label">Net this month</div></div>
+      </div>
+
+      <div class="panel">
+        <h2 style="margin-top:0">Needs attention ${attn.length ? `<span class="badge">${attn.length}</span>` : ''}</h2>
+        ${
+          attn.length
+            ? `<ul style="margin:0;padding-left:18px">${attn
+                .slice(0, 25)
+                .map((i) => `<li class="${i.overdue ? 'overdue' : ''}" style="margin:4px 0">${i.html}</li>`)
+                .join('')}</ul>`
+            : '<p class="attention-none">Nothing needs action right now.</p>'
+        }
+        ${needsReview ? `<p class="subtitle" style="margin-top:10px">${needsReview} expense${needsReview > 1 ? 's' : ''} need categorizing — <a href="/dashboard/finances/review">review</a>.</p>` : ''}
       </div>
 
       <div class="grid cols-2">
@@ -92,17 +169,18 @@ function register(router, requireAuth) {
           }
         </div>
         <div class="panel">
-          <h2 style="margin-top:0">Recent messages</h2>
-          ${
-            recentMsgs.length
-              ? `<table><tr><th>When</th><th>Customer</th><th>Channel</th><th>Status</th></tr>${recentMsgs
+          <h2 style="margin-top:0">Recent activity</h2>
+          ${(() => {
+            const acts = db.listRecentActivity(10);
+            return acts.length
+              ? `<table><tr><th>When</th><th>Customer</th><th>What</th></tr>${acts
                   .map(
-                    (m) =>
-                      `<tr><td>${fmtDateTime(m.created_at)}</td><td>${escapeHtml(m.customer_name)}</td><td>${m.channel}</td><td>${escapeHtml(m.status || '')}</td></tr>`
+                    (a) =>
+                      `<tr><td>${fmtDateTime(a.created_at)}</td><td>${a.customer_id ? `<a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name || '')}</a>` : ''}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(String(a.new_value).slice(0, 40)) : ''}</td></tr>`
                   )
                   .join('')}</table>`
-              : `<p class="subtitle">No messages sent yet.</p>`
-          }
+              : '<p class="subtitle">No activity yet.</p>';
+          })()}
         </div>
       </div>
 
@@ -117,187 +195,433 @@ function register(router, requireAuth) {
 
   // ---------- Customers ----------
   router.get('/dashboard/customers', requireAuth, (req, res) => {
-    const customers = db.listCustomers();
+    const q = (req.query.q || '').trim().toLowerCase();
+    let customers = db.listCustomers();
+    if (q) {
+      customers = customers.filter((c) =>
+        [c.name, c.phone, c.email, c.address].filter(Boolean).some((f) => String(f).toLowerCase().includes(q))
+      );
+    }
     const body = `
       <h1>Customers</h1>
       <div class="panel">
-        <h2 style="margin-top:0">Add a customer</h2>
-        <form method="POST" action="/dashboard/customers">
-          <div class="grid cols-2">
-            <div><label>Name *</label><input type="text" name="name" required></div>
-            <div><label>Phone</label><input type="tel" name="phone" placeholder="(804) 555-0100"></div>
-            <div><label>Email</label><input type="email" name="email"></div>
-            <div><label>Address</label><input type="text" name="address"></div>
+        <form method="GET" action="/dashboard/customers" style="margin-bottom:14px">
+          <div style="display:flex;gap:8px">
+            <input type="search" name="q" value="${escapeHtml(req.query.q || '')}" placeholder="Search name, phone, email, address">
+            <button class="btn secondary" type="submit">Search</button>
           </div>
-          <label>Notes</label><textarea name="notes"></textarea>
-          <div style="margin-top:12px"><button class="btn" type="submit">Add customer</button></div>
         </form>
+        <details ${q ? '' : ''}>
+          <summary style="cursor:pointer;font-weight:700">Add a customer</summary>
+          <form method="POST" action="/dashboard/customers" style="margin-top:10px">
+            <div class="grid cols-2">
+              <div><label>Name *</label><input type="text" name="name" required></div>
+              <div><label>Phone</label><input type="tel" name="phone" placeholder="(804) 555-0100"></div>
+              <div><label>Email</label><input type="email" name="email"></div>
+              <div><label>Address</label><input type="text" name="address"></div>
+              <div><label>Source</label><select name="source_id"><option value="">— none —</option>${db.listSources().map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('')}</select></div>
+              <div><label>Campaign</label><select name="campaign_id"><option value="">— none —</option>${db.listCampaigns().map((mc) => `<option value="${mc.id}">${escapeHtml(mc.source_name || '')} — ${escapeHtml(mc.name)}</option>`).join('')}</select></div>
+            </div>
+            <label>Notes</label><textarea name="notes"></textarea>
+            <div style="margin-top:12px"><button class="btn" type="submit">Add customer</button></div>
+          </form>
+        </details>
       </div>
       <div class="panel">
-        <table>
-          <tr><th>Name</th><th>Phone</th><th>Email</th><th>Added</th></tr>
+        <div style="overflow-x:auto"><table>
+          <tr><th>Name</th><th>Stage</th><th>Phone</th><th>Email</th><th>Added</th></tr>
           ${customers
             .map(
               (c) =>
-                `<tr><td><a href="/dashboard/customers/${c.id}">${escapeHtml(c.name)}</a></td><td>${escapeHtml(c.phone || '')}</td><td>${escapeHtml(c.email || '')}</td><td>${fmtDate(c.created_at)}</td></tr>`
+                `<tr>
+                  <td><a href="/dashboard/customers/${c.id}">${escapeHtml(c.name)}</a>${c.dormant ? ' <span class="badge">dormant</span>' : ''}</td>
+                  <td>${escapeHtml(c.sales_stage || '')}${c.stage_substatus ? `<div class="subtitle" style="margin:0">${escapeHtml(c.stage_substatus)}</div>` : ''}</td>
+                  <td>${c.phone ? `<a href="tel:${escapeHtml(telHref(c.phone))}">${phone(c.phone)}</a>` : ''}</td>
+                  <td>${escapeHtml(c.email || '')}</td>
+                  <td>${fmtDate(c.first_contact_at || c.created_at)}</td>
+                </tr>`
             )
             .join('')}
-        </table>
-        ${customers.length === 0 ? '<p class="subtitle">No customers yet.</p>' : ''}
+        </table></div>
+        ${customers.length === 0 ? '<p class="subtitle">No customers found.</p>' : ''}
       </div>
     `;
     res.send(dashboardLayout({ title: 'Customers', active: '/dashboard/customers', body, flash: flashFromQuery(req.query) }));
   });
 
   router.post('/dashboard/customers', requireAuth, (req, res) => {
-    const { name, phone, email, address, notes } = req.body;
+    const { name, phone: ph, email: em, address, notes, source_id, campaign_id } = req.body;
     if (!name) return res.redirect('/dashboard/customers?err=Name is required');
-    const c = db.createCustomer({ name, phone: normalizePhone(phone), email, address, notes });
+    const c = db.createCustomer({
+      name,
+      phone: normalizePhone(ph),
+      email: em,
+      address,
+      notes,
+      source_id: source_id || null,
+      campaign_id: campaign_id || null,
+      actor: actorOf(req),
+    });
     res.redirect(`/dashboard/customers/${c.id}?ok=Customer added`);
   });
 
   router.get('/dashboard/customers/:id', requireAuth, (req, res) => {
     const c = db.getCustomer(req.params.id);
     if (!c) return res.status(404).send('Customer not found');
-    const leads = db.listLeads().filter((l) => l.customer_id === c.id);
     const jobs = db.listJobs().filter((j) => j.customer_id === c.id);
-    const appts = db.listAppointments().filter((a) => a.customer_id === c.id);
-    const messages = db.listMessagesForCustomer(c.id);
+    const activeJobs = jobs.filter((j) => j.status !== 'Complete');
+    const appts = db.listAppointmentsForCustomer(c.id);
+    const messages = db.listMessagesForCustomer(c.id).slice().reverse();
     const files = db.listCustomerFiles(c.id);
+    const followups = db.listFollowups(c.id, { includeClosed: true });
+    const openFollowups = followups.filter((f) => f.status === 'open');
+    const attribution = db.getCustomerAttribution(c.id);
+    const activity = db.listActivityForCustomer(c.id, 60);
+    const stageHistory = db.getCustomerStageHistory(c.id);
+    const attention = attentionForCustomer(c);
+    const sources = db.listSources();
+    const campaigns = db.listCampaigns();
+    const stage = c.sales_stage || 'Bona Fide Lead';
+    const subOptions = db.STAGE_SUBSTATUSES[stage] || [];
+    const smsOn = sms.twilioConfigured();
+    const emailOn = email.emailConfigured();
+
+    const stageForm = `
+      <form method="POST" action="/dashboard/customers/${c.id}/stage" class="stage-form">
+        <div class="grid cols-2">
+          <div>
+            <label>Sales stage (KPI)</label>
+            <select name="sales_stage">
+              ${db.SALES_STAGES.map((s) => `<option value="${escapeHtml(s)}" ${s === stage ? 'selected' : ''}>${escapeHtml(s)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label>Attention sub-status</label>
+            <select name="stage_substatus">
+              <option value="">— none —</option>
+              ${subOptions.map((s) => `<option value="${escapeHtml(s)}" ${s === c.stage_substatus ? 'selected' : ''}>${escapeHtml(s)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <label class="check" style="display:flex;align-items:center;gap:8px;margin-top:10px">
+          <input type="checkbox" name="dormant" value="1" style="width:auto" ${c.dormant ? 'checked' : ''}> Dormant / waiting indefinitely (still active, not lost)
+        </label>
+        <div style="margin-top:10px"><button class="btn" type="submit">Update stage</button></div>
+      </form>`;
+
+    const nextActionForm = `
+      <form method="POST" action="/dashboard/customers/${c.id}/followups" style="margin-top:8px">
+        <div class="grid cols-2">
+          <div><label>Next action *</label><input type="text" name="title" placeholder="Send estimate, call back, drop off referrals..." required></div>
+          <div><label>Due</label><input type="datetime-local" name="due_at"></div>
+        </div>
+        <input type="hidden" name="kind" value="next_action">
+        <div style="margin-top:8px"><button class="btn secondary" type="submit">Add follow-up</button></div>
+      </form>`;
+
+    const openFollowupList = openFollowups.length
+      ? `<ul style="margin:8px 0 0;padding-left:0;list-style:none">${openFollowups
+          .map(
+            (f) => `<li style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)">
+              <span class="${f.due_at && new Date(f.due_at) < new Date() ? 'overdue' : ''}">${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}</span>
+              <span style="white-space:nowrap">
+                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="done"><button class="btn small" type="submit">Done</button></form>
+                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="dismissed"><button class="btn small secondary" type="submit">Dismiss</button></form>
+              </span>
+            </li>`
+          )
+          .join('')}</ul>`
+      : '<p class="subtitle" style="margin:8px 0 0">No open follow-ups.</p>';
+
+    const jobsBlock = activeJobs.length
+      ? activeJobs
+          .map(
+            (j) => `<div class="panel" style="margin-bottom:10px">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+                <div><strong><a href="/dashboard/jobs/${j.id}">Job — ${escapeHtml(j.status)}</a></strong>
+                  <div class="subtitle" style="margin:0">${j.sold_amount ? fmtMoney(j.sold_amount) : 'amount not set'} · balance ${fmtMoney(db.getJobBalance(j.id) || 0)}</div></div>
+                <a class="btn small secondary" href="/status/${j.public_token}" target="_blank">Customer link</a>
+              </div>
+            </div>`
+          )
+          .join('')
+      : '';
 
     const body = `
-      <h1>${escapeHtml(c.name)}</h1>
-      <p class="subtitle">Customer since ${fmtDate(c.created_at)}</p>
-
-      <div class="grid cols-2">
-        <div class="panel">
-          <h2 style="margin-top:0">Contact info</h2>
-          <form method="POST" action="/dashboard/customers/${c.id}">
-            <label>Name *</label><input type="text" name="name" value="${escapeHtml(c.name)}" required>
-            <label>Phone</label><input type="tel" name="phone" value="${escapeHtml(c.phone || '')}">
-            <label>Email</label><input type="email" name="email" value="${escapeHtml(c.email || '')}">
-            <label>Address</label><input type="text" name="address" value="${escapeHtml(c.address || '')}">
-            <label>Notes</label><textarea name="notes">${escapeHtml(c.notes || '')}</textarea>
-            <div style="margin-top:12px"><button class="btn" type="submit">Save</button></div>
-          </form>
+      ${backLink('/dashboard/customers', 'All customers')}
+      <div class="cust-header">
+        <h1>${escapeHtml(c.name)}</h1>
+        <div class="cust-contact">
+          ${c.phone ? `📞 <a href="tel:${escapeHtml(telHref(c.phone))}">${phone(c.phone)}</a>` : '<span class="subtitle">no phone</span>'}
+          ${c.email ? ` &nbsp;·&nbsp; ✉️ <a href="mailto:${escapeHtml(c.email)}">${escapeHtml(c.email)}</a>` : ''}
+          ${c.address ? `<br>📍 <a target="_blank" rel="noopener" href="https://maps.google.com/?q=${encodeURIComponent(c.address)}">${escapeHtml(c.address)}</a>` : ''}
+          <br><span class="subtitle">Customer since ${fmtDate(c.first_contact_at || c.created_at)}</span>
         </div>
-
-        <div class="panel">
-          <h2 style="margin-top:0">Send a message</h2>
-          <form method="POST" action="/dashboard/customers/${c.id}/message">
-            <label>Channel</label>
-            <select name="channel">
-              <option value="sms">Text (SMS)</option>
-              <option value="email">Email</option>
-            </select>
-            <label>Message</label>
-            <textarea name="body" placeholder="Type a message to send now..." required></textarea>
-            <div style="margin-top:12px"><button class="btn" type="submit">Send</button></div>
-          </form>
-          <h3>History</h3>
-          ${
-            messages.length
-              ? `<table><tr><th>When</th><th>Ch.</th><th>Dir.</th><th>Body</th><th>Status</th></tr>${messages
-                  .map(
-                    (m) =>
-                      `<tr><td>${fmtDateTime(m.created_at)}</td><td>${m.channel}</td><td>${m.direction}</td><td>${escapeHtml((m.body || '').slice(0, 80))}</td><td>${escapeHtml(m.status || '')}</td></tr>`
-                  )
-                  .join('')}</table>`
-              : `<p class="subtitle">No messages yet.</p>`
-          }
+        <div class="stage-line">
+          <span class="stage-pill">${escapeHtml(stage)}</span>
+          ${c.stage_substatus ? `<span class="substatus-pill">${escapeHtml(c.stage_substatus)}</span>` : ''}
+          ${c.dormant ? `<span class="substatus-pill" style="background:#eee;color:#555">Dormant</span>` : ''}
         </div>
+        ${quickActions(c)}
       </div>
+
+      ${attentionBanner(attention)}
+      ${jobsBlock}
 
       <div class="panel">
-        <h2 style="margin-top:0">Files</h2>
-        <p class="subtitle">Photos, measurement sheets, contracts - anything for this customer. Only visible here in the dashboard.</p>
-        <form method="POST" action="/dashboard/customers/${c.id}/files" enctype="multipart/form-data">
-          <div class="grid cols-3">
-            <div><label>File</label><input type="file" name="file" required></div>
-            <div><label>Note (optional)</label><input type="text" name="note" placeholder="e.g. kitchen measurements"></div>
-            <div><label>Job (optional)</label><select name="job_id"><option value="">- not job-specific -</option>${jobs
-              .map((j) => `<option value="${j.id}">${escapeHtml(j.status)}${j.sold_amount ? ' · ' + fmtMoney(j.sold_amount) : ''}</option>`)
-              .join('')}</select></div>
-          </div>
-          <div style="margin-top:12px"><button class="btn secondary" type="submit">Upload</button></div>
-        </form>
-        ${
-          files.length
-            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
-                .map(
-                  (f) => `<tr>
-                    <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
-                    <td>${escapeHtml(f.note || '')}</td>
-                    <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
-                    <td>${fmtDateTime(f.created_at)}</td>
-                    <td style="white-space:nowrap">
-                      ${(f.mime_type || '').startsWith('image/') ? `<a class="btn small secondary" href="/dashboard/customers/${c.id}/files/${f.id}/sign">Sign</a> ` : ''}
-                      <form class="inline" method="POST" action="/dashboard/customers/${c.id}/files/${f.id}/delete" onsubmit="return confirm('Delete this file?')"><button class="btn small danger" type="submit">Delete</button></form>
-                    </td>
-                  </tr>`
-                )
-                .join('')}</table>`
-            : `<p class="subtitle">No files yet.</p>`
-        }
+        <h2 style="margin-top:0">Opportunity</h2>
+        ${stageForm}
+        <h3>Next actions / follow-ups</h3>
+        ${openFollowupList}
+        ${nextActionForm}
       </div>
 
-      <div class="panel">
-        <h2 style="margin-top:0">Leads / funnel</h2>
-        <form method="POST" action="/dashboard/leads">
-          <input type="hidden" name="customer_id" value="${c.id}">
-          <div class="grid cols-3">
-            <div><label>Source</label><input type="text" name="source" placeholder="Referral, Google, walk-in..."></div>
-            <div><label>Estimate value ($)</label><input type="number" step="0.01" name="estimate_value"></div>
-            <div><label>Notes</label><input type="text" name="notes"></div>
-          </div>
-          <div style="margin-top:12px"><button class="btn secondary" type="submit">Add to funnel as New Lead</button></div>
-        </form>
-        ${
-          leads.length
-            ? `<table style="margin-top:14px"><tr><th>Stage</th><th>Source</th><th>Est. value</th><th>Updated</th></tr>${leads
-                .map(
-                  (l) =>
-                    `<tr><td><span class="badge ${stageBadgeClass(l.stage)}">${escapeHtml(l.stage)}</span></td><td>${escapeHtml(l.source || '')}</td><td>${l.estimate_value ? fmtMoney(l.estimate_value) : ''}</td><td>${fmtDate(l.updated_at)}</td></tr>`
-                )
-                .join('')}</table>`
-            : ''
-        }
-      </div>
+      ${section(
+        'message',
+        'Text / Email',
+        `<p id="send-text"></p>
+         ${!smsOn ? '<div class="msg err" style="margin:0 0 10px">Texting NOT CONFIGURED — set TWILIO_* env vars. Messages below are recorded but not delivered.</div>' : ''}
+         ${!emailOn ? '<div class="msg err" style="margin:0 0 10px">Email NOT CONFIGURED — set RESEND_API_KEY / EMAIL_FROM. Messages below are recorded but not delivered.</div>' : ''}
+         <form method="POST" action="/dashboard/customers/${c.id}/message">
+           <label>Channel</label>
+           <select name="channel">
+             <option value="sms" ${c.phone ? '' : 'disabled'}>Text (SMS)${c.phone ? '' : ' — no phone on file'}</option>
+             <option value="email" ${c.email ? '' : 'disabled'}>Email${c.email ? '' : ' — no email on file'}</option>
+           </select>
+           <label>Message</label>
+           <textarea name="body" id="send-email" placeholder="Type a message…" required></textarea>
+           <div style="margin-top:10px"><button class="btn" type="submit">Send &amp; record</button></div>
+         </form>
+         <h3>Communication history</h3>
+         ${
+           messages.length
+             ? `<table><tr><th>When</th><th>Ch.</th><th>Dir.</th><th>Message</th><th>Delivery</th></tr>${messages
+                 .map(
+                   (m) =>
+                     `<tr><td>${fmtDateTime(m.created_at)}</td><td>${escapeHtml(m.channel)}</td><td>${escapeHtml(m.direction)}</td><td>${escapeHtml((m.body || '').slice(0, 120))}</td><td>${escapeHtml(m.status || '')}</td></tr>`
+                 )
+                 .join('')}</table>`
+             : '<p class="subtitle">No messages yet.</p>'
+         }`,
+        { count: messages.length }
+      )}
 
-      <div class="grid cols-2">
-        <div class="panel">
-          <h2 style="margin-top:0">Appointments</h2>
-          ${
-            appts.length
-              ? `<table><tr><th>When</th><th>Type</th><th>Status</th></tr>${appts
-                  .map((a) => `<tr><td>${fmtDateTime(a.scheduled_at)}</td><td>${escapeHtml(a.type)}</td><td>${escapeHtml(a.status)}</td></tr>`)
-                  .join('')}</table>`
-              : `<p class="subtitle">None yet.</p>`
-          }
-          <a class="btn small secondary" href="/dashboard/appointments?customer_id=${c.id}">Schedule one</a>
-        </div>
-        <div class="panel">
-          <h2 style="margin-top:0">Jobs</h2>
-          ${
-            jobs.length
-              ? `<table><tr><th>Status</th><th>Amount</th><th>Link</th></tr>${jobs
-                  .map(
-                    (j) =>
-                      `<tr><td><a href="/dashboard/jobs/${j.id}">${escapeHtml(j.status)}</a></td><td>${j.sold_amount ? fmtMoney(j.sold_amount) : ''}</td><td><a href="/status/${j.public_token}" target="_blank">customer link</a></td></tr>`
-                  )
-                  .join('')}</table>`
-              : `<p class="subtitle">No jobs yet - mark a lead "Sold" to create one.</p>`
-          }
-        </div>
-      </div>
+      ${section(
+        'appts',
+        'Appointments',
+        `<form method="POST" action="/dashboard/appointments" style="margin-bottom:12px">
+           <input type="hidden" name="customer_id" value="${c.id}">
+           <input type="hidden" name="return_to" value="/dashboard/customers/${c.id}">
+           <div class="grid cols-2">
+             <div><label>Type</label><select name="type">${db.APPT_TYPES.map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select></div>
+             <div><label>Date &amp; time *</label><input type="datetime-local" name="scheduled_at" required></div>
+             <div><label>Duration (min)</label><input type="number" name="duration_min" value="60"></div>
+             <div><label>Notes</label><input type="text" name="notes"></div>
+           </div>
+           <div style="margin-top:8px"><button class="btn secondary" type="submit">Schedule</button></div>
+         </form>
+         ${
+           appts.length
+             ? `<table><tr><th>When</th><th>Type</th><th>Status</th><th></th></tr>${appts
+                 .map((a) => {
+                   const missed = a.status === 'scheduled' && new Date(a.scheduled_at) < new Date();
+                   return `<tr>
+                     <td class="${missed ? 'overdue' : ''}">${fmtDateTime(a.scheduled_at)}${missed ? ' (missed)' : ''}</td>
+                     <td>${escapeHtml(a.type)}</td>
+                     <td>${escapeHtml(a.status)}</td>
+                     <td style="white-space:nowrap">
+                       ${
+                         a.status === 'scheduled'
+                           ? `<a class="btn small secondary" href="/dashboard/appointments/${a.id}/edit">Edit / reschedule</a>
+                              <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><input type="hidden" name="return_to" value="/dashboard/customers/${c.id}"><button class="btn small" type="submit">Complete</button></form>
+                              <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><input type="hidden" name="return_to" value="/dashboard/customers/${c.id}"><button class="btn small danger" type="submit">Cancel</button></form>`
+                           : ''
+                       }
+                     </td>
+                   </tr>`;
+                 })
+                 .join('')}</table>`
+             : '<p class="subtitle">None yet.</p>'
+         }`,
+        { count: appts.length, open: attention.some((a) => a.apptId) }
+      )}
+
+      ${section(
+        'files',
+        'Files',
+        `<form method="POST" action="/dashboard/customers/${c.id}/files" enctype="multipart/form-data">
+           <div class="grid cols-3">
+             <div><label>File</label><input type="file" name="file" required></div>
+             <div><label>Note</label><input type="text" name="note" placeholder="e.g. kitchen measurements"></div>
+             <div><label>Job (optional)</label><select name="job_id"><option value="">— not job-specific —</option>${jobs
+               .map((j) => `<option value="${j.id}">${escapeHtml(j.status)}${j.sold_amount ? ' · ' + fmtMoney(j.sold_amount) : ''}</option>`)
+               .join('')}</select></div>
+           </div>
+           <div style="margin-top:10px"><button class="btn secondary" type="submit">Upload</button></div>
+         </form>
+         ${
+           files.length
+             ? `<table style="margin-top:12px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
+                 .map(
+                   (f) => `<tr>
+                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
+                     <td>${escapeHtml(f.note || '')}</td>
+                     <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
+                     <td>${fmtDate(f.created_at)}</td>
+                     <td style="white-space:nowrap">
+                       ${(f.mime_type || '').startsWith('image/') ? `<a class="btn small secondary" href="/dashboard/customers/${c.id}/files/${f.id}/sign">Sign</a> ` : ''}
+                       <form class="inline" method="POST" action="/dashboard/customers/${c.id}/files/${f.id}/delete"><button class="btn small warn" type="submit" title="Recoverable - restore from Deleted Files">Delete</button></form>
+                     </td>
+                   </tr>`
+                 )
+                 .join('')}</table>
+                 <p class="subtitle" style="margin-top:8px">Deleting is recoverable — find it under <a href="/dashboard/files/deleted">Deleted Files</a>.</p>`
+             : '<p class="subtitle">No files yet.</p>'
+         }`,
+        { count: files.length }
+      )}
+
+      ${section(
+        'marketing',
+        'Marketing source / attribution',
+        `<p class="subtitle">Original: <strong>${escapeHtml(
+          attribution.original ? attribution.original.campaign_name || attribution.original.source_name || 'set' : 'not attributed'
+        )}</strong>${
+          attribution.original ? ` (${fmtDate(attribution.original.created_at)})` : ''
+        } — the first attribution is preserved and never overwritten.</p>
+         <form method="POST" action="/dashboard/customers/${c.id}/attribution">
+           <div class="grid cols-2">
+             <div><label>Source</label><select name="source_id"><option value="">— none —</option>${sources
+               .map((s) => `<option value="${s.id}" ${s.id === c.source_id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`)
+               .join('')}</select></div>
+             <div><label>Campaign</label><select name="campaign_id"><option value="">— none —</option>${campaigns
+               .map((mc) => `<option value="${mc.id}" ${mc.id === c.campaign_id ? 'selected' : ''}>${escapeHtml(mc.source_name || '')} — ${escapeHtml(mc.name)}</option>`)
+               .join('')}</select></div>
+           </div>
+           <label>Why (re-attribution reason)</label><input type="text" name="note" placeholder="e.g. confirmed came from Home Show, not Google">
+           <div style="margin-top:8px"><button class="btn secondary" type="submit">Set / re-attribute</button></div>
+         </form>
+         ${
+           attribution.history.length > 1
+             ? `<h3>Attribution history</h3><table><tr><th>When</th><th>To</th><th>By</th><th>Why</th></tr>${attribution.history
+                 .map(
+                   (h) =>
+                     `<tr><td>${fmtDate(h.created_at)}</td><td>${escapeHtml(h.campaign_name || h.source_name || h.tracking_phone || '—')}</td><td>${escapeHtml(h.actor)}</td><td>${escapeHtml(h.note || '')}</td></tr>`
+                 )
+                 .join('')}</table>`
+             : ''
+         }`
+      )}
+
+      ${section(
+        'contact',
+        'Contact details &amp; notes',
+        `<form method="POST" action="/dashboard/customers/${c.id}">
+           <input type="hidden" name="return_to" value="/dashboard/customers/${c.id}">
+           <div class="grid cols-2">
+             <div><label>Name *</label><input type="text" name="name" value="${escapeHtml(c.name)}" required></div>
+             <div><label>Phone</label><input type="tel" name="phone" value="${escapeHtml(c.phone ? formatPhone(c.phone) : '')}"></div>
+             <div><label>Email</label><input type="email" name="email" value="${escapeHtml(c.email || '')}"></div>
+             <div><label>Address</label><input type="text" name="address" value="${escapeHtml(c.address || '')}"></div>
+           </div>
+           <label>Notes</label><textarea name="notes" rows="4">${escapeHtml(c.notes || '')}</textarea>
+           <div style="margin-top:10px"><button class="btn" type="submit">Save</button></div>
+         </form>`
+      )}
+
+      ${section(
+        'history',
+        'History',
+        `<h3>Stage / status changes</h3>
+         ${
+           stageHistory.length
+             ? `<ul class="timeline">${stageHistory
+                 .map(
+                   (h) =>
+                     `<li class="done"><div class="status">${escapeHtml(h.field)}: ${escapeHtml(h.old_value || '—')} → ${escapeHtml(h.new_value || '—')}</div><div class="when">${fmtDateTime(h.created_at)} · ${escapeHtml(h.actor)}${h.note ? ' · ' + escapeHtml(h.note) : ''}</div></li>`
+                 )
+                 .join('')}</ul>`
+             : '<p class="subtitle">No stage changes recorded yet.</p>'
+         }
+         <h3>All activity</h3>
+         <table><tr><th>When</th><th>What</th><th>By</th></tr>${activity
+           .map(
+             (a) =>
+               `<tr><td>${fmtDateTime(a.created_at)}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(String(a.new_value).slice(0, 60)) : ''}</td><td>${escapeHtml(a.actor)}</td></tr>`
+           )
+           .join('')}</table>
+         <h3>Closed follow-ups</h3>
+         ${
+           followups.filter((f) => f.status !== 'open').length
+             ? `<table><tr><th>Title</th><th>Status</th><th>Closed</th></tr>${followups
+                 .filter((f) => f.status !== 'open')
+                 .map((f) => `<tr><td>${escapeHtml(f.title)}</td><td>${escapeHtml(f.status)}</td><td>${fmtDate(f.completed_at)}</td></tr>`)
+                 .join('')}</table>`
+             : '<p class="subtitle">None.</p>'
+         }`
+      )}
     `;
     res.send(dashboardLayout({ title: c.name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query), context: { customerId: c.id } }));
   });
 
   router.post('/dashboard/customers/:id', requireAuth, (req, res) => {
-    const { name, phone, email, address, notes } = req.body;
-    db.updateCustomer(req.params.id, { name, phone: normalizePhone(phone), email, address, notes });
-    res.redirect(`/dashboard/customers/${req.params.id}?ok=Saved`);
+    const { name, phone: ph, email: em, address, notes } = req.body;
+    db.updateCustomer(req.params.id, { name, phone: normalizePhone(ph), email: em, address, notes }, { actor: actorOf(req) });
+    res.redirect(`${req.body.return_to || `/dashboard/customers/${req.params.id}`}?ok=Saved`);
+  });
+
+  // ---------- Customer: sales stage / attention ----------
+  router.post('/dashboard/customers/:id/stage', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const { sales_stage, stage_substatus, dormant } = req.body;
+    try {
+      db.setSalesStage(c.id, sales_stage, { substatus: stage_substatus || null, actor: actorOf(req) });
+      db.setCustomerDormant(c.id, !!dormant, { actor: actorOf(req) });
+    } catch (e) {
+      return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent(e.message)}`);
+    }
+    res.redirect(`/dashboard/customers/${c.id}?ok=Stage updated`);
+  });
+
+  // ---------- Follow-ups ----------
+  router.post('/dashboard/customers/:id/followups', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const { title, detail, due_at, kind } = req.body;
+    if (!title) return res.redirect(`/dashboard/customers/${c.id}?err=A follow-up needs a title`);
+    db.createFollowup({
+      customer_id: c.id,
+      kind: kind || 'next_action',
+      title,
+      detail,
+      due_at: due_at ? new Date(due_at).toISOString() : null,
+      created_by: actorOf(req),
+    });
+    res.redirect(`/dashboard/customers/${c.id}?ok=Follow-up added`);
+  });
+
+  router.post('/dashboard/followups/:id/close', requireAuth, (req, res) => {
+    const f = db.getFollowup(req.params.id);
+    if (!f) return res.status(404).send('Not found');
+    const status = req.body.status === 'dismissed' ? 'dismissed' : 'done';
+    db.closeFollowup(f.id, status, actorOf(req));
+    res.redirect(`${req.body.return_to || `/dashboard/customers/${f.customer_id}`}?ok=Follow-up ${status}`);
+  });
+
+  // ---------- Marketing attribution (append-only) ----------
+  router.post('/dashboard/customers/:id/attribution', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const { source_id, campaign_id, note } = req.body;
+    db.setCustomerAttribution({
+      customer_id: c.id,
+      source_id: source_id || null,
+      campaign_id: campaign_id || null,
+      note: note || null,
+      actor: actorOf(req),
+    });
+    res.redirect(`/dashboard/customers/${c.id}?ok=Attribution updated`);
   });
 
   // ---------- Customer files (photos, measurement docs, contracts) ----------
@@ -329,14 +653,60 @@ function register(router, requireAuth) {
     fs.createReadStream(filePath).pipe(res);
   });
 
+  // SOFT delete - the bytes stay on disk and the row is retained; the file is
+  // just hidden and pulled from search. Recoverable from /dashboard/files/deleted.
   router.post('/dashboard/customers/:id/files/:fileId/delete', requireAuth, (req, res) => {
     const f = db.getCustomerFile(req.params.fileId);
-    if (f && f.customer_id === req.params.id) {
+    if (f && f.customer_id === req.params.id) db.softDeleteCustomerFile(f.id, actorOf(req));
+    res.redirect(`/dashboard/customers/${req.params.id}?ok=File moved to Deleted Files (recoverable)`);
+  });
+
+  // ---------- Deleted files: recover or permanently purge ----------
+  router.get('/dashboard/files/deleted', requireAuth, (req, res) => {
+    const deleted = db.listDeletedFiles();
+    const body = `
+      ${backLink('/dashboard/files', 'Back to Files')}
+      <h1>Deleted Files</h1>
+      <p class="subtitle">Files removed with Delete land here and can be restored. Permanently deleting also erases the file from disk and cannot be undone.</p>
+      <div class="panel">
+        ${
+          deleted.length
+            ? `<table><tr><th>File</th><th>Customer</th><th>Deleted</th><th>By</th><th></th></tr>${deleted
+                .map(
+                  (f) => `<tr>
+                    <td>${escapeHtml(f.original_name)}</td>
+                    <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : ''}</td>
+                    <td>${fmtDateTime(f.deleted_at)}</td>
+                    <td>${escapeHtml(f.deleted_by || '')}</td>
+                    <td style="white-space:nowrap">
+                      <form class="inline" method="POST" action="/dashboard/files/${f.id}/restore"><button class="btn small" type="submit">Restore</button></form>
+                      <form class="inline" method="POST" action="/dashboard/files/${f.id}/purge" onsubmit="return confirm('Permanently delete this file? This cannot be undone.')"><button class="btn small danger" type="submit">Delete permanently</button></form>
+                    </td>
+                  </tr>`
+                )
+                .join('')}</table>`
+            : '<p class="subtitle">No deleted files.</p>'
+        }
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Deleted Files', active: '/dashboard/files/deleted', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/files/:fileId/restore', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (f) db.restoreCustomerFile(f.id, actorOf(req));
+    res.redirect('/dashboard/files/deleted?ok=File restored');
+  });
+
+  router.post('/dashboard/files/:fileId/purge', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (f && f.deleted_at) {
       const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
       fs.existsSync(filePath) && fs.unlinkSync(filePath);
       db.deleteCustomerFile(f.id);
+      db.logActivity({ entity_type: 'file', entity_id: f.id, customer_id: f.customer_id, field: 'purged', new_value: f.original_name, actor: actorOf(req) });
     }
-    res.redirect(`/dashboard/customers/${req.params.id}?ok=File deleted`);
+    res.redirect('/dashboard/files/deleted?ok=File permanently deleted');
   });
 
   // ---------- Sign a drawing/photo (e.g. "sign the measure drawing") ----------
@@ -351,13 +721,15 @@ function register(router, requireAuth) {
     if (!(f.mime_type || '').startsWith('image/')) return res.status(400).send('Only image files can be signed');
 
     const body = `
+      ${backLink(`/dashboard/customers/${c.id}`, 'Cancel — back to customer, nothing saved')}
       <h1>Sign: ${escapeHtml(f.original_name)}</h1>
-      <p class="subtitle">Draw a signature on top of the image below, then save. This creates a new file - the original is kept as-is.</p>
+      <p class="subtitle">Draw a signature on top of the image below, then save. This creates a NEW file - the original is kept untouched. Cancel any time; nothing is saved until you press "Save signed copy".</p>
       <div class="panel">
         <canvas id="sign-canvas" style="max-width:100%;border:1px solid var(--line);touch-action:none;cursor:crosshair;display:block"></canvas>
-        <div style="margin-top:12px;display:flex;gap:10px">
-          <button class="btn secondary" type="button" id="sign-clear">Clear</button>
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn" type="button" id="sign-save">Save signed copy</button>
+          <button class="btn secondary" type="button" id="sign-clear">Clear drawing</button>
+          <a class="btn secondary" href="/dashboard/customers/${c.id}">Cancel</a>
         </div>
         <p id="sign-status" class="subtitle" style="margin-top:8px"></p>
       </div>
@@ -449,13 +821,22 @@ function register(router, requireAuth) {
     const buffer = Buffer.from(match[1], 'base64');
     const storedName = `${newId()}.png`;
     fs.writeFileSync(path.join(customerUploadsDir(c.id), storedName), buffer);
-    db.createCustomerFile({
+    const fileId = db.createCustomerFile({
       customer_id: c.id,
+      job_id: original.job_id || null,
       stored_name: storedName,
       original_name: `signed-${original.original_name.replace(/\.[^.]+$/, '')}.png`,
       mime_type: 'image/png',
       size: buffer.length,
       note: `Signed copy of "${original.original_name}"`,
+    });
+    db.logActivity({
+      entity_type: 'file',
+      entity_id: fileId,
+      customer_id: c.id,
+      field: 'signed_copy_created',
+      new_value: original.original_name,
+      actor: actorOf(req),
     });
     res.json({ ok: true });
   });
@@ -464,8 +845,10 @@ function register(router, requireAuth) {
     const c = db.getCustomer(req.params.id);
     if (!c) return res.status(404).send('Customer not found');
     const { channel, body } = req.body;
+    if (!body || !body.trim()) return res.redirect(`/dashboard/customers/${c.id}?err=Message is empty`);
+    let result;
     if (channel === 'email') {
-      await require('../services/email').sendEmail({
+      result = await email.sendEmail({
         to: c.email,
         subject: `Message from ${require('../render').BUSINESS_NAME}`,
         html: `<p>${escapeHtml(body).replace(/\n/g, '<br>')}</p>`,
@@ -473,56 +856,335 @@ function register(router, requireAuth) {
         logMessage: db.logMessage,
       });
     } else {
-      await require('../services/sms').sendSms({ to: c.phone, body, customer_id: c.id, logMessage: db.logMessage });
+      result = await sms.sendSms({ to: c.phone, body, customer_id: c.id, logMessage: db.logMessage });
     }
-    res.redirect(`/dashboard/customers/${c.id}?ok=Message sent (see history + console if SMS/email isn't configured yet)`);
+    db.logActivity({
+      entity_type: 'message',
+      entity_id: c.id,
+      customer_id: c.id,
+      field: channel === 'email' ? 'email_sent' : 'text_sent',
+      new_value: (body || '').slice(0, 80),
+      note: result && result.ok ? 'delivered' : result && result.reason ? `not delivered (${result.reason})` : 'not delivered',
+      actor: actorOf(req),
+    });
+    // Honest confirmation: only say "sent" when the provider confirmed it.
+    const msg =
+      result && result.ok
+        ? 'Message sent and recorded.'
+        : result && result.reason === 'not_configured'
+          ? `Recorded, NOT delivered — ${channel === 'email' ? 'email' : 'texting'} is not configured.`
+          : result && result.reason === 'no_phone_number'
+            ? 'Recorded, NOT delivered — no valid phone number on file.'
+            : result && result.reason === 'no_email_address'
+              ? 'Recorded, NOT delivered — no valid email on file.'
+              : 'Recorded, NOT delivered — the provider rejected it (see server log).';
+    res.redirect(`/dashboard/customers/${c.id}?${result && result.ok ? 'ok' : 'err'}=${encodeURIComponent(msg)}`);
   });
 
-  // ---------- Funnel ----------
-  router.get('/dashboard/funnel', requireAuth, (req, res) => {
-    const leads = db.listLeads();
-    const cols = db.LEAD_STAGES.map((stage) => {
-      const inStage = leads.filter((l) => l.stage === stage);
-      return `
-        <div class="funnel-col">
-          <h3>${stage} <span class="badge">${inStage.length}</span></h3>
-          ${inStage
-            .map(
-              (l) => `
-            <div class="lead-card">
-              <div class="name"><a href="/dashboard/customers/${l.customer_id}">${escapeHtml(l.customer_name)}</a></div>
-              <div class="meta">${escapeHtml(l.source || 'no source')}${l.estimate_value ? ' · ' + fmtMoney(l.estimate_value) : ''}</div>
-              <form method="POST" action="/dashboard/leads/${l.id}/stage">
-                <select name="stage" onchange="this.form.submit()">
-                  ${db.LEAD_STAGES.map((s) => `<option value="${s}" ${s === l.stage ? 'selected' : ''}>${s}</option>`).join('')}
+  // ---------- Pipeline (customer-centric sales stages) ----------
+  router.get('/dashboard/funnel', requireAuth, (req, res) => res.redirect('/dashboard/pipeline'));
+
+  router.get('/dashboard/pipeline', requireAuth, (req, res) => {
+    const customers = db.listCustomers().filter((c) => (req.query.dormant === '1' ? true : !c.dormant));
+    const byStage = {};
+    for (const s of db.SALES_STAGES) byStage[s] = [];
+    for (const c of customers) (byStage[c.sales_stage] || (byStage['Bona Fide Lead'] = byStage['Bona Fide Lead'] || [])).push(c);
+    const openF = db.listOpenFollowups();
+    const followupCount = {};
+    for (const f of openF) followupCount[f.customer_id] = (followupCount[f.customer_id] || 0) + 1;
+
+    const cols = db.SALES_STAGES.map((stage) => {
+      const inStage = byStage[stage] || [];
+      return `<div class="funnel-col">
+        <h3>${escapeHtml(stage)} <span class="badge">${inStage.length}</span></h3>
+        ${inStage
+          .map(
+            (c) => `<div class="lead-card">
+              <div class="name"><a href="/dashboard/customers/${c.id}">${escapeHtml(c.name)}</a></div>
+              <div class="meta">${c.stage_substatus ? escapeHtml(c.stage_substatus) : (c.phone ? phone(c.phone) : 'no phone')}${followupCount[c.id] ? ` · ${followupCount[c.id]} follow-up${followupCount[c.id] > 1 ? 's' : ''}` : ''}</div>
+              <form method="POST" action="/dashboard/customers/${c.id}/stage">
+                <input type="hidden" name="stage_substatus" value="${escapeHtml(c.stage_substatus || '')}">
+                <input type="hidden" name="dormant" value="${c.dormant ? '1' : ''}">
+                <select name="sales_stage" onchange="this.form.submit()">
+                  ${db.SALES_STAGES.map((s) => `<option value="${escapeHtml(s)}" ${s === c.sales_stage ? 'selected' : ''}>${escapeHtml(s)}</option>`).join('')}
                 </select>
               </form>
             </div>`
-            )
-            .join('')}
-        </div>`;
+          )
+          .join('')}
+      </div>`;
     }).join('');
 
     const body = `
-      <h1>Funnel</h1>
-      <p class="subtitle">Move a lead to "Sold" and a job is created automatically, with a tracking link texted/emailed to the customer.</p>
+      <h1>Pipeline</h1>
+      <p class="subtitle">Where every opportunity stands. Sub-statuses (e.g. "Estimate Overdue") are set on the customer page and flag what needs action — they don't move the KPI stage.
+        ${req.query.dormant === '1' ? '<a href="/dashboard/pipeline">Hide dormant</a>' : '<a href="/dashboard/pipeline?dormant=1">Show dormant too</a>'}</p>
       <div class="panel">
-        <h2 style="margin-top:0">New lead (new or existing customer)</h2>
+        <h2 style="margin-top:0">New customer / lead</h2>
         <form method="POST" action="/dashboard/leads/quick">
           <div class="grid cols-3">
             <div><label>Name *</label><input type="text" name="name" required></div>
             <div><label>Phone</label><input type="tel" name="phone"></div>
             <div><label>Email</label><input type="email" name="email"></div>
-            <div><label>Source</label><input type="text" name="source" placeholder="Referral, Google, walk-in..."></div>
-            <div><label>Estimate value ($)</label><input type="number" step="0.01" name="estimate_value"></div>
+            <div><label>Source</label><select name="source_id"><option value="">— none —</option>${db.listSources().map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('')}</select></div>
+            <div><label>Campaign</label><select name="campaign_id"><option value="">— none —</option>${db.listCampaigns().map((mc) => `<option value="${mc.id}">${escapeHtml(mc.source_name || '')} — ${escapeHtml(mc.name)}</option>`).join('')}</select></div>
             <div><label>Notes</label><input type="text" name="notes"></div>
           </div>
-          <div style="margin-top:12px"><button class="btn" type="submit">Add lead</button></div>
+          <div style="margin-top:12px"><button class="btn" type="submit">Add</button></div>
         </form>
       </div>
       <div class="funnel">${cols}</div>
     `;
-    res.send(dashboardLayout({ title: 'Funnel', active: '/dashboard/funnel', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: 'Pipeline', active: '/dashboard/pipeline', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // ---------- KPI ----------
+  router.get('/dashboard/kpi', requireAuth, (req, res) => {
+    const now = new Date();
+    const def = { start: `${now.getFullYear()}-01-01`, end: now.toISOString().slice(0, 10) };
+    const startStr = req.query.start || def.start;
+    const endStr = req.query.end || def.end;
+    const start = `${startStr}T00:00:00.000Z`;
+    const end = `${endStr}T23:59:59.999Z`;
+    const k = db.kpiFunnel({ start, end });
+    const camp = db.kpiByCampaign({ start, end });
+
+    const steps = [
+      ['Bona Fide Leads', k.counts.bona_fide_leads, null],
+      ['Design Appointments Set', k.counts.design_appointments_set, k.conversion.lead_to_appointment],
+      ['Design Appointments Completed', k.counts.design_appointments_completed, k.conversion.appointment_to_completed],
+      ['Estimates Presented', k.counts.estimates_presented, k.conversion.completed_to_estimate],
+      ['Sales', k.counts.sales, k.conversion.estimate_to_sale],
+    ];
+
+    const body = `
+      <h1>KPI</h1>
+      <p class="subtitle">Cohort = customers whose first contact date falls in the window. Every conversion rate below shows its exact numerator / denominator so the meaning can't drift.</p>
+      <div class="panel">
+        <form method="GET" action="/dashboard/kpi">
+          <div class="grid cols-3">
+            <div><label>From</label><input type="date" name="start" value="${startStr}"></div>
+            <div><label>To</label><input type="date" name="end" value="${endStr}"></div>
+            <div style="align-self:end"><button class="btn secondary" type="submit">Update</button></div>
+          </div>
+        </form>
+      </div>
+
+      <h2>Primary funnel</h2>
+      <div class="kpi-funnel">
+        ${steps
+          .map(
+            ([name, num, conv]) => `<div class="kpi-step">
+              <div><div class="k-name">${escapeHtml(name)}</div>${
+                conv && conv.rate !== null
+                  ? `<div class="denominator-note">${conv.rate}% of ${conv.denominator} ${escapeHtml(conv.denominator_label)}</div>`
+                  : ''
+              }</div>
+              <div class="k-num">${num}</div>
+            </div>`
+          )
+          .join('')}
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0">Closed / We Declined Customer (terminal, not "lost")</h3>
+        <p style="font-size:1.2rem;font-weight:700;margin:0">${k.counts.closed_we_declined}</p>
+      </div>
+
+      <h2>Revenue (window)</h2>
+      <div class="grid cols-4">
+        <div class="stat"><div class="num">${fmtMoney(k.revenue.collected)}</div><div class="label">Payments collected<br><span class="denominator-note">sum of payments dated in window</span></div></div>
+        <div class="stat"><div class="num">${fmtMoney(k.revenue.sold_contract_value)}</div><div class="label">Sold contract value<br><span class="denominator-note">sum of sold_amount on jobs created in window</span></div></div>
+        <div class="stat"><div class="num">${k.revenue.jobs_created}</div><div class="label">Jobs created in window</div></div>
+        <div class="stat"><div class="num">${fmtMoney(k.revenue.average_sale)}</div><div class="label">Average sale<br><span class="denominator-note">sold value ÷ jobs created</span></div></div>
+      </div>
+
+      <h2>All conversion rates</h2>
+      <div class="panel"><table>
+        <tr><th>Rate</th><th>Value</th><th>Numerator</th><th>Denominator</th></tr>
+        ${Object.entries(k.conversion)
+          .map(
+            ([key, v]) =>
+              `<tr><td>${escapeHtml(key.replace(/_/g, ' '))}</td><td>${v.rate === null ? '—' : v.rate + '%'}</td><td>${v.numerator}</td><td>${v.denominator} <span class="denominator-note">(${escapeHtml(v.denominator_label)})</span></td></tr>`
+          )
+          .join('')}
+      </table></div>
+
+      <h2>By marketing source / campaign</h2>
+      <div class="panel"><div style="overflow-x:auto"><table>
+        <tr><th>Source / campaign</th><th>Spend</th><th>Leads</th><th>Appts</th><th>Sales</th><th>Revenue</th><th>Cost / lead</th><th>Cost / appt</th><th>CAC</th><th>ROAS</th></tr>
+        ${camp
+          .map(
+            (g) => `<tr>
+              <td>${escapeHtml(g.label)}</td>
+              <td>${g.campaign_cost ? fmtMoney(g.campaign_cost) : '—'}</td>
+              <td>${g.leads}</td><td>${g.appointments}</td><td>${g.sales}</td>
+              <td>${fmtMoney(g.revenue)}</td>
+              <td>${g.cost_per_lead != null ? fmtMoney(g.cost_per_lead) : '—'}</td>
+              <td>${g.cost_per_appointment != null ? fmtMoney(g.cost_per_appointment) : '—'}</td>
+              <td>${g.customer_acquisition_cost != null ? fmtMoney(g.customer_acquisition_cost) : '—'}</td>
+              <td>${g.roas != null ? g.roas + '×' : '—'}</td>
+            </tr>`
+          )
+          .join('')}
+      </table></div>
+      <p class="denominator-note">Cost/lead = campaign spend ÷ leads attributed to it. Cost/appt = spend ÷ appointments. CAC = spend ÷ sales. ROAS = revenue ÷ spend. Blank when spend or the denominator is zero.</p>
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'KPI', active: '/dashboard/kpi', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // ---------- Marketing (sources & campaigns) ----------
+  router.get('/dashboard/marketing', requireAuth, (req, res) => {
+    const sources = db.listSources({ includeInactive: true });
+    const campaigns = db.listCampaigns({ includeInactive: true });
+    const body = `
+      <h1>Marketing</h1>
+      <p class="subtitle">Sources (Reach, Richmond Magazine, Home Show, Referral, Google…) each hold campaigns. A campaign can own a dedicated tracking phone number — a future answering AI will use the number a call came in on to auto-attribute that Bona Fide Lead. Original attribution on a customer is preserved forever; re-attribution is logged.</p>
+
+      <div class="grid cols-2">
+        <div class="panel">
+          <h2 style="margin-top:0">Add a source</h2>
+          <form method="POST" action="/dashboard/marketing/sources">
+            <label>Name *</label><input type="text" name="name" required placeholder="Home Show">
+            <label>Notes</label><input type="text" name="notes">
+            <div style="margin-top:10px"><button class="btn" type="submit">Add source</button></div>
+          </form>
+          <h3>Sources</h3>
+          ${
+            sources.length
+              ? `<table><tr><th>Name</th><th>Campaigns</th><th></th></tr>${sources
+                  .map(
+                    (s) =>
+                      `<tr><td>${escapeHtml(s.name)}${s.active ? '' : ' <span class="badge">inactive</span>'}</td><td>${campaigns.filter((c) => c.source_id === s.id).length}</td>
+                       <td><form class="inline" method="POST" action="/dashboard/marketing/sources/${s.id}"><input type="hidden" name="active" value="${s.active ? '0' : '1'}"><input type="hidden" name="name" value="${escapeHtml(s.name)}"><button class="btn small secondary" type="submit">${s.active ? 'Deactivate' : 'Reactivate'}</button></form></td></tr>`
+                  )
+                  .join('')}</table>`
+              : '<p class="subtitle">No sources yet.</p>'
+          }
+        </div>
+
+        <div class="panel">
+          <h2 style="margin-top:0">Add a campaign</h2>
+          ${
+            sources.filter((s) => s.active).length
+              ? `<form method="POST" action="/dashboard/marketing/campaigns">
+                  <label>Source *</label><select name="source_id" required>${sources.filter((s) => s.active).map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('')}</select>
+                  <label>Campaign name *</label><input type="text" name="name" required placeholder="Spring 2026 Home Show booth">
+                  <label>Dedicated tracking phone</label><input type="tel" name="tracking_phone" placeholder="(804) 555-0142">
+                  <div class="grid cols-2">
+                    <div><label>Start</label><input type="date" name="start_date"></div>
+                    <div><label>End</label><input type="date" name="end_date"></div>
+                    <div><label>Spend ($)</label><input type="number" step="0.01" name="cost"></div>
+                    <div><label>Status</label><select name="status"><option>active</option><option>planned</option><option>ended</option></select></div>
+                  </div>
+                  <label>Notes</label><input type="text" name="notes">
+                  <div style="margin-top:10px"><button class="btn" type="submit">Add campaign</button></div>
+                </form>`
+              : '<p class="subtitle">Add a source first.</p>'
+          }
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2 style="margin-top:0">Campaigns</h2>
+        ${
+          campaigns.length
+            ? `<div style="overflow-x:auto"><table>
+                <tr><th>Source</th><th>Campaign</th><th>Tracking #</th><th>Dates</th><th>Spend</th><th>Status</th><th></th></tr>
+                ${campaigns
+                  .map(
+                    (c) => `<tr>
+                      <td>${escapeHtml(c.source_name || '')}</td>
+                      <td>${escapeHtml(c.name)}</td>
+                      <td>${c.tracking_phone ? phone(c.tracking_phone) : '—'}</td>
+                      <td>${c.start_date ? fmtDate(c.start_date) : '?'} – ${c.end_date ? fmtDate(c.end_date) : 'ongoing'}</td>
+                      <td>${c.cost != null ? fmtMoney(c.cost) : '—'}</td>
+                      <td>${escapeHtml(c.status)}${c.active ? '' : ' <span class="badge">archived</span>'}</td>
+                      <td><a class="btn small secondary" href="/dashboard/marketing/campaigns/${c.id}/edit">Edit</a></td>
+                    </tr>`
+                  )
+                  .join('')}
+              </table></div>`
+            : '<p class="subtitle">No campaigns yet.</p>'
+        }
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Marketing', active: '/dashboard/marketing', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/marketing/sources', requireAuth, (req, res) => {
+    if (!req.body.name) return res.redirect('/dashboard/marketing?err=Source needs a name');
+    if (req.body.active !== undefined) {
+      // toggle path reuses this route via hidden fields - handled in :id below normally
+    }
+    db.createSource({ name: req.body.name, notes: req.body.notes });
+    res.redirect('/dashboard/marketing?ok=Source added');
+  });
+
+  router.post('/dashboard/marketing/sources/:id', requireAuth, (req, res) => {
+    db.updateSource(req.params.id, { name: req.body.name, notes: req.body.notes, active: req.body.active === '1' });
+    res.redirect('/dashboard/marketing?ok=Source updated');
+  });
+
+  router.post('/dashboard/marketing/campaigns', requireAuth, (req, res) => {
+    const { source_id, name } = req.body;
+    if (!source_id || !name) return res.redirect('/dashboard/marketing?err=Campaign needs a source and a name');
+    db.createCampaign({
+      source_id,
+      name,
+      tracking_phone: req.body.tracking_phone ? normalizePhone(req.body.tracking_phone) : null,
+      start_date: req.body.start_date || null,
+      end_date: req.body.end_date || null,
+      cost: req.body.cost,
+      status: req.body.status || 'active',
+      notes: req.body.notes || null,
+    });
+    res.redirect('/dashboard/marketing?ok=Campaign added');
+  });
+
+  router.get('/dashboard/marketing/campaigns/:id/edit', requireAuth, (req, res) => {
+    const c = db.getCampaign(req.params.id);
+    if (!c) return res.status(404).send('Campaign not found');
+    const sources = db.listSources({ includeInactive: true });
+    const body = `
+      ${backLink('/dashboard/marketing', 'Cancel — back to Marketing')}
+      <h1>Edit campaign</h1>
+      <div class="panel">
+        <form method="POST" action="/dashboard/marketing/campaigns/${c.id}">
+          <label>Source</label><select name="source_id">${sources.map((s) => `<option value="${s.id}" ${s.id === c.source_id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}</select>
+          <label>Name</label><input type="text" name="name" value="${escapeHtml(c.name)}">
+          <label>Tracking phone</label><input type="tel" name="tracking_phone" value="${escapeHtml(c.tracking_phone ? formatPhone(c.tracking_phone) : '')}">
+          <div class="grid cols-2">
+            <div><label>Start</label><input type="date" name="start_date" value="${escapeHtml(c.start_date || '')}"></div>
+            <div><label>End</label><input type="date" name="end_date" value="${escapeHtml(c.end_date || '')}"></div>
+            <div><label>Spend ($)</label><input type="number" step="0.01" name="cost" value="${c.cost != null ? c.cost : ''}"></div>
+            <div><label>Status</label><select name="status">${['active', 'planned', 'ended'].map((s) => `<option ${s === c.status ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
+          </div>
+          <label>Notes</label><input type="text" name="notes" value="${escapeHtml(c.notes || '')}">
+          <label class="check" style="display:flex;gap:8px;margin-top:10px"><input type="checkbox" name="active" value="1" style="width:auto" ${c.active ? 'checked' : ''}> Active (unchecked = archived)</label>
+          <div style="margin-top:12px;display:flex;gap:10px">
+            <button class="btn" type="submit">Save</button>
+            <a class="btn secondary" href="/dashboard/marketing">Cancel</a>
+          </div>
+        </form>
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Edit campaign', active: '/dashboard/marketing', body }));
+  });
+
+  router.post('/dashboard/marketing/campaigns/:id', requireAuth, (req, res) => {
+    db.updateCampaign(req.params.id, {
+      source_id: req.body.source_id,
+      name: req.body.name,
+      tracking_phone: req.body.tracking_phone ? normalizePhone(req.body.tracking_phone) : '',
+      start_date: req.body.start_date,
+      end_date: req.body.end_date,
+      cost: req.body.cost,
+      status: req.body.status,
+      notes: req.body.notes,
+      active: req.body.active === '1',
+    });
+    res.redirect('/dashboard/marketing?ok=Campaign saved');
   });
 
   router.post('/dashboard/leads', requireAuth, (req, res) => {
@@ -532,29 +1194,57 @@ function register(router, requireAuth) {
     res.redirect(`/dashboard/customers/${customer_id}?ok=Lead added to funnel`);
   });
 
-  // Quick-add: creates the customer (or reuses an existing match by phone/email) and a lead in one step.
+  // Quick-add: creates the customer (or reuses an existing match by phone/email),
+  // records marketing attribution, and keeps a legacy lead row for continuity.
   router.post('/dashboard/leads/quick', requireAuth, async (req, res) => {
-    const { name, phone, email, source, estimate_value, notes } = req.body;
-    if (!name) return res.redirect('/dashboard/funnel?err=Name is required');
-    const phoneNorm = normalizePhone(phone);
-    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, email);
-    if (!customer) customer = db.createCustomer({ name, phone: phoneNorm, email });
-    const lead = db.createLead({ customer_id: customer.id, source, estimate_value, notes });
+    const { name, phone: ph, email: em, source, source_id, campaign_id, estimate_value, notes } = req.body;
+    if (!name) return res.redirect('/dashboard/pipeline?err=Name is required');
+    const phoneNorm = normalizePhone(ph);
+    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, em);
+    if (!customer) {
+      customer = db.createCustomer({
+        name,
+        phone: phoneNorm,
+        email: em,
+        notes,
+        source_id: source_id || null,
+        campaign_id: campaign_id || null,
+        actor: actorOf(req),
+      });
+    } else if (source_id || campaign_id) {
+      db.setCustomerAttribution({ customer_id: customer.id, source_id, campaign_id, note: 'quick-add', actor: actorOf(req) });
+    }
+    const lead = db.createLead({ customer_id: customer.id, source: source || null, estimate_value, notes });
     try {
       await automations.onLeadCreated(lead, customer);
     } catch (e) {
       console.error('onLeadCreated failed', e);
     }
-    res.redirect('/dashboard/funnel?ok=Lead added and welcome message sent');
+    res.redirect(`/dashboard/customers/${customer.id}?ok=Customer added`);
   });
 
+  // Legacy funnel stage dropdown. Kept working, but it now also moves the
+  // customer-level sales_stage (the KPI source of truth) via a legacy->new map.
   router.post('/dashboard/leads/:id/stage', requireAuth, async (req, res) => {
     const lead = db.getLead(req.params.id);
     if (!lead) return res.status(404).send('Lead not found');
     const { stage } = req.body;
     db.updateLeadStage(lead.id, stage);
-
-    if (stage === 'Sold') {
+    const map = {
+      'New Lead': 'Bona Fide Lead',
+      Contacted: 'Bona Fide Lead',
+      Quoted: 'Estimate Presented',
+      Sold: 'Sold',
+      Lost: 'Closed / We Declined Customer',
+    };
+    if (map[stage]) {
+      try {
+        db.setSalesStage(lead.customer_id, map[stage], { actor: actorOf(req), note: 'via legacy funnel' });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    if (stage === 'Sold' && !db.listJobs().some((j) => j.customer_id === lead.customer_id)) {
       const customer = db.getCustomer(lead.customer_id);
       const job = db.createJob({ lead_id: lead.id, customer_id: lead.customer_id, sold_amount: lead.estimate_value });
       try {
@@ -563,7 +1253,7 @@ function register(router, requireAuth) {
         console.error('onJobCreated failed', e);
       }
     }
-    res.redirect('/dashboard/funnel?ok=Stage updated');
+    res.redirect(`${req.body.return_to || '/dashboard/pipeline'}?ok=Stage updated`);
   });
 
   // ---------- Appointments ----------
@@ -596,29 +1286,30 @@ function register(router, requireAuth) {
         </form>
       </div>
       <div class="panel">
-        <table>
-          <tr><th>When</th><th>Customer</th><th>Type</th><th>Status</th><th>Reminder</th><th></th></tr>
+        <div style="overflow-x:auto"><table>
+          <tr><th>When</th><th>Customer</th><th>Type</th><th>Status</th><th></th></tr>
           ${appts
-            .map(
-              (a) => `
+            .map((a) => {
+              const missed = a.status === 'scheduled' && new Date(a.scheduled_at) < new Date();
+              return `
             <tr>
-              <td>${fmtDateTime(a.scheduled_at)}</td>
-              <td><a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a></td>
+              <td class="${missed ? 'overdue' : ''}">${fmtDateTime(a.scheduled_at)}${missed ? ' (missed)' : ''}</td>
+              <td><a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a>${a.customer_phone ? `<div class="subtitle" style="margin:0">${phone(a.customer_phone)}</div>` : ''}</td>
               <td>${escapeHtml(a.type)}</td>
               <td>${escapeHtml(a.status)}</td>
-              <td>${a.reminder_sent ? 'sent' : '-'}</td>
-              <td>
+              <td style="white-space:nowrap">
                 ${
                   a.status === 'scheduled'
-                    ? `<form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><button class="btn small secondary" type="submit">Complete</button></form>
-                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><button class="btn small danger" type="submit">Cancel</button></form>`
+                    ? `<a class="btn small secondary" href="/dashboard/appointments/${a.id}/edit?return_to=${encodeURIComponent('/dashboard/appointments')}">Edit</a>
+                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small" type="submit">Complete</button></form>
+                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small danger" type="submit">Cancel</button></form>`
                     : ''
                 }
               </td>
-            </tr>`
-            )
+            </tr>`;
+            })
             .join('')}
-        </table>
+        </table></div>
         ${appts.length === 0 ? '<p class="subtitle">No appointments yet.</p>' : ''}
       </div>
     `;
@@ -627,15 +1318,90 @@ function register(router, requireAuth) {
 
   router.post('/dashboard/appointments', requireAuth, async (req, res) => {
     const { customer_id, type, scheduled_at, duration_min, notes } = req.body;
-    if (!customer_id || !scheduled_at) return res.redirect('/dashboard/appointments?err=Customer and time are required');
+    const returnTo = req.body.return_to || '/dashboard/appointments';
+    if (!customer_id || !scheduled_at) return res.redirect(`${returnTo}?err=Customer and time are required`);
     const iso = new Date(scheduled_at).toISOString();
-    const appt = db.createAppointment({ customer_id, type, scheduled_at: iso, duration_min: Number(duration_min) || 60, notes });
-    res.redirect('/dashboard/appointments?ok=Appointment scheduled');
+    db.createAppointment({ customer_id, type, scheduled_at: iso, duration_min: Number(duration_min) || 60, notes, created_by: actorOf(req) });
+    // A design appointment being set advances the KPI stage (if it isn't already past it).
+    if (/design|consultation/i.test(type || '')) {
+      const c = db.getCustomer(customer_id);
+      if (c && db.SALES_STAGES.indexOf(c.sales_stage) < db.SALES_STAGES.indexOf('Design Appointment Set')) {
+        db.setSalesStage(customer_id, 'Design Appointment Set', { substatus: 'Upcoming', actor: actorOf(req), note: 'appointment scheduled' });
+      }
+    }
+    res.redirect(`${returnTo}?ok=Appointment scheduled`);
+  });
+
+  router.get('/dashboard/appointments/:id/edit', requireAuth, (req, res) => {
+    const a = db.getAppointment(req.params.id);
+    if (!a) return res.status(404).send('Appointment not found');
+    const c = db.getCustomer(a.customer_id);
+    const local = new Date(a.scheduled_at);
+    const localValue = new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    const returnTo = req.query.return_to || `/dashboard/customers/${a.customer_id}`;
+    const body = `
+      ${backLink(returnTo, 'Cancel — back without changes')}
+      <h1>Edit / reschedule appointment</h1>
+      <p class="subtitle">${escapeHtml(c ? c.name : '')} · currently ${escapeHtml(a.status)}</p>
+      <div class="panel">
+        <form method="POST" action="/dashboard/appointments/${a.id}">
+          <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">
+          <div class="grid cols-2">
+            <div><label>Type</label><select name="type">${db.APPT_TYPES.map((t) => `<option ${t === a.type ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select></div>
+            <div><label>Date &amp; time</label><input type="datetime-local" name="scheduled_at" value="${localValue}"></div>
+            <div><label>Duration (min)</label><input type="number" name="duration_min" value="${a.duration_min || 60}"></div>
+            <div><label>Notes</label><input type="text" name="notes" value="${escapeHtml(a.notes || '')}"></div>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:10px">
+            <button class="btn" type="submit">Save changes</button>
+            <a class="btn secondary" href="${escapeHtml(returnTo)}">Cancel</a>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <h3 style="margin-top:0">Change status</h3>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <form method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}"><button class="btn" type="submit">Mark completed</button></form>
+          <form method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}"><button class="btn danger" type="submit">Cancel appointment</button></form>
+        </div>
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Edit appointment', active: '/dashboard/appointments', body }));
+  });
+
+  router.post('/dashboard/appointments/:id', requireAuth, (req, res) => {
+    const a = db.getAppointment(req.params.id);
+    if (!a) return res.status(404).send('Appointment not found');
+    const { type, scheduled_at, duration_min, notes } = req.body;
+    db.updateAppointment(
+      a.id,
+      {
+        type,
+        scheduled_at: scheduled_at ? new Date(scheduled_at).toISOString() : a.scheduled_at,
+        duration_min,
+        notes,
+      },
+      { actor: actorOf(req) }
+    );
+    res.redirect(`${req.body.return_to || `/dashboard/customers/${a.customer_id}`}?ok=Appointment updated`);
   });
 
   router.post('/dashboard/appointments/:id/status', requireAuth, (req, res) => {
-    db.updateAppointmentStatus(req.params.id, req.body.status);
-    res.redirect('/dashboard/appointments?ok=Updated');
+    const a = db.getAppointment(req.params.id);
+    if (!a) return res.status(404).send('Appointment not found');
+    db.setAppointmentStatusTracked(a.id, req.body.status, { actor: actorOf(req) });
+    // A completed design appointment advances the KPI stage.
+    if (req.body.status === 'completed' && /design|consultation/i.test(a.type || '')) {
+      const c = db.getCustomer(a.customer_id);
+      if (c && db.SALES_STAGES.indexOf(c.sales_stage) < db.SALES_STAGES.indexOf('Design Appointment Completed')) {
+        db.setSalesStage(a.customer_id, 'Design Appointment Completed', {
+          substatus: 'Estimate Being Prepared',
+          actor: actorOf(req),
+          note: 'design appointment completed',
+        });
+      }
+    }
+    res.redirect(`${req.body.return_to || '/dashboard/appointments'}?ok=Appointment ${req.body.status}`);
   });
 
   // ---------- Jobs ----------
@@ -821,12 +1587,8 @@ function register(router, requireAuth) {
   router.post('/dashboard/jobs/:id/files/:fileId/delete', requireAuth, (req, res) => {
     const job = db.getJob(req.params.id);
     const f = db.getCustomerFile(req.params.fileId);
-    if (job && f && f.job_id === job.id) {
-      const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
-      fs.existsSync(filePath) && fs.unlinkSync(filePath);
-      db.deleteCustomerFile(f.id);
-    }
-    res.redirect(`/dashboard/jobs/${req.params.id}?ok=File deleted`);
+    if (job && f && f.job_id === job.id) db.softDeleteCustomerFile(f.id, actorOf(req));
+    res.redirect(`/dashboard/jobs/${req.params.id}?ok=File moved to Deleted Files (recoverable)`);
   });
 
   // ---------- Files search (across all customers + jobs) ----------
@@ -1060,6 +1822,7 @@ function register(router, requireAuth) {
     const tabs = [
       ['/dashboard/finances', 'Overview'],
       ['/dashboard/finances/expenses', 'Expenses'],
+      ['/dashboard/finances/review', 'Needs Review'],
       ['/dashboard/finances/reports', 'Reports'],
     ];
     return `<div style="margin-bottom:16px">${tabs
@@ -1161,28 +1924,40 @@ function register(router, requireAuth) {
   });
 
   // ---------- Expenses ----------
+  function coaSelect(name, selected) {
+    return `<select name="${name}">
+      <option value="">— uncategorized (needs review) —</option>
+      ${db
+        .chartOfAccounts({ type: 'expense' })
+        .map((a) => `<option value="${escapeHtml(a.name)}" ${a.name === selected ? 'selected' : ''}>${escapeHtml(a.name)}</option>`)
+        .join('')}
+    </select>`;
+  }
+
   router.get('/dashboard/finances/expenses', requireAuth, (req, res) => {
     const expenses = db.listExpenses();
     const jobs = db.listJobs();
+    const reviewCount = db.listUncategorizedExpenses().length;
     const body = `
       <h1>Bookkeeping</h1>
-      <p class="subtitle">Business expenses. Attach one to a job to see true job cost/margin later.</p>
+      <p class="subtitle">Capture expenses now — categorization can wait. Anything without a Chart-of-Accounts category is flagged under <a href="/dashboard/finances/review">Needs Review</a>${reviewCount ? ` (${reviewCount})` : ''}.</p>
       ${bkSubnav('/dashboard/finances/expenses')}
       <div class="panel">
         <h2 style="margin-top:0">Log an expense</h2>
+        <p class="subtitle">Tip: the assistant can capture these from a sentence ("spent $84.27 at Lowe's for cabinet hardware") or a receipt photo.</p>
         <form method="POST" action="/dashboard/finances/expenses">
           <div class="grid cols-3">
             <div><label>Amount ($) *</label><input type="number" step="0.01" name="amount" required></div>
-            <div><label>Category</label><select name="category">${db.EXPENSE_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join('')}</select></div>
+            <div><label>Merchant / payee</label><input type="text" name="merchant" placeholder="Lowe's"></div>
             <div><label>Date</label><input type="date" name="expense_date"></div>
-            <div><label>Vendor / paid to</label><input type="text" name="vendor"></div>
-            <div><label>Method</label><input type="text" name="method" placeholder="Card, check, cash..."></div>
-            <div>
-              <label>Job (optional - for job costing)</label>
-              <select name="job_id"><option value="">- none / overhead -</option>${jobs.map((j) => `<option value="${j.id}">${escapeHtml(j.customer_name)} - ${escapeHtml(j.status)}</option>`).join('')}</select>
-            </div>
-            <div style="grid-column: span 3"><label>Note</label><input type="text" name="note"></div>
+            <div><label>Chart of Accounts category</label>${coaSelect('coa_account', '')}</div>
+            <div><label>Payment account</label><input type="text" name="payment_account" placeholder="Business checking, Amex…"></div>
+            <div><label>Job (optional)</label><select name="job_id"><option value="">— none / overhead —</option>${jobs
+              .map((j) => `<option value="${j.id}">${escapeHtml(j.customer_name)} — ${escapeHtml(j.status)}</option>`)
+              .join('')}</select></div>
+            <div style="grid-column: span 3"><label>Memo / description</label><input type="text" name="memo" placeholder="Cabinet hinges + drawer slides"></div>
           </div>
+          <input type="hidden" name="entry_source" value="manual">
           <div style="margin-top:12px"><button class="btn" type="submit">Log expense</button></div>
         </form>
       </div>
@@ -1191,15 +1966,24 @@ function register(router, requireAuth) {
           <h2 style="margin:0">All expenses</h2>
           <a class="btn secondary small" href="/dashboard/finances/expenses/export.csv">Export CSV</a>
         </div>
-        <table style="margin-top:12px">
-          <tr><th>Date</th><th>Category</th><th>Vendor</th><th>Amount</th><th>Job</th><th>Note</th></tr>
+        <div style="overflow-x:auto"><table style="margin-top:12px">
+          <tr><th>Date</th><th>Category</th><th>Merchant</th><th>Amount</th><th>Account</th><th>Job</th><th>Recon.</th><th></th></tr>
           ${expenses
             .map(
               (e) =>
-                `<tr><td>${fmtDate(e.expense_date)}</td><td>${escapeHtml(e.category)}</td><td>${escapeHtml(e.vendor || '')}</td><td>${fmtMoney(e.amount)}</td><td>${e.job_id ? `<a href="/dashboard/jobs/${e.job_id}">${escapeHtml(e.job_customer_name || '')}</a>` : ''}</td><td>${escapeHtml(e.note || '')}</td></tr>`
+                `<tr>
+                  <td>${fmtDate(e.expense_at || e.expense_date)}</td>
+                  <td>${escapeHtml(e.coa_account || e.category)}${e.needs_review ? ' <span class="badge">review</span>' : ''}</td>
+                  <td>${escapeHtml(e.merchant || e.vendor || '')}</td>
+                  <td>${fmtMoney(e.amount)}</td>
+                  <td>${escapeHtml(e.payment_account || '')}</td>
+                  <td>${e.job_id ? `<a href="/dashboard/jobs/${e.job_id}">${escapeHtml(e.job_customer_name || '')}</a>` : ''}</td>
+                  <td>${escapeHtml(e.reconciliation_status || 'unreconciled')}</td>
+                  <td><a class="btn small secondary" href="/dashboard/finances/expenses/${e.id}/edit">Edit</a></td>
+                </tr>`
             )
             .join('')}
-        </table>
+        </table></div>
         ${expenses.length === 0 ? '<p class="subtitle">No expenses logged yet.</p>' : ''}
       </div>
     `;
@@ -1207,18 +1991,116 @@ function register(router, requireAuth) {
   });
 
   router.post('/dashboard/finances/expenses', requireAuth, (req, res) => {
-    const { amount, category, expense_date, vendor, method, note, job_id } = req.body;
+    const { amount, coa_account, expense_date, merchant, memo, payment_account, job_id, entry_source } = req.body;
     if (!amount) return res.redirect('/dashboard/finances/expenses?err=Amount is required');
-    db.createExpense({
+    const id = db.createExpense({
       job_id: job_id || null,
       amount: Number(amount),
-      category,
-      vendor,
-      method,
-      note,
-      expense_date: expense_date ? new Date(expense_date).toISOString() : undefined,
+      merchant,
+      memo,
+      coa_account: coa_account || null, // createExpense auto-suggests when this is blank
+      payment_account,
+      entry_source: entry_source || 'manual',
+      expense_at: expense_date ? new Date(expense_date).toISOString() : undefined,
+      created_by: actorOf(req),
     });
-    res.redirect('/dashboard/finances/expenses?ok=Expense logged');
+    const flagged = db.getExpense(id).needs_review;
+    res.redirect(
+      `/dashboard/finances/expenses?ok=${encodeURIComponent('Expense captured' + (flagged ? ' - flagged for review (no confident category)' : ''))}`
+    );
+  });
+
+  router.get('/dashboard/finances/expenses/:id/edit', requireAuth, (req, res) => {
+    const e = db.getExpense(req.params.id);
+    if (!e) return res.status(404).send('Expense not found');
+    const jobs = db.listJobs();
+    const candidates = db.findExpenseMatchCandidates({ amount: e.amount, date: e.expense_at || e.expense_date });
+    const body = `
+      ${backLink('/dashboard/finances/expenses', 'Cancel — back to Expenses')}
+      <h1>Edit expense</h1>
+      <div class="panel">
+        <form method="POST" action="/dashboard/finances/expenses/${e.id}">
+          <div class="grid cols-3">
+            <div><label>Amount ($)</label><input type="number" step="0.01" name="amount" value="${e.amount}"></div>
+            <div><label>Merchant</label><input type="text" name="merchant" value="${escapeHtml(e.merchant || e.vendor || '')}"></div>
+            <div><label>Date</label><input type="date" name="expense_date" value="${escapeHtml((e.expense_at || e.expense_date || '').slice(0, 10))}"></div>
+            <div><label>Category</label>${coaSelect('coa_account', e.coa_account)}</div>
+            <div><label>Payment account</label><input type="text" name="payment_account" value="${escapeHtml(e.payment_account || '')}"></div>
+            <div><label>Reconciliation</label><select name="reconciliation_status">${['unreconciled', 'matched', 'reconciled'].map((s) => `<option ${s === e.reconciliation_status ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
+            <div><label>Job</label><select name="job_id"><option value="">— none —</option>${jobs.map((j) => `<option value="${j.id}" ${j.id === e.job_id ? 'selected' : ''}>${escapeHtml(j.customer_name)} — ${escapeHtml(j.status)}</option>`).join('')}</select></div>
+            <div style="grid-column: span 2"><label>Memo</label><input type="text" name="memo" value="${escapeHtml(e.memo || e.note || '')}"></div>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:10px">
+            <button class="btn" type="submit">Save</button>
+            <a class="btn secondary" href="/dashboard/finances/expenses">Cancel</a>
+          </div>
+        </form>
+      </div>
+      ${
+        e.entry_source && e.entry_source !== 'bank_import'
+          ? `<p class="subtitle">When a bank/card import is added later, a transaction of ${fmtMoney(e.amount)} near ${fmtDate(e.expense_at || e.expense_date)} should be <strong>matched</strong> to this row (external_ref is currently empty), not entered again. ${candidates.length > 1 ? `${candidates.length - 1} other captured expense(s) also fall in that match window.` : ''}</p>`
+          : ''
+      }
+    `;
+    res.send(dashboardLayout({ title: 'Edit expense', active: '/dashboard/finances/expenses', body }));
+  });
+
+  router.post('/dashboard/finances/expenses/:id', requireAuth, (req, res) => {
+    const e = db.getExpense(req.params.id);
+    if (!e) return res.status(404).send('Expense not found');
+    db.updateExpense(
+      e.id,
+      {
+        amount: req.body.amount,
+        merchant: req.body.merchant,
+        memo: req.body.memo,
+        coa_account: req.body.coa_account || null,
+        payment_account: req.body.payment_account,
+        job_id: req.body.job_id || null,
+        reconciliation_status: req.body.reconciliation_status,
+        expense_at: req.body.expense_date ? new Date(req.body.expense_date).toISOString() : undefined,
+        needs_review: req.body.coa_account ? 0 : 1,
+      },
+      { actor: actorOf(req) }
+    );
+    res.redirect(`${req.body.return_to || '/dashboard/finances/expenses'}?ok=Expense updated`);
+  });
+
+  // Needs Review: expenses captured without a confident category.
+  router.get('/dashboard/finances/review', requireAuth, (req, res) => {
+    const rows = db.listUncategorizedExpenses();
+    const body = `
+      <h1>Bookkeeping</h1>
+      <p class="subtitle">Expenses captured without a certain category. Assign one — or leave it and come back later.</p>
+      ${bkSubnav('/dashboard/finances/review')}
+      <div class="panel">
+        ${
+          rows.length
+            ? rows
+                .map(
+                  (e) => `<form method="POST" action="/dashboard/finances/expenses/${e.id}" style="border-bottom:1px solid var(--line);padding:12px 0">
+                    <input type="hidden" name="return_to" value="/dashboard/finances/review">
+                    <input type="hidden" name="amount" value="${e.amount}">
+                    <input type="hidden" name="merchant" value="${escapeHtml(e.merchant || e.vendor || '')}">
+                    <input type="hidden" name="memo" value="${escapeHtml(e.memo || e.note || '')}">
+                    <input type="hidden" name="payment_account" value="${escapeHtml(e.payment_account || '')}">
+                    <input type="hidden" name="reconciliation_status" value="${escapeHtml(e.reconciliation_status || 'unreconciled')}">
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                      <strong>${fmtMoney(e.amount)}</strong>
+                      <span>${escapeHtml(e.merchant || e.vendor || 'unknown merchant')}</span>
+                      <span class="subtitle">${fmtDate(e.expense_at || e.expense_date)}${e.memo ? ' · ' + escapeHtml(e.memo) : ''}</span>
+                      ${coaSelect('coa_account', db.suggestExpenseAccount(`${e.merchant || ''} ${e.memo || ''}`))}
+                      <button class="btn small" type="submit">Save</button>
+                      ${e.receipt_file_id ? '<span class="badge">receipt attached</span>' : ''}
+                    </div>
+                  </form>`
+                )
+                .join('')
+            : '<p class="subtitle">Nothing needs review. 🎉</p>'
+        }
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Needs Review', active: '/dashboard/finances/review', body, flash: flashFromQuery(req.query) }));
   });
 
   router.get('/dashboard/finances/expenses/export.csv', requireAuth, (req, res) => {

@@ -8,8 +8,15 @@ const MIME = {
   '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
   '.ico': 'image/x-icon',
   '.csv': 'text/csv; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.woff2': 'font/woff2',
 };
 
 function matchPath(pattern, pathname) {
@@ -199,6 +206,9 @@ class Router {
           var sep = loc.includes('?') ? '&' : '?';
           loc = loc + sep + '_scroll=' + encodeURIComponent(scroll);
         }
+        // A Location header must be ASCII. Percent-encode anything outside the
+        // safe set so a flash message with an em-dash / emoji can't 500.
+        loc = String(loc).replace(/[^\x21-\x7E]/g, (ch) => encodeURIComponent(ch));
         res.writeHead(302, { Location: loc });
         res.end();
       };

@@ -9,6 +9,8 @@
 // destructive stays a manual dashboard action for now.
 const https = require('https');
 const db = require('../db');
+const sms = require('./sms');
+const email = require('./email');
 
 // Sales-training (reps, roleplay/quiz/real-sale logging) was scaffolded -
 // tables, tools, and prompt text - but never finished with a UI and isn't in
@@ -375,6 +377,148 @@ const BASE_TOOLS = [
       required: ['job_id', 'confirmed'],
     },
   },
+  {
+    name: 'set_sales_stage',
+    description:
+      "Move a customer's PRIMARY sales stage. Valid stages, in order: 'Bona Fide Lead', 'Design Appointment Set', 'Design Appointment Completed', 'Estimate Presented', 'Sold', 'Closed / We Declined Customer'. There is NO 'Lost' - a customer who simply hasn't bought stays active/dormant. Optionally set an attention sub-status (e.g. 'Estimate Overdue', 'Follow-up Due', 'Waiting on Customer', 'Reschedule Needed') which flags what needs doing without changing the KPI stage. This is a real write - confirm the change with Andrew first, then pass confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        stage: { type: 'string' },
+        substatus: { type: 'string', description: 'attention sub-status, or empty string to clear it' },
+        dormant: { type: 'boolean', description: 'mark the customer dormant/waiting (still active, not lost)' },
+        note: { type: 'string' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['customer_id', 'stage', 'confirmed'],
+    },
+  },
+  {
+    name: 'create_followup',
+    description:
+      "Add a next action / follow-up for a customer so it shows up in their attention list and on the Overview. Use for 'send the estimate', 'call back Friday', 'drop off referrals', 'reschedule the missed appointment'. Give a due date/time when there is one.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        title: { type: 'string' },
+        detail: { type: 'string' },
+        due_at: { type: 'string', description: 'ISO 8601 datetime (convert local Eastern to UTC)' },
+        kind: { type: 'string', enum: ['next_action', 'follow_up', 'estimate', 'referrals', 'reschedule', 'custom'] },
+      },
+      required: ['customer_id', 'title'],
+    },
+  },
+  {
+    name: 'list_open_followups',
+    description: 'List every open follow-up across all customers, soonest / most overdue first - the attention queue.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'close_followup',
+    description: "Mark a follow-up 'done' or 'dismissed'.",
+    input_schema: {
+      type: 'object',
+      properties: { followup_id: { type: 'string' }, status: { type: 'string', enum: ['done', 'dismissed'] } },
+      required: ['followup_id', 'status'],
+    },
+  },
+  {
+    name: 'reschedule_appointment',
+    description: "Change an appointment's date/time (and optionally type/duration/notes). Rescheduling clears the 'reminder sent' flag so a fresh reminder goes out.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        appointment_id: { type: 'string' },
+        scheduled_at: { type: 'string', description: 'ISO 8601 datetime' },
+        type: { type: 'string' },
+        duration_min: { type: 'number' },
+        notes: { type: 'string' },
+      },
+      required: ['appointment_id', 'scheduled_at'],
+    },
+  },
+  {
+    name: 'set_appointment_status',
+    description: "Set an appointment to 'completed', 'canceled', or back to 'scheduled'. Completing a design appointment advances the customer's KPI stage.",
+    input_schema: {
+      type: 'object',
+      properties: { appointment_id: { type: 'string' }, status: { type: 'string', enum: ['completed', 'canceled', 'scheduled'] } },
+      required: ['appointment_id', 'status'],
+    },
+  },
+  {
+    name: 'send_customer_message',
+    description:
+      "Send a text or email to a customer THROUGH the BOS (same pipeline the dashboard uses). It is recorded in the communication history with its real delivery status. If Twilio / Resend aren't configured it is recorded but NOT delivered and you must tell Andrew that plainly - never imply it went out. This is outward-facing: state the exact recipient, channel, and message and get Andrew's explicit yes, then pass confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        channel: { type: 'string', enum: ['sms', 'email'] },
+        body: { type: 'string' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['customer_id', 'channel', 'body', 'confirmed'],
+    },
+  },
+  {
+    name: 'capture_expense',
+    description:
+      "Record a business expense from a sentence ('spent $84.27 at Lowe's for cabinet hardware') or an uploaded receipt. Capture amount, merchant, date, memo, and a suggested Chart-of-Accounts category. If the category is reasonably obvious, suggest it and let Andrew confirm/correct; if not, leave coa_account empty and it is saved as Uncategorized / Needs Review - do NOT invent certainty. If a receipt file was uploaded this turn, pass its file_id as receipt_file_id. This writes to the books - state the entry and get Andrew's yes, then confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number' },
+        merchant: { type: 'string' },
+        memo: { type: 'string' },
+        coa_account: { type: 'string', description: 'exact Chart-of-Accounts name, or omit if uncertain' },
+        payment_account: { type: 'string', description: "e.g. 'Business checking', 'Amex'" },
+        expense_at: { type: 'string', description: 'ISO datetime, defaults to now' },
+        job_id: { type: 'string' },
+        receipt_file_id: { type: 'string' },
+        entry_source: { type: 'string', enum: ['voice', 'manual', 'upload', 'assistant', 'email'] },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['amount', 'confirmed'],
+    },
+  },
+  {
+    name: 'list_chart_of_accounts',
+    description: 'List the Chart of Accounts categories (for choosing an expense category).',
+    input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['expense', 'income'] } } },
+  },
+  {
+    name: 'list_marketing',
+    description: 'List marketing sources and campaigns (id, name, tracking phone, spend).',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'set_customer_attribution',
+    description:
+      "Attribute (or re-attribute) a customer to a marketing source and/or campaign. Append-only - the customer's ORIGINAL attribution is preserved and never overwritten; this records a new current attribution with the reason. Use when Andrew says e.g. 'she actually came from the Home Show, not Google'.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        source_id: { type: 'string' },
+        campaign_id: { type: 'string' },
+        tracking_phone: { type: 'string', description: 'inbound tracking number the lead called, if that is the signal' },
+        note: { type: 'string' },
+      },
+      required: ['customer_id'],
+    },
+  },
+  {
+    name: 'get_kpi_summary',
+    description:
+      'The primary funnel KPIs and conversion rates for a date range, plus per-campaign marketing KPIs. Every rate ships its exact numerator/denominator and a denominator label so the numbers are unambiguous.',
+    input_schema: {
+      type: 'object',
+      properties: { start: { type: 'string', description: 'ISO date' }, end: { type: 'string', description: 'ISO date' } },
+    },
+  },
 ];
 
 // Withheld from the model unless SALES_TRAINING_ENABLED (see top of file).
@@ -533,6 +677,120 @@ function runTool(name, input) {
     case 'list_production_queue': {
       return { queue: db.listProductionQueue({ includeDelivered: input.includeDelivered }) };
     }
+    case 'set_sales_stage': {
+      if (input.confirmed !== true) {
+        return { error: 'Not changed - restate the stage change (and sub-status if any) and wait for Andrew to confirm.' };
+      }
+      if (!db.SALES_STAGES.includes(input.stage)) {
+        return { error: `Unknown stage. Valid: ${db.SALES_STAGES.join(', ')}` };
+      }
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      db.setSalesStage(input.customer_id, input.stage, {
+        substatus: input.substatus === undefined ? undefined : input.substatus || null,
+        actor: 'assistant',
+        note: input.note || null,
+      });
+      if (input.dormant !== undefined) db.setCustomerDormant(input.customer_id, !!input.dormant, { actor: 'assistant' });
+      return { ok: true, customer: db.getCustomer(input.customer_id), customer_id: input.customer_id };
+    }
+    case 'create_followup': {
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      const f = db.createFollowup({
+        customer_id: input.customer_id,
+        kind: input.kind || 'next_action',
+        title: input.title,
+        detail: input.detail,
+        due_at: input.due_at || null,
+        created_by: 'assistant',
+      });
+      return { ok: true, followup: f, customer_id: input.customer_id };
+    }
+    case 'list_open_followups': {
+      return { followups: db.listOpenFollowups() };
+    }
+    case 'close_followup': {
+      const f = db.getFollowup(input.followup_id);
+      if (!f) return { error: 'Follow-up not found' };
+      db.closeFollowup(input.followup_id, input.status === 'dismissed' ? 'dismissed' : 'done', 'assistant');
+      return { ok: true, customer_id: f.customer_id };
+    }
+    case 'reschedule_appointment': {
+      const a = db.getAppointment(input.appointment_id);
+      if (!a) return { error: 'Appointment not found' };
+      db.updateAppointment(
+        input.appointment_id,
+        { scheduled_at: input.scheduled_at, type: input.type, duration_min: input.duration_min, notes: input.notes },
+        { actor: 'assistant' }
+      );
+      return { ok: true, appointment: db.getAppointment(input.appointment_id), customer_id: a.customer_id };
+    }
+    case 'set_appointment_status': {
+      const a = db.getAppointment(input.appointment_id);
+      if (!a) return { error: 'Appointment not found' };
+      db.setAppointmentStatusTracked(input.appointment_id, input.status, { actor: 'assistant' });
+      if (input.status === 'completed' && /design|consultation/i.test(a.type || '')) {
+        const c = db.getCustomer(a.customer_id);
+        if (c && db.SALES_STAGES.indexOf(c.sales_stage) < db.SALES_STAGES.indexOf('Design Appointment Completed')) {
+          db.setSalesStage(a.customer_id, 'Design Appointment Completed', { substatus: 'Estimate Being Prepared', actor: 'assistant', note: 'design appointment completed' });
+        }
+      }
+      return { ok: true, customer_id: a.customer_id };
+    }
+    case 'send_customer_message': {
+      if (input.confirmed !== true) {
+        return { error: 'Not sent - restate the recipient, channel, and exact message, and wait for Andrew to confirm.' };
+      }
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      // handled async in the loop below via a marker; do it inline synchronously is not possible,
+      // so we perform it here through a promise the caller awaits. runTool is sync, so queue it.
+      return { __async_send: { customer: c, channel: input.channel, body: input.body } };
+    }
+    case 'capture_expense': {
+      if (input.confirmed !== true) {
+        return { error: 'Not recorded - restate the amount, merchant, date, and category, and wait for Andrew to confirm.' };
+      }
+      const id = db.createExpense({
+        amount: Number(input.amount),
+        merchant: input.merchant,
+        memo: input.memo,
+        coa_account: input.coa_account || null, // createExpense auto-suggests when blank
+        payment_account: input.payment_account,
+        job_id: input.job_id || null,
+        receipt_file_id: input.receipt_file_id || null,
+        entry_source: input.entry_source || 'assistant',
+        expense_at: input.expense_at || undefined,
+        created_by: 'assistant',
+      });
+      const saved = db.getExpense(id);
+      return { ok: true, expense_id: id, coa_account: saved.coa_account, needs_review: saved.needs_review };
+    }
+    case 'list_chart_of_accounts': {
+      return { accounts: db.chartOfAccounts({ type: input.type }) };
+    }
+    case 'list_marketing': {
+      return { sources: db.listSources(), campaigns: db.listCampaigns() };
+    }
+    case 'set_customer_attribution': {
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      db.setCustomerAttribution({
+        customer_id: input.customer_id,
+        source_id: input.source_id || null,
+        campaign_id: input.campaign_id || null,
+        tracking_phone: input.tracking_phone || null,
+        note: input.note || null,
+        actor: 'assistant',
+      });
+      return { ok: true, attribution: db.getCustomerAttribution(input.customer_id), customer_id: input.customer_id };
+    }
+    case 'get_kpi_summary': {
+      const start = input.start ? `${input.start}T00:00:00.000Z` : undefined;
+      const end = input.end ? `${input.end}T23:59:59.999Z` : undefined;
+      return { funnel: db.kpiFunnel({ start, end }), by_campaign: db.kpiByCampaign({ start, end }) };
+    }
     case 'search_files': {
       return { files: db.searchFiles(input.query) };
     }
@@ -677,11 +935,24 @@ function callClaude(messages) {
   });
 }
 
-const SYSTEM_PROMPT = `You are the office manager AND financial analyst for the Shelves to Drawers RVA CRM.
-You have tools to look up and change customers, leads, appointments, payments, expenses,
-jobs, and product/factory-order lines; to search and read uploaded files; plus reporting
-tools for cash flow, P&L, accounts receivable, expense run-rate, and the
-production queue. Andrew wants to be able to actually talk through business questions with
+const SYSTEM_PROMPT = `You are the office manager AND financial analyst for the Shelves to Drawers RVA BOS
+(Business Operations System). You have tools to look up and change customers, their sales
+stage, follow-ups, appointments, payments, expenses, jobs, product/factory-order lines,
+and marketing attribution; to send a customer a text/email through the BOS; to search and
+read uploaded files; plus reporting tools for KPIs, cash flow, P&L, accounts receivable,
+expense run-rate, and the production queue.
+
+SALES MODEL - important. The primary, measurable stage of an opportunity is one of, in
+order: Bona Fide Lead → Design Appointment Set → Design Appointment Completed → Estimate
+Presented → Sold. "Closed / We Declined Customer" is a separate terminal disposition.
+There is NO "Lost" and no "Inquiry" stage. A customer who simply hasn't bought is still
+active - use the dormant flag or a sub-status, never treat non-purchase as lost. Attention
+sub-statuses (Estimate Overdue, Follow-up Due, Reschedule Needed, Waiting on Customer, etc.)
+say what needs doing and do NOT change the KPI stage. When Andrew reports something
+happened ("did the design appt for the Walkers", "sent Jane her estimate"), move the stage
+AND, where useful, add a follow-up with a due date.
+
+Andrew wants to be able to actually talk through business questions with
 you - "can I afford to buy the truck this month," "why does next month look tight," "which
 customers still owe me money" - not just issue one-line commands. Use the reporting tools
 proactively and combine them: a cash-flow question almost always needs list_job_balances
@@ -856,6 +1127,47 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
         result = runTool(block.name, block.input || {});
       } catch (err) {
         result = { error: String(err.message || err) };
+      }
+      // send_customer_message returns a marker; the actual send is async and
+      // happens here so the message goes through the exact same sms/email
+      // pipeline (and verified logging) as the dashboard.
+      if (result && result.__async_send) {
+        const { customer, channel, body } = result.__async_send;
+        let sendRes;
+        try {
+          if (channel === 'email') {
+            sendRes = await email.sendEmail({
+              to: customer.email,
+              subject: `Message from ${process.env.BUSINESS_NAME || 'Shelves to Drawers RVA'}`,
+              html: `<p>${String(body).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>')}</p>`,
+              customer_id: customer.id,
+              logMessage: db.logMessage,
+            });
+          } else {
+            sendRes = await sms.sendSms({ to: customer.phone, body, customer_id: customer.id, logMessage: db.logMessage });
+          }
+        } catch (e) {
+          sendRes = { ok: false, reason: String(e.message || e) };
+        }
+        db.logActivity({
+          entity_type: 'message',
+          entity_id: customer.id,
+          customer_id: customer.id,
+          field: channel === 'email' ? 'email_sent' : 'text_sent',
+          new_value: String(body).slice(0, 80),
+          note: sendRes && sendRes.ok ? 'delivered' : `not delivered (${(sendRes && sendRes.reason) || 'error'})`,
+          actor: 'assistant',
+        });
+        result = {
+          ok: !!(sendRes && sendRes.ok),
+          delivered: !!(sendRes && sendRes.ok),
+          recorded: true,
+          note:
+            sendRes && sendRes.ok
+              ? 'Message delivered and recorded.'
+              : `Recorded in history but NOT delivered${sendRes && sendRes.reason ? ` (${sendRes.reason})` : ''}. Tell Andrew it did not actually send.`,
+          customer_id: customer.id,
+        };
       }
       toolLog.push({ tool: block.name, input: block.input, result });
       const foundCustomerId =

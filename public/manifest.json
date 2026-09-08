@@ -1,0 +1,16 @@
+{
+  "name": "The BOS - Shelves to Drawers RVA",
+  "short_name": "The BOS",
+  "description": "Business Operations System for Shelves to Drawers RVA",
+  "start_url": "/dashboard",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1e3d22",
+  "theme_color": "#1e3d22",
+  "icons": [
+    { "src": "/static/img/favicon-32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "/static/img/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "/static/img/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -24,12 +24,21 @@ const { Router } = require('./router');
 const { requireAuth } = require('./auth');
 const dashboardRoutes = require('./routes/dashboard');
 const publicRoutes = require('./routes/public');
+const authRoutes = require('./routes/auth-routes');
 
 const router = new Router();
 router.use('/static', path.join(__dirname, '..', 'public'));
 
+// Service worker must be served from the root so its scope can be "/".
+router.get('/sw.js', (req, res) => {
+  const p = path.join(__dirname, '..', 'public', 'sw.js');
+  res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Service-Worker-Allowed': '/', 'Cache-Control': 'no-cache' });
+  fs.createReadStream(p).pipe(res);
+});
+
 router.get('/', (req, res) => res.redirect('/dashboard'));
 
+authRoutes.register(router);
 dashboardRoutes.register(router, requireAuth);
 publicRoutes.register(router);
 

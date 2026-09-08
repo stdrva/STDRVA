@@ -5,6 +5,73 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.4.0 (2026-09-08) — Customer Operations phase
+
+Sales model
+- New customer-level sales stage: **Bona Fide Lead → Design Appointment Set → Design
+  Appointment Completed → Estimate Presented → Sold**, plus the terminal disposition
+  **Closed / We Declined Customer**. No "Lost", no "Inquiry" — a customer who hasn't
+  bought is still active (`dormant` flag / attention sub-status). Legacy `leads`/funnel
+  kept working and mapped onto the new stages. Existing customers backfilled from jobs /
+  appointments / old lead stage.
+- Attention sub-statuses per stage (Estimate Overdue, Follow-up Due, Reschedule Needed,
+  Waiting on Customer, …) — advisory, never move the KPI stage.
+- `activity_log` table: every stage/status/attribution/appointment/expense/file change
+  records field, old value, new value, timestamp and actor (user vs assistant). Stage
+  history is never erased.
+- `followups` table + UI: next action, due date, open/done/dismissed. Overdue items are
+  loud; the Overview and each customer header surface what needs action.
+
+Customer page — rebuilt with progressive disclosure. Prominent: name/contact, sales
+stage + attention, quick actions (Text / Email / Call / Map), current opportunity,
+active jobs. Collapsed: files, appointments, marketing, communications, history, notes.
+
+Navigation — consolidated. New **KPI** and **Marketing** tabs; **Pipeline** replaces
+Funnel; a **More** menu holds Production Queue, Files, Booking Link/QR, Product Options
+(hidden but reachable), Deleted Files. Bookkeeping kept.
+
+KPI — `/dashboard/kpi`: the primary funnel with counts and conversion rates, every rate
+shipping its exact numerator / denominator / denominator-label. Revenue, average sale,
+and per source/campaign breakdown (cost per lead / appt, CAC, ROAS).
+
+Marketing — `marketing_sources` + `marketing_campaigns` (dedicated tracking phone, spend,
+dates) + append-only `customer_attribution` (original attribution preserved forever).
+`findCampaignByTrackingPhone()` is the hook a future answering-AI uses to auto-attribute
+an inbound call.
+
+Appointments — edit / reschedule / cancel / complete. Rescheduling re-arms the reminder.
+A past scheduled appointment becomes an attention item. `google_event_id` column reserved.
+
+Texting / Email — real BOS actions from the customer page and the assistant, through the
+existing SMS/email pipeline with verified delivery status. Clearly shows **NOT CONFIGURED**
+and records "recorded, not delivered" rather than faking success.
+
+Files — signature workflow gets a clear Cancel; deletion is now **soft** (recoverable
+from Deleted Files; permanent purge is a separate explicit action).
+
+Bookkeeping capture — expenses gain merchant, memo, Chart-of-Accounts category, payment
+account, entry source, reconciliation status, receipt file link, and `external_ref` for
+future match-not-duplicate bank import. Obvious merchants auto-categorize; uncertain ones
+go to **Needs Review** (never a guessed category). `chart_of_accounts` table seeded.
+
+Login / mobile — cookie session + `/login` page (Basic Auth still works for API);
+"keep me signed in"; PWA manifest, iOS Home Screen metadata, and an instant boot splash
+so the standalone launch never shows a black screen; service worker for installability.
+
+Assistant — new tools: set_sales_stage, create_followup / close_followup /
+list_open_followups, reschedule_appointment / set_appointment_status,
+send_customer_message, capture_expense, list_chart_of_accounts, list_marketing /
+set_customer_attribution, get_kpi_summary. All writes still confirm-gated; all use the
+same db operations as the forms. Widget stays open after send, can minimize/close with a
+launcher to reopen, no longer covers content, optional voice-to-text mic.
+
+Phone numbers — one `formatPhone()` helper; every US number displays as `(804) 839-7984`
+everywhere. Storage stays E.164; extensions and international numbers are not mangled.
+
+Tests — first suite (`npm test`, node:test, no deps): phone formatting, sales-stage
+history, KPI denominators, follow-up lifecycle, appointment reschedule/complete, file
+soft-delete, expense categorization, marketing attribution append-only. 28 tests.
+
 ## 1.3.0 (2026-09-03)
 - Added: files can now be attached to a **job**, not just a customer. Every file still
   belongs to a customer; a job tag makes it show on that job's page too. New Files panel on
