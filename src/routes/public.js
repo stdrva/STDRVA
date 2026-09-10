@@ -606,9 +606,21 @@ async function createBooking({ name, phone, email, address, slotIso, type, consu
 function voiceBookingSlots({ address, near, type, count = 4, fromDate, toDate } = {}) {
   const duration = durationForType(type || PUBLIC_TYPE_ORDER[0]);
   const allowed = address ? allowedDaysForAddress(address) : BUSINESS_DAYS;
-  let days = upcomingBusinessDays(allowed);
-  if (fromDate) days = days.filter((d) => dateKey(d) >= fromDate);
-  if (toDate) days = days.filter((d) => dateKey(d) <= toDate);
+  let days;
+  if (fromDate || toDate) {
+    // An explicit window ("sometime in March") - walk that range directly so we
+    // aren't capped by the normal ~2-week booking horizon.
+    const now = new Date();
+    const minDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + BOOKING_MIN_LEAD_DAYS);
+    const start = fromDate && fromDate > dateKey(minDay) ? new Date(fromDate + 'T00:00:00') : minDay;
+    const end = toDate ? new Date(toDate + 'T00:00:00') : new Date(start.getTime() + 45 * 86400000);
+    days = [];
+    for (let d = new Date(start); d <= end && days.length < 60; d.setDate(d.getDate() + 1)) {
+      if (allowed.includes(d.getDay())) days.push(new Date(d));
+    }
+  } else {
+    days = upcomingBusinessDays(allowed);
+  }
 
   const nearZone = near ? zoneForAddress(near) : null;
   const nearZip3 = near ? (parseAddress(near).zip || '').slice(0, 3) : '';
