@@ -5,6 +5,26 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.4.3 (2026-09-10) — Bug-fix wave 3: Home Show consultant attribution (spec 9)
+
+- New `sales_consultants` table; `consultant_id` added to customers, leads and
+  appointments (guarded migrations, existing data untouched).
+- The booking flow accepts `?consultant=<name>&lead_source=Home%20Show`. The public
+  page shows a "Home Show — booking with <name>" banner; the consultant is matched or
+  created, credited on the customer (cascading to their lead) and on the appointment,
+  and the customer is attributed to a "Home Show" marketing source. An existing
+  customer's original consultant is never overwritten by a re-book.
+- **Lead-capture credit and appointment-booked credit are counted separately.**
+- **Booking Link page:** a "Home Show link" section — pick (or type) a consultant and get
+  a pre-tagged booking URL + QR to hand out at the booth.
+- **KPI page:** a "Home Show / consultant scoreboard" — per consultant: leads captured,
+  appointments booked, appointments completed, show rate, jobs sold, revenue. Counts
+  only, no commission math.
+- **Assistant:** `set_home_show_consultant` (credit a consultant from a sentence like
+  "this lead is Andrew's" — also stamps any appointment already booked this turn) and
+  `list_consultants`; `get_kpi_summary` now includes the per-consultant scoreboard.
+- Customer page shows the crediting consultant in the attribution section.
+
 ## 1.4.2 (2026-09-10) — Bug-fix wave 2: booking flow
 
 The self-serve booking flow was rebuilt around a clear sequence (spec 2-8):

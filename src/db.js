@@ -333,6 +333,16 @@ CREATE TABLE IF NOT EXISTS chart_of_accounts (
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+
+-- Home Show / event salespeople. A consultant "captures" a lead and may "book"
+-- a design appointment on the spot; both are credited to them (spec 9). No
+-- commission math here - just the attribution and the counts behind it.
+CREATE TABLE IF NOT EXISTS sales_consultants (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
 `);
 
 (function migrateCustomersTable() {
@@ -345,6 +355,7 @@ CREATE TABLE IF NOT EXISTS chart_of_accounts (
     ['source_id', 'TEXT'],
     ['campaign_id', 'TEXT'],
     ['first_contact_at', 'TEXT'], // when they became a Bona Fide Lead (KPI denominator anchor)
+    ['consultant_id', 'TEXT'], // Home Show / event salesperson who captured them (spec 9)
   ];
   for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE customers ADD COLUMN ${col} ${type}`);
 })();
@@ -356,8 +367,14 @@ CREATE TABLE IF NOT EXISTS chart_of_accounts (
     ['completed_at', 'TEXT'],
     ['google_event_id', 'TEXT'], // reserved: Google Calendar becomes authoritative later
     ['created_by', 'TEXT'],
+    ['consultant_id', 'TEXT'], // consultant who booked this design appointment (spec 9)
   ];
   for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE appointments ADD COLUMN ${col} ${type}`);
+})();
+
+(function migrateLeadsConsultant() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(leads)`).all().map((c) => c.name));
+  if (!existing.has('consultant_id')) db.exec(`ALTER TABLE leads ADD COLUMN consultant_id TEXT`);
 })();
 
 (function migrateExpensesTable() {
@@ -652,12 +669,12 @@ function updateCustomer(id, { name, phone, email, address, notes }, { actor } = 
 }
 
 // ---- Leads ----
-function createLead({ customer_id, stage, source, estimate_value, notes }) {
+function createLead({ customer_id, stage, source, estimate_value, notes, consultant_id }) {
   const id = newId();
   const ts = nowIso();
   db.prepare(
-    `INSERT INTO leads (id, customer_id, stage, source, estimate_value, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`
-  ).run(id, customer_id, stage || 'New Lead', source || null, estimate_value || null, notes || null, ts, ts);
+    `INSERT INTO leads (id, customer_id, stage, source, estimate_value, notes, created_at, updated_at, consultant_id) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, stage || 'New Lead', source || null, estimate_value || null, notes || null, ts, ts, consultant_id || null);
   return getLead(id);
 }
 function getLead(id) {
@@ -688,13 +705,13 @@ function updateLead(id, { estimate_value, notes, source }) {
 }
 
 // ---- Appointments ----
-function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes, created_by }) {
+function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes, created_by, consultant_id }) {
   const id = newId();
   const ts = nowIso();
   db.prepare(
-    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at, updated_at, created_by)
-     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?, ?, ?)`
-  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, ts, ts, created_by || 'user');
+    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at, updated_at, created_by, consultant_id)
+     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?, ?, ?, ?)`
+  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, ts, ts, created_by || 'user', consultant_id || null);
   logActivity({
     entity_type: 'appointment',
     entity_id: id,
@@ -1602,7 +1619,117 @@ function closeFollowup(id, status, actor) {
   return getFollowup(id);
 }
 
+// ---- Home Show / event sales consultants (spec 9) ----
+function listConsultants({ includeInactive } = {}) {
+  const sql = `SELECT * FROM sales_consultants${includeInactive ? '' : ' WHERE active = 1'} ORDER BY name ASC`;
+  return db.prepare(sql).all();
+}
+function getConsultant(id) {
+  if (!id) return null;
+  return db.prepare(`SELECT * FROM sales_consultants WHERE id = ?`).get(id) || null;
+}
+function findConsultantByName(name) {
+  if (!name) return null;
+  return db.prepare(`SELECT * FROM sales_consultants WHERE lower(trim(name)) = lower(trim(?)) LIMIT 1`).get(name) || null;
+}
+function createConsultant({ name }) {
+  const id = newId();
+  db.prepare(`INSERT INTO sales_consultants (id, name, active, created_at) VALUES (?,?,1,?)`).run(id, String(name).trim(), nowIso());
+  return getConsultant(id);
+}
+// Find a consultant by name or make one - used by the booking flow / assistant
+// so "Andrew at the Home Show" just works without a setup step.
+function upsertConsultantByName(name) {
+  if (!name || !String(name).trim()) return null;
+  return findConsultantByName(name) || createConsultant({ name });
+}
+function setConsultantActive(id, active) {
+  db.prepare(`UPDATE sales_consultants SET active = ? WHERE id = ?`).run(active ? 1 : 0, id);
+  return getConsultant(id);
+}
+// Attach (or change) the consultant credited with a customer, and cascade to
+// their open lead. Logged so the credit history is visible.
+function setCustomerConsultant(customer_id, consultant_id, { actor } = {}) {
+  const c = getCustomer(customer_id);
+  if (!c) return null;
+  if ((c.consultant_id || null) === (consultant_id || null)) return c;
+  db.prepare(`UPDATE customers SET consultant_id = ?, updated_at = ? WHERE id = ?`).run(consultant_id || null, nowIso(), customer_id);
+  db.prepare(`UPDATE leads SET consultant_id = ? WHERE customer_id = ? AND (consultant_id IS NULL OR consultant_id = ?)`)
+    .run(consultant_id || null, customer_id, c.consultant_id || null);
+  const con = getConsultant(consultant_id);
+  logActivity({
+    entity_type: 'customer',
+    entity_id: customer_id,
+    customer_id,
+    field: 'sales_consultant',
+    old_value: c.consultant_id ? (getConsultant(c.consultant_id) || {}).name || c.consultant_id : null,
+    new_value: con ? con.name : null,
+    actor: actor || 'user',
+  });
+  return getCustomer(customer_id);
+}
+
+// Per-consultant scoreboard (spec 9). Counts only - no commission math.
+//   leads_captured        - customers this consultant is credited with
+//   appointments_booked    - design appointments they booked
+//   appointments_completed - of those, marked completed  (show rate = completed / booked)
+//   jobs_sold / revenue    - jobs for their customers, and the sold contract value
+// `start`/`end` are ISO datetimes filtering on when the lead/appt/job was created.
+function consultantScoreboard({ start, end } = {}) {
+  const inRange = (col) => {
+    const parts = [];
+    if (start) parts.push(`${col} >= '${start}'`);
+    if (end) parts.push(`${col} <= '${end}'`);
+    return parts.length ? ' AND ' + parts.join(' AND ') : '';
+  };
+  const consultants = listConsultants({ includeInactive: true });
+  return consultants
+    .map((con) => {
+      const leads_captured = db
+        .prepare(`SELECT COUNT(*) n FROM customers WHERE consultant_id = ?${inRange('COALESCE(first_contact_at, created_at)')}`)
+        .get(con.id).n;
+      const appts = db
+        .prepare(`SELECT status FROM appointments WHERE consultant_id = ?${inRange('created_at')}`)
+        .all(con.id);
+      const appointments_booked = appts.length;
+      const appointments_completed = appts.filter((a) => a.status === 'completed').length;
+      const jobRows = db
+        .prepare(
+          `SELECT jobs.sold_amount FROM jobs JOIN customers ON customers.id = jobs.customer_id
+           WHERE customers.consultant_id = ?${inRange('jobs.created_at')}`
+        )
+        .all(con.id);
+      const jobs_sold = jobRows.length;
+      const revenue = jobRows.reduce((s, j) => s + (Number(j.sold_amount) || 0), 0);
+      return {
+        id: con.id,
+        name: con.name,
+        active: !!con.active,
+        leads_captured,
+        appointments_booked,
+        appointments_completed,
+        show_rate: appointments_booked ? appointments_completed / appointments_booked : null,
+        jobs_sold,
+        revenue,
+      };
+    })
+    .sort((a, b) => b.leads_captured - a.leads_captured || b.appointments_booked - a.appointments_booked);
+}
+
 // ---- Marketing sources & campaigns ----
+// The marketing source every Home Show booking is attributed to (spec 9).
+function homeShowSourceId() {
+  const existing = db.prepare(`SELECT id FROM marketing_sources WHERE lower(name) = 'home show' LIMIT 1`).get();
+  if (existing) return existing.id;
+  const id = newId();
+  db.prepare(`INSERT INTO marketing_sources (id, name, notes, active, created_at) VALUES (?,?,?,1,?)`).run(
+    id,
+    'Home Show',
+    'Auto-created for Home Show consultant attribution',
+    nowIso()
+  );
+  return id;
+}
 function createSource({ name, notes }) {
   const id = newId();
   db.prepare(`INSERT INTO marketing_sources (id, name, notes, active, created_at) VALUES (?,?,?,1,?)`).run(
@@ -2047,6 +2174,16 @@ module.exports = {
   SALES_STAGES,
   SALES_FUNNEL,
   STAGE_SUBSTATUSES,
+  // Home Show / event consultants (spec 9)
+  listConsultants,
+  getConsultant,
+  findConsultantByName,
+  createConsultant,
+  upsertConsultantByName,
+  setConsultantActive,
+  setCustomerConsultant,
+  consultantScoreboard,
+  homeShowSourceId,
   // activity log
   logActivity,
   listActivityForCustomer,

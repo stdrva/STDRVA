@@ -607,12 +607,20 @@ function register(router) {
       }
     }
 
+    const consultantParam = (req.query.consultant || '').trim();
+    const showBanner = consultantParam
+      ? `<div class="panel" style="border-left:3px solid var(--gold);background:#fffbf0">
+          <p style="margin:0"><strong>${escapeHtml(req.query.lead_source || 'Home Show')}</strong> — booking with <strong>${escapeHtml(consultantParam)}</strong>. Fill this out and pick a time; ${escapeHtml(consultantParam.split(' ')[0])} stays credited on your appointment.</p>
+        </div>`
+      : '';
+
     const body = `
       <div class="public-hero">
         <h1>Let's Get Started</h1>
         <div class="rule"></div>
         <p class="subtitle">Pick a service, tell us where you are, then choose from the times we offer. No account needed.</p>
       </div>
+      ${showBanner}
       <div class="panel">
         <h3 style="margin-top:0">1. What do you need?</h3>
         ${typeOptions}
@@ -705,12 +713,14 @@ function register(router) {
     const scheduledAt = when.toISOString();
 
     // Attribution / Home Show consultant (spec 9) - captured, never required.
-    const consultant = (body.consultant || req.query.consultant || '').trim();
-    const leadSource = (body.lead_source || req.query.lead_source || '').trim();
+    const consultantName = (body.consultant || req.query.consultant || '').trim();
+    let leadSource = (body.lead_source || req.query.lead_source || '').trim();
+    const consultant = consultantName ? db.upsertConsultantByName(consultantName) : null;
+    if (consultant && !leadSource) leadSource = 'Home Show';
 
     const flags = [];
     if (outOfArea) flags.push('[Outside normal service area — booked anyway]');
-    if (consultant) flags.push(`[Sales consultant: ${consultant}]`);
+    if (consultant) flags.push(`[Sales consultant: ${consultant.name}]`);
     if (leadSource) flags.push(`[Lead source: ${leadSource}]`);
     const bookingNote = flags.join(' ');
 
@@ -722,6 +732,7 @@ function register(router) {
         email: emailVal,
         address,
         notes: bookingNote || null,
+        source_id: consultant ? db.homeShowSourceId() : null,
       });
     } else {
       // Existing record: the booking form is the customer's own latest word -
@@ -744,6 +755,24 @@ function register(router) {
       }
     }
 
+    // Credit the Home Show consultant on the customer (cascades to their lead)
+    // and record the Home Show attribution. Only sets it if not already set -
+    // an existing customer's original consultant is not stolen by a re-book.
+    if (consultant && !customer.consultant_id) {
+      db.setCustomerConsultant(customer.id, consultant.id, { actor: 'public' });
+      try {
+        db.setCustomerAttribution({
+          customer_id: customer.id,
+          source_id: db.homeShowSourceId(),
+          note: `Home Show — consultant ${consultant.name}`,
+          actor: 'public',
+        });
+      } catch (e) {
+        console.error('home show attribution failed', e);
+      }
+      customer = db.getCustomer(customer.id);
+    }
+
     // Funnel lead.
     const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
     let lead = existingLeads.find((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
@@ -753,6 +782,7 @@ function register(router) {
         stage: 'Contacted',
         source: leadSource || 'Self-service booking',
         notes: bookingNote || null,
+        consultant_id: consultant ? consultant.id : customer.consultant_id || null,
       });
     }
 
@@ -784,7 +814,8 @@ function register(router) {
         scheduled_at: scheduledAt,
         duration_min: duration,
         notes: bookingNote || null,
-        created_by: consultant ? `consultant:${consultant}` : 'public',
+        created_by: consultant ? `consultant:${consultant.name}` : 'public',
+        consultant_id: consultant ? consultant.id : customer.consultant_id || null,
       });
       try {
         await automations.onAppointmentBooked(appt, customer);

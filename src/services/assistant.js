@@ -520,6 +520,24 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'set_home_show_consultant',
+    description:
+      "Credit a Home Show / event sales consultant on a customer (spec 9). Sets the customer's lead source to Home Show and attributes the lead - and any appointment already booked in this conversation - to that consultant, so they show on the KPI scoreboard. Pass the consultant's name as spoken ('Andrew', 'Andrew Kerwin'); it's matched or created. Use this when a salesperson says a lead is theirs ('this is Andrew at the Home Show', 'this lead belongs to me').",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        consultant_name: { type: 'string' },
+      },
+      required: ['customer_id', 'consultant_name'],
+    },
+  },
+  {
+    name: 'list_consultants',
+    description: 'List the Home Show / event sales consultants on file (name + id).',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
     name: 'navigate_to_record',
     description:
       "Open a screen inside the BOS for Andrew - this moves the dashboard page he is looking at. Use it when he says 'open Leora Copeland's record', 'show me her job', 'open her appointment', 'pull up production', etc. This is BOS navigation only, not device control. For a person, resolve the customer first with find_customers and pass their customer_id. Types: 'customer' (their record - also where their sales stage / estimate status lives), 'job' (needs the job id), 'appointment' (needs the appointment id - opens its edit screen), 'files' (a customer's files if customer_id given, else the global file list), 'production', 'pipeline', 'kpi', 'appointments' (the calendar/list), 'overview'. After navigating, the conversation and the active customer are preserved.",
@@ -611,6 +629,7 @@ const READ_ONLY_TOOLS = new Set([
   'list_open_followups',
   'list_chart_of_accounts',
   'list_marketing',
+  'list_consultants',
   'get_kpi_summary',
   'list_sales_reps',
   'get_training_history',
@@ -833,7 +852,36 @@ function runTool(name, input) {
     case 'get_kpi_summary': {
       const start = input.start ? `${input.start}T00:00:00.000Z` : undefined;
       const end = input.end ? `${input.end}T23:59:59.999Z` : undefined;
-      return { funnel: db.kpiFunnel({ start, end }), by_campaign: db.kpiByCampaign({ start, end }) };
+      return {
+        funnel: db.kpiFunnel({ start, end }),
+        by_campaign: db.kpiByCampaign({ start, end }),
+        by_consultant: db.consultantScoreboard({ start, end }),
+      };
+    }
+    case 'set_home_show_consultant': {
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      const con = db.upsertConsultantByName(input.consultant_name);
+      if (!con) return { error: 'Need a consultant name.' };
+      db.setCustomerConsultant(input.customer_id, con.id, { actor: 'assistant' });
+      try {
+        db.setCustomerAttribution({
+          customer_id: input.customer_id,
+          source_id: db.homeShowSourceId(),
+          note: `Home Show — consultant ${con.name} (via assistant)`,
+          actor: 'assistant',
+        });
+      } catch (e) {}
+      // Also stamp any appointment for this customer that has no consultant yet.
+      for (const a of db.listAppointments({}).filter((a) => a.customer_id === input.customer_id && !a.consultant_id)) {
+        try {
+          db.db.prepare(`UPDATE appointments SET consultant_id = ? WHERE id = ?`).run(con.id, a.id);
+        } catch (e) {}
+      }
+      return { ok: true, consultant: con.name, customer_id: input.customer_id };
+    }
+    case 'list_consultants': {
+      return { consultants: db.listConsultants({ includeInactive: true }).map((c) => ({ id: c.id, name: c.name, active: !!c.active })) };
     }
     case 'navigate_to_record': {
       const t = String(input.type || '').toLowerCase();
