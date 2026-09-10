@@ -2435,6 +2435,7 @@ function register(router, requireAuth) {
       const message = (req.body.message || '').trim();
       const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
       const context = ctxCustomer ? { customerId: ctxCustomer.id } : {};
+      if (req.body.mode === 'voice') context.mode = 'voice';
 
       // Attachment arrives one of two ways:
       //  - file_id: already uploaded via /assistant/upload (preferred path)

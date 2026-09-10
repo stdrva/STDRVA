@@ -5,6 +5,43 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.5.0 (2026-09-10) — Voice Mode for Home Show booking (spec 10-15, 24-25)
+
+A first usable **full conversational Voice Mode** — the same assistant, spoken. Zero new
+dependencies (browser Web Speech API).
+
+- **Prominent "🎤 Voice" button** (bottom-left, large, always visible). Opens a full-screen
+  voice view: a status line, a state-animated mic orb, a running transcript, and **End**.
+- **Continuous two-way:** you speak, it answers **out loud**, then the mic reopens on its
+  own — no Send between turns. Talking over the assistant interrupts it (barge-in).
+- **Same brain:** every utterance goes to the same `/dashboard/assistant/chat` with
+  `mode=voice`, so it shares the exact conversation, customer context, tools and CRM
+  actions as the text assistant. Opening or ending Voice never loses the conversation;
+  the transcript mirrors into the text widget too.
+- **Salesperson → customer handoff (spec 11-13):** a spoken briefing —
+  *"this is Andrew at the Home Show, I'm handing the phone to Donna who wants an
+  appointment in March, she's way up north so check the ZIPs and book anyway, try for a
+  day I'm already up there"* — is understood conversationally. The consultant, lead
+  source, customer name, date range, geography note, service-area override and scheduling
+  preference are extracted and **stay active for the rest of the call** once the customer
+  is on the phone. No manual fields.
+- **Location-aware scheduling (spec 14):** `list_available_slots` takes a `near` area and
+  prefers days Andrew already has an appointment nearby (same ZIP-3 / town / zone). If
+  there's no usable match it falls back to normal openings and says so — no invented
+  precision.
+- **Verbal confirmation for the write (spec 24):** before booking, the assistant says the
+  day, time and address back and only creates the appointment after a spoken (or tapped)
+  "yes". `book_design_appointment` runs the **exact same `createBooking()` path** as the
+  public form (customer upsert with latest details, Home Show consultant credit, lead,
+  appointment, confirmation text/email). Discovery questions come after the booking.
+- **Service area never blocks** a voice booking (spec 6) — the address is still recorded
+  and Andrew still notified.
+- iPhone Safari's Web Speech support is limited (no true continuous mode); Voice Mode
+  detects it, still works one turn at a time, and says so. Android/desktop Chrome get the
+  full hands-free loop.
+
+New assistant tools: `list_available_slots`, `book_design_appointment` (confirm-gated).
+
 ## 1.4.3 (2026-09-10) — Bug-fix wave 3: Home Show consultant attribution (spec 9)
 
 - New `sales_consultants` table; `consultant_id` added to customers, leads and

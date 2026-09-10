@@ -11,6 +11,11 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
+// Shared self-serve / voice booking logic (slot picking, the single createBooking
+// path). Required lazily inside the tools to avoid any load-order surprises.
+function booking() {
+  return require('../routes/public');
+}
 
 // Sales-training (reps, roleplay/quiz/real-sale logging) was scaffolded -
 // tables, tools, and prompt text - but never finished with a UI and isn't in
@@ -520,6 +525,42 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'list_available_slots',
+    description:
+      "Get real open design-appointment times to offer a customer (voice / Home Show booking). Returns up to `count` options SPREAD across different days and times - not just the next few in a row. Pass the customer's `address` so the day options respect Andrew's routing. Pass `near` (usually the same address, or a consultant's note like 'she lives far north') to prefer days Andrew ALREADY has an appointment in that area (spec 14) - if there's no usable match it just returns normal openings and says so. Use `from_date`/`to_date` (YYYY-MM-DD) for a requested window like 'sometime in March'. Offer the customer 4, and if they want others call again with a later `from_date` or higher `count`.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: "customer's home address" },
+        near: { type: 'string', description: 'address / area to bias toward (spec 14 routing)' },
+        type: { type: 'string', description: 'appointment type, default Short Design Consultation' },
+        from_date: { type: 'string', description: 'YYYY-MM-DD earliest' },
+        to_date: { type: 'string', description: 'YYYY-MM-DD latest' },
+        count: { type: 'number', description: 'how many options, default 4' },
+      },
+    },
+  },
+  {
+    name: 'book_design_appointment',
+    description:
+      "Book a design appointment end to end from the voice / Home Show flow: it creates or updates the customer (latest details win), credits the Home Show consultant if given, opens a funnel lead, creates the appointment, and sends the confirmation - the exact same path as the public booking form. Get all of: full name, phone, a valid email, full street address (incl. city/state/ZIP), and an exact `scheduled_at` the customer picked from list_available_slots. This is a real write and it is outward-facing (it texts/emails the customer): first say the appointment back in plain words ('Tuesday, March 17 at 2 PM at 123 Main Street - should I book it?') and only pass confirmed:true after the customer (or Andrew) says yes out loud or on screen (spec 24). Service area never blocks a booking (spec 6); an out-of-area address just gets flagged.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        phone: { type: 'string' },
+        email: { type: 'string' },
+        address: { type: 'string' },
+        scheduled_at: { type: 'string', description: 'ISO 8601 datetime from list_available_slots' },
+        type: { type: 'string', description: 'default Short Design Consultation' },
+        consultant_name: { type: 'string', description: 'Home Show salesperson to credit, if any' },
+        lead_source: { type: 'string', description: "e.g. 'Home Show'" },
+        confirmed: { type: 'boolean', description: 'true only after a spoken/on-screen yes to this exact time' },
+      },
+      required: ['name', 'phone', 'email', 'address', 'scheduled_at', 'confirmed'],
+    },
+  },
+  {
     name: 'set_home_show_consultant',
     description:
       "Credit a Home Show / event sales consultant on a customer (spec 9). Sets the customer's lead source to Home Show and attributes the lead - and any appointment already booked in this conversation - to that consultant, so they show on the KPI scoreboard. Pass the consultant's name as spoken ('Andrew', 'Andrew Kerwin'); it's matched or created. Use this when a salesperson says a lead is theirs ('this is Andrew at the Home Show', 'this lead belongs to me').",
@@ -630,6 +671,7 @@ const READ_ONLY_TOOLS = new Set([
   'list_chart_of_accounts',
   'list_marketing',
   'list_consultants',
+  'list_available_slots',
   'get_kpi_summary',
   'list_sales_reps',
   'get_training_history',
@@ -858,6 +900,25 @@ function runTool(name, input) {
         by_consultant: db.consultantScoreboard({ start, end }),
       };
     }
+    case 'list_available_slots': {
+      const r = booking().voiceBookingSlots({
+        address: input.address,
+        near: input.near,
+        type: input.type,
+        count: input.count || 4,
+        fromDate: input.from_date,
+        toDate: input.to_date,
+      });
+      return r;
+    }
+    case 'book_design_appointment': {
+      if (input.confirmed !== true) {
+        return { error: 'Not booked - say the date, time and address back to the customer and wait for a spoken or on-screen "yes" to this exact time, then call again with confirmed:true.' };
+      }
+      // createBooking is async; runTool is sync, so hand it back as a marker
+      // the loop awaits (same pattern as send_customer_message).
+      return { __async_booking: { input } };
+    }
     case 'set_home_show_consultant': {
       const c = db.getCustomer(input.customer_id);
       if (!c) return { error: 'Customer not found' };
@@ -1025,13 +1086,13 @@ function runTool(name, input) {
 }
 
 // ---------- Anthropic Messages API (raw HTTPS, no SDK) ----------
-function callClaude(messages) {
+function callClaude(messages, opts = {}) {
   return new Promise((resolve, reject) => {
     const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
     const body = JSON.stringify({
       model,
       max_tokens: 2048,
-      system: systemPrompt(),
+      system: systemPrompt(opts),
       tools: TOOLS,
       messages,
     });
@@ -1169,8 +1230,53 @@ single most important use: right after Andrew reports how an actual sales call w
 as a real_sale session with a specific, honest summary of what worked and what didn't and an
 outcome of won/lost. Only pull get_training_history when it's actually relevant.`;
 
-function systemPrompt() {
-  return SYSTEM_PROMPT + (SALES_TRAINING_ENABLED ? SALES_TRAINING_PROMPT : '');
+// Appended when the message came in over Voice Mode (spec 10-14, 24-25).
+const VOICE_PROMPT = `
+
+VOICE MODE. This message was spoken aloud and your reply will be read aloud, then the
+mic reopens automatically - it is a live back-and-forth, so keep replies short, natural
+and free of markdown, lists, IDs, URLs and raw ISO dates. One or two sentences, then a
+clear question or next step.
+
+The main job in Voice Mode is Home Show booking, and it usually starts with a SALESPERSON
+briefing you before handing the phone to a CUSTOMER. When someone opens with something like
+"this is Andrew at the Home Show, I'm handing the phone to Donna who wants an appointment
+in March, she's way up north so check the ZIPs and book her anyway, try for a day I'm
+already up there" - do NOT ask them to repeat it into fields. Quietly extract and hold:
+ - sales consultant (e.g. Andrew) and lead source = Home Show
+ - the customer's name
+ - the objective (book a design appointment)
+ - any requested date range ("March")
+ - geography notes ("far north")
+ - a service-area override ("book anyway")
+ - scheduling preferences ("a day Andrew's already in that area" -> pass it as the "near"
+   argument to list_available_slots)
+Acknowledge in one short line ("Got it, Andrew - go ahead and hand her the phone"), and
+KEEP those instructions active for the whole rest of the call even after the customer is
+speaking. They do not need to be repeated.
+
+When the speaker hands over ("here's Donna" / "okay she's got the phone"), switch to
+talking directly TO the customer, warmly and simply: "Hi Donna - let's find you a good
+time. What's the full address, including city and ZIP?" Then gather anything missing
+(address, phone, email), read back a spelled name/street if it sounds ambiguous, call
+list_available_slots and offer FOUR times spread out, let them pick or ask for others.
+
+Before you actually book: say the whole thing back - "I've got Tuesday, March 17th at
+2 PM at 123 Main Street in Bowling Green. Want me to book that?" - and only call
+book_design_appointment with confirmed:true after they say yes out loud (or tap confirm).
+A spoken "yes" is enough; don't make them touch the screen. After it's booked, say it's
+done and repeat the day and time, then you may ask the quick discovery questions (rooms,
+pets, prior experience, what to show them) - the appointment comes first.
+
+Never reject a booking for being out of area; if the salesperson said book anyway, book
+anyway - the address is still recorded and Andrew is still notified.`;
+
+function systemPrompt(opts = {}) {
+  return (
+    SYSTEM_PROMPT +
+    (opts.mode === 'voice' ? VOICE_PROMPT : '') +
+    (SALES_TRAINING_ENABLED ? SALES_TRAINING_PROMPT : '')
+  );
 }
 
 // Runs the full tool-use loop for one user message. Returns
@@ -1247,7 +1353,7 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
   for (let i = 0; i < 6; i++) {
     let response;
     try {
-      response = await callClaude(messages);
+      response = await callClaude(messages, { mode: context.mode });
     } catch (err) {
       remember(`(error: ${err.message})`);
       return { summary: `Assistant error: ${err.message}`, error: true, toolLog };
@@ -1269,6 +1375,43 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
         result = runTool(block.name, block.input || {});
       } catch (err) {
         result = { error: String(err.message || err) };
+      }
+      // book_design_appointment returns a marker; the real booking (async, and
+      // it fires the SMS/email automations) happens here through the exact same
+      // createBooking() path the public /book form uses.
+      if (result && result.__async_booking) {
+        const inp = result.__async_booking.input;
+        let br;
+        try {
+          br = await booking().createBooking({
+            name: inp.name,
+            phone: inp.phone,
+            email: inp.email,
+            address: inp.address,
+            slotIso: inp.scheduled_at,
+            type: inp.type,
+            consultantName: inp.consultant_name,
+            leadSource: inp.lead_source,
+            actor: 'assistant',
+          });
+        } catch (e) {
+          br = { ok: false, error: String(e.message || e) };
+        }
+        if (br.ok) {
+          result = {
+            ok: true,
+            booked: true,
+            appointment_id: br.appt.id,
+            customer_id: br.customer.id,
+            when: booking().fmtSlotLong(new Date(br.appt.scheduled_at)),
+            out_of_area: !!br.outOfArea,
+            note:
+              'Appointment booked and the confirmation text/email was triggered (it is only actually delivered if Twilio/Resend are configured).' +
+              (br.outOfArea ? ' Address is outside the normal area - Andrew was notified.' : ''),
+          };
+        } else {
+          result = { ok: false, error: br.error || 'Booking failed.', conflict: !!br.conflict };
+        }
       }
       // send_customer_message returns a marker; the actual send is async and
       // happens here so the message goes through the exact same sms/email

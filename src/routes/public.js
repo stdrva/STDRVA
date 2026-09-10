@@ -476,6 +476,188 @@ function bookingContact(q) {
   };
 }
 
+// The one place a design appointment is actually created from a self-serve /
+// voice booking. No HTTP here - both POST /book/confirm and the assistant's
+// book_design_appointment tool call this so the two paths can never drift
+// (customer upsert with latest values (spec 7), Home Show consultant credit
+// (spec 9), lead, appointment, notify automations, idempotency + slot re-check).
+async function createBooking({ name, phone, email, address, slotIso, type, consultantName, leadSource, actor }) {
+  type = type || PUBLIC_TYPE_ORDER[0];
+  name = (name || '').trim();
+  phone = (phone || '').trim();
+  email = (email || '').trim();
+  address = (address || '').trim();
+  const when = slotIso ? new Date(slotIso) : null;
+  if (!name || !phone || !isValidEmail(email) || !address || !when || isNaN(when.getTime())) {
+    return { ok: false, error: 'Need a name, phone, valid email, full address and a valid time slot.' };
+  }
+
+  const phoneNorm = normalizePhone(phone);
+  const emailVal = email;
+  const outOfArea = zoneForAddress(address) === 'out-of-area';
+  const duration = durationForType(type);
+  const scheduledAt = when.toISOString();
+
+  let ls = (leadSource || '').trim();
+  const consultant = (consultantName || '').trim() ? db.upsertConsultantByName(consultantName) : null;
+  if (consultant && !ls) ls = 'Home Show';
+
+  const flags = [];
+  if (outOfArea) flags.push('[Outside normal service area — booked anyway]');
+  if (consultant) flags.push(`[Sales consultant: ${consultant.name}]`);
+  if (ls) flags.push(`[Lead source: ${ls}]`);
+  const bookingNote = flags.join(' ');
+  const who = actor || 'public';
+
+  let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
+  if (!customer) {
+    customer = db.createCustomer({
+      name,
+      phone: phoneNorm,
+      email: emailVal,
+      address,
+      notes: bookingNote || null,
+      source_id: consultant ? db.homeShowSourceId() : null,
+    });
+  } else {
+    const merged = {
+      name: name || customer.name,
+      phone: phoneNorm || customer.phone,
+      email: emailVal || customer.email,
+      address: address || customer.address,
+      notes: customer.notes,
+    };
+    if (
+      merged.name !== customer.name ||
+      merged.phone !== customer.phone ||
+      merged.email !== customer.email ||
+      merged.address !== customer.address
+    ) {
+      db.updateCustomer(customer.id, merged, { actor: who });
+      customer = db.getCustomer(customer.id);
+    }
+  }
+
+  if (consultant && !customer.consultant_id) {
+    db.setCustomerConsultant(customer.id, consultant.id, { actor: who });
+    try {
+      db.setCustomerAttribution({
+        customer_id: customer.id,
+        source_id: db.homeShowSourceId(),
+        note: `Home Show — consultant ${consultant.name}`,
+        actor: who,
+      });
+    } catch (e) {
+      console.error('home show attribution failed', e);
+    }
+    customer = db.getCustomer(customer.id);
+  }
+
+  const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
+  let lead = existingLeads.find((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
+  if (!lead) {
+    lead = db.createLead({
+      customer_id: customer.id,
+      stage: 'Contacted',
+      source: ls || 'Self-service booking',
+      notes: bookingNote || null,
+      consultant_id: consultant ? consultant.id : customer.consultant_id || null,
+    });
+  }
+
+  let appt = db
+    .listAppointments()
+    .find((a) => a.customer_id === customer.id && a.scheduled_at === scheduledAt && a.type === type);
+  if (!appt) {
+    const dayStart = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_START, 0, 0);
+    const dayEnd = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_END, 0, 0);
+    const taken = db.listAppointmentsBetween(dayStart.toISOString(), dayEnd.toISOString()).some((a) => {
+      const aStart = new Date(a.scheduled_at);
+      const aEnd = new Date(aStart.getTime() + (a.duration_min || 60) * 60000);
+      return when < aEnd && new Date(when.getTime() + duration * 60000) > aStart;
+    });
+    if (taken) return { ok: false, error: 'That time was just taken - pick another.', conflict: true, customer, when };
+    appt = db.createAppointment({
+      customer_id: customer.id,
+      lead_id: lead.id,
+      type,
+      scheduled_at: scheduledAt,
+      duration_min: duration,
+      notes: bookingNote || null,
+      created_by: consultant ? `consultant:${consultant.name}` : who,
+      consultant_id: consultant ? consultant.id : customer.consultant_id || null,
+    });
+    try {
+      await automations.onAppointmentBooked(appt, customer);
+      if (outOfArea) await automations.onOutOfAreaContact('booked', customer, { type });
+    } catch (e) {
+      console.error('onAppointmentBooked failed', e);
+    }
+  }
+  return { ok: true, customer, lead, appt, outOfArea, when, duration };
+}
+
+// Available appointment slots for the voice/assistant booking path (spec 14).
+// Returns up to `count` spread options as ISO strings, each annotated with
+// whether Andrew already has an appointment that day near `near` (same ZIP-3 /
+// town / zone) so the assistant can prefer those when a consultant asks for a
+// day he's "already in that area". Falls back to normal spread when there is
+// no usable geography.
+function voiceBookingSlots({ address, near, type, count = 4, fromDate, toDate } = {}) {
+  const duration = durationForType(type || PUBLIC_TYPE_ORDER[0]);
+  const allowed = address ? allowedDaysForAddress(address) : BUSINESS_DAYS;
+  let days = upcomingBusinessDays(allowed);
+  if (fromDate) days = days.filter((d) => dateKey(d) >= fromDate);
+  if (toDate) days = days.filter((d) => dateKey(d) <= toDate);
+
+  const nearZone = near ? zoneForAddress(near) : null;
+  const nearZip3 = near ? (parseAddress(near).zip || '').slice(0, 3) : '';
+
+  const dayInfo = days
+    .map((d) => {
+      const key = dateKey(d);
+      const slots = slotsForDate(key, duration);
+      if (!slots.length) return null;
+      let nearby = false;
+      if (near) {
+        const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
+        const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59);
+        const appts = db.listAppointmentsBetween(dayStart.toISOString(), dayEnd.toISOString());
+        nearby = appts.some((a) => {
+          const cust = db.getCustomer(a.customer_id);
+          if (!cust || !cust.address) return false;
+          const z = zoneForAddress(cust.address);
+          const zip3 = (parseAddress(cust.address).zip || '').slice(0, 3);
+          return (nearZip3 && zip3 && zip3 === nearZip3) || (nearZone && z && z === nearZone && z !== 'out-of-area');
+        });
+      }
+      return { key, date: d, slots, nearby };
+    })
+    .filter(Boolean);
+
+  // Prefer days with a nearby appointment (spec 14), else keep natural order.
+  const ordered = near ? dayInfo.slice().sort((a, b) => (b.nearby ? 1 : 0) - (a.nearby ? 1 : 0)) : dayInfo;
+  const out = [];
+  let round = 0;
+  while (out.length < count && round < 12) {
+    for (const di of ordered) {
+      const sorted = di.slots.slice().sort((a, b) => a - b);
+      const s = sorted[round];
+      if (s && out.length < count) out.push({ iso: s.toISOString(), label: fmtSlotLong(s), nearby: di.nearby });
+    }
+    round++;
+  }
+  return {
+    slots: out,
+    used_geography: !!near && dayInfo.some((d) => d.nearby),
+    note: near
+      ? dayInfo.some((d) => d.nearby)
+        ? 'Some options are on days Andrew already has an appointment in that area - those are listed first.'
+        : 'No existing appointments near that address were found, so these are just the normal openings.'
+      : undefined,
+  };
+}
+
 function register(router) {
   // ---------- Step 1-2: service + contact/address, then the 4 time options ----------
   router.get('/book', (req, res) => {
@@ -705,101 +887,20 @@ function register(router) {
       );
     }
 
-    const phoneNorm = normalizePhone(phone);
-    const emailVal = email;
-    const zone = zoneForAddress(address);
-    const outOfArea = zone === 'out-of-area';
-    const duration = durationForType(type);
-    const scheduledAt = when.toISOString();
+    const result = await createBooking({
+      name,
+      phone,
+      email,
+      address,
+      slotIso: slotIso,
+      type,
+      consultantName: (body.consultant || req.query.consultant || '').trim(),
+      leadSource: (body.lead_source || req.query.lead_source || '').trim(),
+      actor: 'public',
+    });
 
-    // Attribution / Home Show consultant (spec 9) - captured, never required.
-    const consultantName = (body.consultant || req.query.consultant || '').trim();
-    let leadSource = (body.lead_source || req.query.lead_source || '').trim();
-    const consultant = consultantName ? db.upsertConsultantByName(consultantName) : null;
-    if (consultant && !leadSource) leadSource = 'Home Show';
-
-    const flags = [];
-    if (outOfArea) flags.push('[Outside normal service area — booked anyway]');
-    if (consultant) flags.push(`[Sales consultant: ${consultant.name}]`);
-    if (leadSource) flags.push(`[Lead source: ${leadSource}]`);
-    const bookingNote = flags.join(' ');
-
-    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
-    if (!customer) {
-      customer = db.createCustomer({
-        name,
-        phone: phoneNorm,
-        email: emailVal,
-        address,
-        notes: bookingNote || null,
-        source_id: consultant ? db.homeShowSourceId() : null,
-      });
-    } else {
-      // Existing record: the booking form is the customer's own latest word -
-      // keep whatever they just typed (spec 7: "Donna" -> "Donna Test" sticks).
-      const merged = {
-        name: name || customer.name,
-        phone: phoneNorm || customer.phone,
-        email: emailVal || customer.email,
-        address: address || customer.address,
-        notes: customer.notes,
-      };
-      if (
-        merged.name !== customer.name ||
-        merged.phone !== customer.phone ||
-        merged.email !== customer.email ||
-        merged.address !== customer.address
-      ) {
-        db.updateCustomer(customer.id, merged, { actor: 'public' });
-        customer = db.getCustomer(customer.id);
-      }
-    }
-
-    // Credit the Home Show consultant on the customer (cascades to their lead)
-    // and record the Home Show attribution. Only sets it if not already set -
-    // an existing customer's original consultant is not stolen by a re-book.
-    if (consultant && !customer.consultant_id) {
-      db.setCustomerConsultant(customer.id, consultant.id, { actor: 'public' });
-      try {
-        db.setCustomerAttribution({
-          customer_id: customer.id,
-          source_id: db.homeShowSourceId(),
-          note: `Home Show — consultant ${consultant.name}`,
-          actor: 'public',
-        });
-      } catch (e) {
-        console.error('home show attribution failed', e);
-      }
-      customer = db.getCustomer(customer.id);
-    }
-
-    // Funnel lead.
-    const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
-    let lead = existingLeads.find((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
-    if (!lead) {
-      lead = db.createLead({
-        customer_id: customer.id,
-        stage: 'Contacted',
-        source: leadSource || 'Self-service booking',
-        notes: bookingNote || null,
-        consultant_id: consultant ? consultant.id : customer.consultant_id || null,
-      });
-    }
-
-    // Idempotency: a double submit / back-button resubmit shouldn't double-book.
-    let appt = db
-      .listAppointments()
-      .find((a) => a.customer_id === customer.id && a.scheduled_at === scheduledAt && a.type === type);
-    if (!appt) {
-      // Re-check the slot is still free (someone else may have taken it).
-      const dayStart = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_START, 0, 0);
-      const dayEnd = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_END, 0, 0);
-      const taken = db.listAppointmentsBetween(dayStart.toISOString(), dayEnd.toISOString()).some((a) => {
-        const aStart = new Date(a.scheduled_at);
-        const aEnd = new Date(aStart.getTime() + (a.duration_min || 60) * 60000);
-        return when < aEnd && new Date(when.getTime() + duration * 60000) > aStart;
-      });
-      if (taken) {
+    if (!result.ok) {
+      if (result.conflict) {
         return res.send(
           publicLayout({
             title: 'That time was just taken',
@@ -807,26 +908,16 @@ function register(router) {
           })
         );
       }
-      appt = db.createAppointment({
-        customer_id: customer.id,
-        lead_id: lead.id,
-        type,
-        scheduled_at: scheduledAt,
-        duration_min: duration,
-        notes: bookingNote || null,
-        created_by: consultant ? `consultant:${consultant.name}` : 'public',
-        consultant_id: consultant ? consultant.id : customer.consultant_id || null,
-      });
-      try {
-        await automations.onAppointmentBooked(appt, customer);
-        if (outOfArea) await automations.onOutOfAreaContact('booked', customer, { type });
-      } catch (e) {
-        console.error('onAppointmentBooked failed', e);
-      }
+      return res.send(
+        publicLayout({
+          title: 'Booking error',
+          body: `<div class="panel"><p>${escapeHtml(result.error)} <a href="/book?${contactQS({ type, name, phone, email, address })}">Go back</a>.</p></div>`,
+        })
+      );
     }
 
     // Post-Redirect-Get so a refresh on the success page doesn't resubmit.
-    return res.redirect(`/book/booked?appt=${encodeURIComponent(appt.id)}`);
+    return res.redirect(`/book/booked?appt=${encodeURIComponent(result.appt.id)}`);
   }
 
   router.post('/book/confirm', doConfirm);
@@ -985,10 +1076,14 @@ function register(router) {
 
 module.exports = {
   register,
-  // exported for tests
+  // shared with the assistant / voice booking path + tests
+  createBooking,
+  voiceBookingSlots,
   parseAddress,
   addressLooksComplete,
   pickSpreadSlots,
   zoneForAddress,
   allowedDaysForAddress,
+  durationForType,
+  fmtSlotLong,
 };

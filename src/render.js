@@ -127,6 +127,7 @@ ${DASH_SCROLL_BODY}
   ${body}
 </main>
 ${assistantWidget(context)}
+${voiceMode(context)}
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function(){}); });
@@ -515,6 +516,172 @@ function assistantWidget(context) {
       if (f) setTimeout(function(){ f.focus(); }, 300);
     });
   });
+})();
+</script>`;
+}
+
+// ---------- Voice Mode (spec 10-15, 24-25) ----------
+// A full-screen, hands-free voice conversation with the SAME assistant (same
+// server-side conversation, same tools, same customer context). Web Speech API,
+// zero dependencies. It POSTs to /dashboard/assistant/chat with mode=voice, so
+// opening/closing Voice never loses the conversation. Built for the Home Show
+// "salesperson briefs, then hands the customer the phone" workflow.
+function voiceMode(context) {
+  const customerId = context && context.customerId ? context.customerId : '';
+  return `
+<button id="voice-launch" type="button" aria-label="Start Voice Mode">🎤 <span>Voice</span></button>
+<div id="voice-overlay" data-context-customer-id="${customerId}" data-state="idle" hidden>
+  <div class="vm-inner">
+    <button type="button" id="vm-end" class="vm-end" aria-label="End voice">✕ End</button>
+    <div class="vm-status" id="vm-status">Starting…</div>
+    <button type="button" id="vm-orb" class="vm-orb" aria-label="Tap to talk"><span class="vm-orb-icon">🎤</span></button>
+    <p class="vm-hint">Speak naturally. It listens, answers out loud, then listens again — no buttons. Tap the mic to pause or interrupt.</p>
+    <div class="vm-log" id="vm-log"></div>
+    <p class="vm-fallback" id="vm-fallback" hidden>This browser's voice support is limited (iPhone Safari especially). It still works one turn at a time — tap the mic, speak, wait for the reply, tap again. For the smoothest experience use Chrome.</p>
+  </div>
+</div>
+<script>
+(function () {
+  var launch = document.getElementById('voice-launch');
+  var overlay = document.getElementById('voice-overlay');
+  if (!launch || !overlay) return;
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var synth = window.speechSynthesis;
+  var statusEl = document.getElementById('vm-status');
+  var logEl = document.getElementById('vm-log');
+  var orb = document.getElementById('vm-orb');
+  var endBtn = document.getElementById('vm-end');
+  var fallbackEl = document.getElementById('vm-fallback');
+  var ctxCustomerId = overlay.getAttribute('data-context-customer-id') || '';
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+
+  var rec = null, running = false, speaking = false, busy = false, wantListen = false;
+
+  function setStatus(s, cls) { statusEl.textContent = s; overlay.setAttribute('data-state', cls || 'idle'); }
+  function addLine(role, text) {
+    var d = document.createElement('div');
+    d.className = 'vm-line ' + (role === 'user' ? 'me' : 'ai');
+    d.textContent = (role === 'user' ? 'You: ' : '') + text;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+    // Mirror into the text assistant log if it's on the page, so the two views agree.
+    var al = document.getElementById('assistant-log');
+    if (al) {
+      var b = document.createElement('div');
+      b.className = 'aw-bubble ' + (role === 'user' ? 'user' : 'bot');
+      b.textContent = text;
+      al.appendChild(b); al.scrollTop = al.scrollHeight;
+    }
+  }
+  function stripForSpeech(t) { return String(t).replace(/[*_\\\`#>|]/g, '').replace(/\\s+/g, ' ').trim(); }
+
+  function open() {
+    overlay.hidden = false;
+    document.body.style.overflow = 'hidden';
+    if (!SR) {
+      setStatus("This browser can't run voice. Use the typing assistant instead.", 'error');
+      fallbackEl.hidden = false;
+      return;
+    }
+    if (isIOS) fallbackEl.hidden = false;
+    // Unlock speech synthesis inside the tap gesture (needed on iOS).
+    try { if (synth) { synth.cancel(); var u0 = new SpeechSynthesisUtterance(' '); u0.volume = 0; synth.speak(u0); } } catch (e) {}
+    setStatus('Listening…', 'listening');
+    startListening();
+  }
+  function close() {
+    wantListen = false;
+    try { if (rec) rec.stop(); } catch (e) {}
+    try { if (synth) synth.cancel(); } catch (e) {}
+    overlay.hidden = true;
+    document.body.style.overflow = '';
+  }
+
+  function makeRec() {
+    var r = new SR();
+    r.lang = 'en-US'; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
+    var finalText = '';
+    r.onstart = function () { running = true; if (!busy && !speaking) setStatus('Listening…', 'listening'); };
+    r.onresult = function (ev) {
+      var interim = '';
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var t = ev.results[i][0].transcript;
+        if (ev.results[i].isFinal) finalText += t + ' '; else interim += t;
+      }
+      if (interim && !busy) setStatus('\\u201c' + interim.trim() + '\\u201d', 'listening');
+      if (speaking) { try { synth.cancel(); } catch (e) {} speaking = false; } // barge-in
+    };
+    r.onerror = function (ev) {
+      running = false;
+      if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+        wantListen = false;
+        setStatus('Microphone is blocked. Allow mic access, then reopen Voice.', 'error');
+      }
+    };
+    r.onend = function () {
+      running = false;
+      var said = finalText.trim(); finalText = '';
+      if (said) handleUtterance(said);
+      else if (wantListen && !busy && !speaking) startListening();
+    };
+    return r;
+  }
+  function startListening() {
+    if (busy || speaking) return;
+    wantListen = true;
+    rec = makeRec();
+    try { rec.start(); } catch (e) { setTimeout(function () { if (wantListen) startListening(); }, 500); }
+  }
+  function stopListening() { wantListen = false; try { if (rec) rec.stop(); } catch (e) {} }
+
+  function handleUtterance(text) {
+    addLine('user', text);
+    busy = true; setStatus('Thinking…', 'thinking');
+    var fd = new FormData();
+    fd.append('message', text);
+    fd.append('mode', 'voice');
+    if (ctxCustomerId) fd.append('context_customer_id', ctxCustomerId);
+    var ctrl = ('AbortController' in window) ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 120000) : null;
+    fetch('/dashboard/assistant/chat', { method: 'POST', headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }, body: fd, signal: ctrl ? ctrl.signal : undefined })
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var d; try { d = t ? JSON.parse(t) : {}; } catch (e) { d = { error: true }; }
+        var reply;
+        if (d && (d._reauth || d.reauth || /your session expired/i.test(d.error || ''))) reply = 'Your session timed out. Please reload the page and start Voice again.';
+        else reply = (d && d.summary) || 'Sorry, I did not catch that. Say it again?';
+        addLine('bot', reply);
+        speak(reply);
+        if (d && d.navigateTo) setTimeout(function () { window.location.href = d.navigateTo; }, 3500);
+      })
+      .catch(function (err) {
+        var msg = (err && err.name === 'AbortError') ? 'That took too long. Let\\'s try again.' : 'I lost the connection. Try again in a moment.';
+        addLine('bot', msg); speak(msg);
+      })
+      .finally(function () { if (timer) clearTimeout(timer); busy = false; });
+  }
+
+  function speak(text) {
+    var clean = stripForSpeech(text);
+    if (!synth || !clean) { if (wantListen) startListening(); return; }
+    try { synth.cancel(); } catch (e) {}
+    var u = new SpeechSynthesisUtterance(clean);
+    u.rate = 1.03; u.pitch = 1;
+    speaking = true; setStatus('Speaking…', 'speaking');
+    u.onend = function () { speaking = false; if (wantListen) startListening(); else setStatus('Tap the mic to talk', 'idle'); };
+    u.onerror = function () { speaking = false; if (wantListen) startListening(); };
+    try { synth.speak(u); } catch (e) { speaking = false; if (wantListen) startListening(); }
+  }
+
+  launch.addEventListener('click', open);
+  endBtn.addEventListener('click', close);
+  orb.addEventListener('click', function () {
+    if (busy) return;
+    if (speaking) { try { synth.cancel(); } catch (e) {} speaking = false; startListening(); return; }
+    if (running) { stopListening(); setStatus('Paused — tap the mic to talk', 'idle'); }
+    else { startListening(); }
+  });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) close(); });
 })();
 </script>`;
 }
