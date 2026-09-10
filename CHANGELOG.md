@@ -5,6 +5,39 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.4.1 (2026-09-10) — Bug-fix wave 1: production URLs + assistant widget
+
+Production URLs (spec 1)
+- `baseUrl()` now falls back to Render's auto-injected `RENDER_EXTERNAL_URL` (then
+  `PUBLIC_BASE_URL`, then `localhost:PORT`) when `BASE_URL` isn't set — booking links, QR
+  codes, status-page links and links inside texts/emails stop showing `localhost:3000` in
+  production. Startup logs the real public base URL and warns if it's still local in prod.
+
+Assistant widget
+- **File / image upload no longer fails with "Could not reach the assistant" (spec 16).**
+  Root cause: `customer_files.customer_id` was `NOT NULL`, so uploading a file from any
+  page that isn't a customer record (Overview, KPI, …) threw. The column is now nullable
+  (table rebuilt, all data preserved). On top of that: uploads now happen on their own
+  fast request and are kept as a reference, so a slow or failed assistant call can't lose
+  the attachment; the chat endpoint always returns JSON (never a 500 HTML page or a login
+  redirect); a failed send keeps the typed message + attachment and shows **Retry**; large
+  files are rejected up front; requests time out cleanly at 120s; the server logs timing
+  and the real error.
+- **Close (×) and minimize (–) now work (spec 17).** The `hidden` attribute was being
+  overridden by the panel's `display:flex`. Reopening restores the conversation, the
+  active customer, and any pending attachment.
+- **Enter sends, Shift+Enter makes a new line (spec 18).** Send button still works.
+- Expired session on an assistant call now says "reload the page to sign back in" instead
+  of the generic error (JSON 401 for fetch requests, not an HTML redirect).
+- **The assistant can navigate the BOS (spec 19):** `navigate_to_record` — "open Leora
+  Copeland's record", "show me her job", "pull up production". Context is preserved.
+- A plain lookup ("what's her balance?") no longer yanks the page to that customer —
+  only an explicit navigation or a real write moves the screen (spec 20/21).
+- Panel is size-capped and starts minimized so the BOS underneath stays usable on a
+  laptop (spec 22).
+- Any ISO datetime that slips into an assistant reply is rewritten to readable local
+  time; the model is also told to never show raw ISO (spec 23).
+
 ## 1.4.0 (2026-09-08) — Customer Operations phase
 
 Sales model

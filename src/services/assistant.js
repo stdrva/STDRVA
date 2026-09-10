@@ -519,6 +519,24 @@ const BASE_TOOLS = [
       properties: { start: { type: 'string', description: 'ISO date' }, end: { type: 'string', description: 'ISO date' } },
     },
   },
+  {
+    name: 'navigate_to_record',
+    description:
+      "Open a screen inside the BOS for Andrew - this moves the dashboard page he is looking at. Use it when he says 'open Leora Copeland's record', 'show me her job', 'open her appointment', 'pull up production', etc. This is BOS navigation only, not device control. For a person, resolve the customer first with find_customers and pass their customer_id. Types: 'customer' (their record - also where their sales stage / estimate status lives), 'job' (needs the job id), 'appointment' (needs the appointment id - opens its edit screen), 'files' (a customer's files if customer_id given, else the global file list), 'production', 'pipeline', 'kpi', 'appointments' (the calendar/list), 'overview'. After navigating, the conversation and the active customer are preserved.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          enum: ['customer', 'job', 'appointment', 'files', 'production', 'pipeline', 'kpi', 'appointments', 'overview'],
+        },
+        customer_id: { type: 'string' },
+        job_id: { type: 'string' },
+        appointment_id: { type: 'string' },
+      },
+      required: ['type'],
+    },
+  },
 ];
 
 // Withheld from the model unless SALES_TRAINING_ENABLED (see top of file).
@@ -571,6 +589,32 @@ const SALES_TRAINING_TOOLS = [
 ];
 
 const TOOLS = [...BASE_TOOLS, ...(SALES_TRAINING_ENABLED ? SALES_TRAINING_TOOLS : [])];
+
+// Tools that only read. A result from one of these must never auto-navigate
+// Andrew's dashboard page (see the tool loop) - navigation is either an
+// explicit navigate_to_record call or the side effect of a real write.
+const READ_ONLY_TOOLS = new Set([
+  'find_customers',
+  'get_customer_detail',
+  'list_job_balances',
+  'get_profit_loss',
+  'get_cash_flow_by_month',
+  'get_expense_run_rate',
+  'list_payments',
+  'list_expenses',
+  'get_job_detail',
+  'list_production_queue',
+  'get_upcoming_appointment_briefing',
+  'search_files',
+  'list_files',
+  'get_file',
+  'list_open_followups',
+  'list_chart_of_accounts',
+  'list_marketing',
+  'get_kpi_summary',
+  'list_sales_reps',
+  'get_training_history',
+]);
 
 // ---------- Tool execution - thin wrappers around db.js ----------
 function runTool(name, input) {
@@ -791,6 +835,46 @@ function runTool(name, input) {
       const end = input.end ? `${input.end}T23:59:59.999Z` : undefined;
       return { funnel: db.kpiFunnel({ start, end }), by_campaign: db.kpiByCampaign({ start, end }) };
     }
+    case 'navigate_to_record': {
+      const t = String(input.type || '').toLowerCase();
+      let pathTo = null;
+      let customer_id = input.customer_id || null;
+      if (t === 'customer') {
+        const c = db.getCustomer(input.customer_id);
+        if (!c) return { error: 'Customer not found - resolve them with find_customers first.' };
+        pathTo = `/dashboard/customers/${c.id}`;
+      } else if (t === 'job') {
+        const j = db.getJob(input.job_id);
+        if (!j) return { error: 'Job not found.' };
+        pathTo = `/dashboard/jobs/${j.id}`;
+        customer_id = j.customer_id;
+      } else if (t === 'appointment') {
+        const a = db.getAppointment(input.appointment_id);
+        if (!a) return { error: 'Appointment not found.' };
+        pathTo = `/dashboard/appointments/${a.id}/edit`;
+        customer_id = a.customer_id;
+      } else if (t === 'files') {
+        if (input.customer_id) {
+          const c = db.getCustomer(input.customer_id);
+          if (!c) return { error: 'Customer not found.' };
+          pathTo = `/dashboard/customers/${c.id}#sec-files`;
+        } else {
+          pathTo = '/dashboard/files';
+        }
+      } else if (t === 'production') {
+        pathTo = '/dashboard/production';
+      } else if (t === 'pipeline') {
+        pathTo = '/dashboard/pipeline';
+      } else if (t === 'kpi') {
+        pathTo = '/dashboard/kpi';
+      } else if (t === 'appointments') {
+        pathTo = '/dashboard/appointments';
+      } else if (t === 'overview') {
+        pathTo = '/dashboard';
+      }
+      if (!pathTo) return { error: `Don't know how to navigate to "${input.type}".` };
+      return { ok: true, __navigate: pathTo, customer_id };
+    }
     case 'search_files': {
       return { files: db.searchFiles(input.query) };
     }
@@ -966,7 +1050,9 @@ info (e.g. no amount for a payment), ask a short clarifying question instead of 
 Dates the user gives in local time should be treated as US Eastern time and converted to
 UTC ISO 8601 for scheduled_at. When you're done making changes, reply with a short, plain
 summary of exactly what you did (or didn't do), written for Andrew to quickly verify - not
-a chatty conversational reply.
+a chatty conversational reply. In that reply, always write dates and times in plain readable
+US Eastern form ("Tue, Sep 15 at 2:00 PM"), never a raw ISO string like
+"2026-09-15T18:00:00Z" - ISO format is only for the tool inputs, never for what Andrew reads.
 
 Financial reasoning rules - these matter more than being fast:
 - Never invent a number. Every dollar figure you state must come from a tool call in this
@@ -1007,6 +1093,13 @@ same for the other one") refer back to what was already discussed - use that con
 of asking Andrew to repeat himself. That history can go stale, though: always re-check current
 facts (a customer's stage, a job's balance, etc.) with the lookup tools before acting, rather
 than trusting a number or status mentioned earlier in the conversation.
+
+Navigation: you can move the BOS screen Andrew is looking at with navigate_to_record -
+"open Leora Copeland's record", "show me her job", "open her appointment", "pull up
+production / the pipeline / KPIs". For a person, call find_customers first and pass the
+customer_id. Navigating does not lose the conversation or the active customer, so it is
+safe to do the moment he asks. Keep the reply to one short line ("Opening Leora Copeland's
+record.") - the screen is already changing, he doesn't need a paragraph.
 
 You have no ability to delete anything - there is no delete tool, full stop. If Andrew asks you
 to delete or remove a record, do not offer to do it, do not suggest a workaround that amounts to
@@ -1092,6 +1185,7 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
   const messages = [...conversationHistory, { role: 'user', content: userContent }];
   const toolLog = [];
   let changedCustomerId = null;
+  let navigateTo = null;
 
   function remember(assistantText) {
     conversationHistory.push({ role: 'user', content: userMessage || (file ? `(uploaded file: ${file.filename})` : '(no message)') });
@@ -1116,7 +1210,7 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
     if (response.stop_reason !== 'tool_use') {
       const text = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
       remember(text || '(no response)');
-      return { summary: text || '(no response)', changedCustomerId, toolLog };
+      return { summary: text || '(no response)', changedCustomerId, navigateTo, toolLog };
     }
 
     const toolResults = [];
@@ -1170,12 +1264,19 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
         };
       }
       toolLog.push({ tool: block.name, input: block.input, result });
-      const foundCustomerId =
-        result?.customer_id ||
-        result?.customer?.id ||
-        result?.lead?.customer_id ||
-        result?.appointment?.customer_id;
-      if (foundCustomerId) changedCustomerId = foundCustomerId;
+      if (result && result.__navigate) navigateTo = result.__navigate;
+      // Only treat this as "a record changed, maybe follow it" for tools that
+      // actually write. A pure lookup (find_customers, get_customer_detail,
+      // reporting) must NOT yank Andrew's page to whatever he just asked about -
+      // that was destroying his context mid-task (spec 20/21).
+      if (!READ_ONLY_TOOLS.has(block.name)) {
+        const foundCustomerId =
+          result?.customer_id ||
+          result?.customer?.id ||
+          result?.lead?.customer_id ||
+          result?.appointment?.customer_id;
+        if (foundCustomerId) changedCustomerId = foundCustomerId;
+      }
       toolResults.push({
         type: 'tool_result',
         tool_use_id: block.id,
@@ -1189,4 +1290,4 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
   return { summary: 'Stopped after several steps without a final answer - try rephrasing.', error: true, toolLog };
 }
 
-module.exports = { handleMessage, assistantConfigured, resetConversation, getHistory };
+module.exports = { handleMessage, assistantConfigured, resetConversation, getHistory, runTool, TOOLS };

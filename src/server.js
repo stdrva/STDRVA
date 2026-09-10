@@ -54,9 +54,19 @@ const server = http.createServer((req, res) => {
 
 const PORT = Number(process.env.PORT || 3000);
 server.listen(PORT, () => {
-  console.log(`\nShelves to Drawers RVA CRM running at http://localhost:${PORT}`);
-  console.log(`Dashboard:    http://localhost:${PORT}/dashboard`);
-  console.log(`Booking page: http://localhost:${PORT}/book\n`);
+  const automations = require('./services/automations');
+  const base = automations.baseUrl();
+  console.log(`\nShelves to Drawers RVA CRM listening on port ${PORT}`);
+  console.log(`Public base URL: ${base}`);
+  console.log(`Dashboard:    ${base}/dashboard`);
+  console.log(`Booking page: ${base}/book\n`);
+  if (automations.baseUrlIsLocal() && process.env.NODE_ENV === 'production') {
+    console.warn(
+      '[config] WARNING: running in production but the public base URL is still localhost. ' +
+        'Set BASE_URL (or rely on RENDER_EXTERNAL_URL) so booking links, QR codes, texts and emails ' +
+        'point at the real domain.\n'
+    );
+  }
 
   require('./services/reminders').start();
 });

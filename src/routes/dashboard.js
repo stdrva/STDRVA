@@ -2298,9 +2298,11 @@ function register(router, requireAuth) {
     if (!message) return res.redirect(`${redirectTo}?err=Type something for the assistant first`);
 
     const result = await assistant.handleMessage(message);
-    const target = result.changedCustomerId ? `/dashboard/customers/${result.changedCustomerId}` : redirectTo;
+    const target =
+      result.navigateTo ||
+      (result.changedCustomerId ? `/dashboard/customers/${result.changedCustomerId}` : redirectTo);
     const param = result.error ? 'err' : 'ok';
-    res.redirect(`${target}?${param}=${encodeURIComponent(result.summary)}`);
+    res.redirect(`${target}${target.includes('?') ? '&' : '?'}${param}=${encodeURIComponent(result.summary)}`);
   });
 
   router.post('/dashboard/assistant/reset', requireAuth, (req, res) => {
@@ -2316,39 +2318,127 @@ function register(router, requireAuth) {
     res.json({ history: assistant.getHistory() });
   });
 
-  router.post('/dashboard/assistant/chat', requireAuth, async (req, res) => {
-    const message = (req.body.message || '').trim();
-    const upload = req.files && req.files[0] ? req.files[0] : null;
-    if (!message && !upload) return res.status(400).json({ error: 'Type something or upload a file' });
+  // Reads the stored bytes for a customer_files row back off disk, so a file
+  // uploaded on an earlier request can still be handed to the model.
+  function readStoredFile(fileRow) {
+    if (!fileRow || !fileRow.stored_name) return null;
+    const p = path.join(UPLOADS_DIR, fileRow.customer_id || '_unassigned', fileRow.stored_name);
+    if (!fs.existsSync(p)) return null;
+    return fs.readFileSync(p);
+  }
 
-    const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
-    const context = ctxCustomer ? { customerId: ctxCustomer.id } : {};
-
-    // The uploaded file is stored immediately, whether or not the assistant is
-    // configured - "keep every file" is the point. It's tagged to the customer
-    // whose page Andrew is on (if any); the assistant can re-tag it to a job.
-    let file = null;
-    if (upload && upload.filename) {
+  // Attachment upload is now a SEPARATE, fast request from sending a chat
+  // message. It just saves the file and hands back a reference. This is why a
+  // slow or failed assistant call can no longer lose an attachment (spec 16):
+  // the bytes are already on disk and the widget keeps the returned file_id to
+  // retry with.
+  router.post('/dashboard/assistant/upload', requireAuth, async (req, res) => {
+    try {
+      const upload = req.files && req.files[0] ? req.files[0] : null;
+      if (!upload || !upload.filename) {
+        return res.status(400).json({ error: 'No file received. Pick a file and try again.' });
+      }
+      const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
       const fileId = saveUpload({
         customer_id: ctxCustomer ? ctxCustomer.id : null,
         job_id: null,
         upload,
         note: 'Uploaded via assistant chat',
       });
-      file = {
-        id: fileId,
+      const analyzable =
+        (upload.mimeType || '').startsWith('image/') ||
+        upload.mimeType === 'application/pdf' ||
+        (upload.mimeType || '').startsWith('text/') ||
+        /\.(txt|csv|md|pdf|jpe?g|png|webp|gif)$/i.test(upload.filename);
+      return res.json({
+        ok: true,
+        file_id: fileId,
         filename: upload.filename,
-        mimeType: upload.mimeType || 'application/octet-stream',
-        buffer: upload.data,
-      };
+        mime: upload.mimeType || 'application/octet-stream',
+        size: upload.data.length,
+        analyzable,
+      });
+    } catch (err) {
+      console.error('[assistant/upload] failed:', err && err.stack ? err.stack : err);
+      return res.status(500).json({ error: 'Could not save that file. It was not stored - try again.' });
     }
+  });
 
-    const result = await assistant.handleMessage(message, context, { file });
-    res.json({
-      summary: result.summary,
-      error: !!result.error,
-      changedCustomerId: result.changedCustomerId || null,
-    });
+  router.post('/dashboard/assistant/chat', requireAuth, async (req, res) => {
+    const started = Date.now();
+    let stage = 'start';
+    try {
+      const message = (req.body.message || '').trim();
+      const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
+      const context = ctxCustomer ? { customerId: ctxCustomer.id } : {};
+
+      // Attachment arrives one of two ways:
+      //  - file_id: already uploaded via /assistant/upload (preferred path)
+      //  - a raw multipart file on this same request (legacy / JS-off fallback)
+      let file = null;
+      stage = 'attachment';
+      if (req.body.file_id) {
+        const row = db.getCustomerFile(req.body.file_id);
+        const buf = row ? readStoredFile(row) : null;
+        if (row && buf) {
+          file = {
+            id: row.id,
+            filename: row.original_name || row.stored_name,
+            mimeType: row.mime_type || 'application/octet-stream',
+            buffer: buf,
+          };
+        } else {
+          console.warn('[assistant/chat] file_id given but bytes not found:', req.body.file_id);
+        }
+      } else if (req.files && req.files[0] && req.files[0].filename) {
+        const upload = req.files[0];
+        const fileId = saveUpload({
+          customer_id: ctxCustomer ? ctxCustomer.id : null,
+          job_id: null,
+          upload,
+          note: 'Uploaded via assistant chat',
+        });
+        file = {
+          id: fileId,
+          filename: upload.filename,
+          mimeType: upload.mimeType || 'application/octet-stream',
+          buffer: upload.data,
+        };
+      }
+
+      if (!message && !file) {
+        return res.status(400).json({ error: 'Type something or attach a file first.' });
+      }
+
+      stage = 'handleMessage';
+      const result = await assistant.handleMessage(message, context, { file });
+      console.log(
+        `[assistant/chat] ok in ${Date.now() - started}ms` +
+          (file ? ` (file ${file.mimeType} ${Math.round(file.buffer.length / 1024)}KB)` : '') +
+          (result.error ? ' [assistant returned error]' : '')
+      );
+      return res.json({
+        summary: result.summary,
+        error: !!result.error,
+        changedCustomerId: result.changedCustomerId || null,
+        navigateTo: result.navigateTo || null,
+      });
+    } catch (err) {
+      console.error(
+        `[assistant/chat] FAILED at stage "${stage}" after ${Date.now() - started}ms:`,
+        err && err.stack ? err.stack : err
+      );
+      // Always JSON, always 200-shaped for the widget - it distinguishes on the
+      // `error` flag, not the HTTP status, so a thrown error still renders as a
+      // readable message instead of the generic "could not reach" catch.
+      return res.status(200).json({
+        error: true,
+        summary:
+          'The assistant hit an error handling that' +
+          (stage === 'handleMessage' ? ' (while thinking/using tools).' : ` (${stage}).`) +
+          ' Your message and attachment are kept - press Retry.',
+      });
+    }
   });
 }
 

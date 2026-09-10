@@ -13,6 +13,18 @@ function wantsHtml(req) {
   return req.method === 'GET' && (a.includes('text/html') || a === '' || a.includes('*/*'));
 }
 
+// A fetch()/XHR call (the assistant widget, voice mode, any JSON API hit).
+// These must get a machine-readable 401 - never a 302 to /login (whose HTML
+// body then blows up r.json()) and never a plain-text body.
+function wantsJson(req) {
+  const a = req.headers.accept || '';
+  return (
+    a.includes('application/json') ||
+    (req.headers['x-requested-with'] || '').toLowerCase() === 'fetch' ||
+    (req.headers['content-type'] || '').includes('application/json')
+  );
+}
+
 function requireAuth(req, res, next) {
   const pass = process.env.DASHBOARD_PASSWORD;
   const user = process.env.DASHBOARD_USER || 'admin';
@@ -47,6 +59,10 @@ function requireAuth(req, res, next) {
     }
   }
 
+  if (wantsJson(req)) {
+    res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({ error: 'Your session expired. Reload the page to sign back in.', reauth: true }));
+  }
   if (wantsHtml(req)) {
     const nextUrl = encodeURIComponent(req.url || '/dashboard');
     res.writeHead(302, { Location: `/login?next=${nextUrl}` });

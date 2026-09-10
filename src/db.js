@@ -384,6 +384,45 @@ CREATE TABLE IF NOT EXISTS chart_of_accounts (
   if (!existing.has('deleted_by')) db.exec(`ALTER TABLE customer_files ADD COLUMN deleted_by TEXT`);
 })();
 
+// ---- Migration: customer_files.customer_id must be NULLABLE. A file uploaded
+// through the Assistant chat while Andrew is NOT on a customer page (Overview,
+// KPI, etc.) has no customer to attach to yet - the old NOT NULL constraint
+// made that insert throw, which surfaced in the widget as the generic
+// "Could not reach the assistant." Rebuild the table (SQLite can't ALTER a
+// column constraint) preserving every column, dropping NOT NULL on
+// customer_id, and making the FK ON DELETE SET NULL. Guarded: only runs while
+// the column is still NOT NULL. ----
+(function migrateCustomerFilesNullableCustomer() {
+  const info = db.prepare(`PRAGMA table_info(customer_files)`).all();
+  const cid = info.find((c) => c.name === 'customer_id');
+  if (!cid || cid.notnull === 0) return; // table absent or already nullable
+
+  const cols = info.map((c) => c.name);
+  const defs = info.map((c) => {
+    if (c.pk) return `${c.name} ${c.type || 'TEXT'} PRIMARY KEY`;
+    if (c.name === 'customer_id') return `customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL`;
+    let d = `${c.name} ${c.type || 'TEXT'}`;
+    if (c.notnull) d += ' NOT NULL';
+    if (c.dflt_value !== null && c.dflt_value !== undefined) d += ` DEFAULT ${c.dflt_value}`;
+    return d;
+  });
+
+  db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec('BEGIN;');
+  try {
+    db.exec(`CREATE TABLE customer_files_new (\n  ${defs.join(',\n  ')}\n);`);
+    db.exec(`INSERT INTO customer_files_new (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM customer_files;`);
+    db.exec('DROP TABLE customer_files;');
+    db.exec('ALTER TABLE customer_files_new RENAME TO customer_files;');
+    db.exec('COMMIT;');
+  } catch (e) {
+    db.exec('ROLLBACK;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    throw e;
+  }
+  db.exec('PRAGMA foreign_keys = ON;');
+})();
+
 // ---- Chart of Accounts seed (only if empty). Small-shop Schedule-C shaped
 // buckets; editable later. ----
 (function seedChartOfAccounts() {
@@ -900,7 +939,7 @@ function createCustomerFile({ customer_id, job_id, stored_name, original_name, m
   db.prepare(
     `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at)
      VALUES (?,?,?,?,?,?,?,?,?)`
-  ).run(id, customer_id, job_id || null, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
+  ).run(id, customer_id || null, job_id || null, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
   syncFileSearch(id);
   return id;
 }

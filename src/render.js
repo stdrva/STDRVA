@@ -206,26 +206,34 @@ function phone(v) {
 }
 
 // ---------- assistant widget ----------
-// Floating chat. Improvements this phase: stays open after sending; a real
-// minimize (collapses to a pill) and close (hidden entirely); a persistent
-// "AI" launcher button re-opens it; it never covers page content (body gets
-// bottom padding); optional voice-to-text mic where the browser supports it.
+// Floating chat. This phase's fixes (spec 16-23):
+//  - X actually closes to the launcher; minimize collapses to the header bar;
+//    reopening restores the conversation, the active customer, and any pending
+//    attachment reference.
+//  - Enter sends, Shift+Enter makes a newline, the Send button still works.
+//  - Attachments upload on their OWN request and are kept as a reference, so a
+//    slow/failed assistant call never loses the file. Failed sends keep the
+//    typed message + attachment and offer Retry. Auth expiry says so plainly
+//    instead of "could not reach the assistant".
+//  - The assistant can navigate the BOS (navigate_to_record) without losing
+//    context.
+//  - Panel is size-capped so the BOS underneath stays usable on a laptop.
 function assistantWidget(context) {
   const customerId = context && context.customerId ? context.customerId : '';
   return `
 <button id="assistant-launch" type="button" aria-label="Open AI assistant" hidden>AI</button>
-<div id="assistant-widget" data-context-customer-id="${customerId}">
+<div id="assistant-widget" data-context-customer-id="${customerId}" hidden>
   <div class="aw-head">
     <span class="aw-title">AI Assistant${customerId ? ' · this customer' : ''}</span>
     <span class="aw-head-btns">
-      <button type="button" id="aw-min" aria-label="Minimize">–</button>
-      <button type="button" id="aw-close" aria-label="Close">×</button>
+      <button type="button" id="aw-min" aria-label="Minimize" title="Minimize">–</button>
+      <button type="button" id="aw-close" aria-label="Close" title="Close">×</button>
     </span>
   </div>
   <div class="aw-body">
     <div id="assistant-log" class="aw-log"></div>
     <form id="assistant-form" enctype="multipart/form-data">
-      <textarea id="assistant-input" rows="2" placeholder="Ask or tell the BOS…"></textarea>
+      <textarea id="assistant-input" rows="2" placeholder="Ask or tell the BOS…  (Enter sends, Shift+Enter = new line)"></textarea>
       <div class="aw-controls">
         <button id="assistant-send" type="submit">Send</button>
         <label class="aw-file" title="Attach a photo / PDF / receipt">
@@ -252,16 +260,39 @@ function assistantWidget(context) {
   var fileInput = form.querySelector('input[name="file"]');
   var fileLabel = document.getElementById('assistant-file-label');
   var micBtn = document.getElementById('aw-mic');
-  var selectedFile = null;
+
+  // Pending attachment: once uploaded it becomes { file_id, name, analyzable }.
+  // Kept in sessionStorage so a page navigation (incl. one the assistant does)
+  // or an accidental reload doesn't drop "you have X attached".
+  var ATT_KEY = 'bos_assistant_attachment';
+  var pendingAttachment = null;
+  try { pendingAttachment = JSON.parse(sessionStorage.getItem(ATT_KEY) || 'null'); } catch (e) {}
+  var lastFailedSend = null; // { message } kept for Retry
+
+  function saveAttachment(a) {
+    pendingAttachment = a;
+    try {
+      if (a) sessionStorage.setItem(ATT_KEY, JSON.stringify(a));
+      else sessionStorage.removeItem(ATT_KEY);
+    } catch (e) {}
+    renderFileLabel();
+  }
+  function renderFileLabel() {
+    if (!pendingAttachment) { fileLabel.textContent = ''; return; }
+    fileLabel.textContent =
+      '📎 ' + pendingAttachment.name +
+      (pendingAttachment.analyzable === false ? ' (stored — will be reviewed by hand)' : ' — attached to your next message');
+  }
+  renderFileLabel();
 
   var STATE_KEY = 'bos_assistant_state';
   function getState(){
     try {
       var s = localStorage.getItem(STATE_KEY);
-      if (s) return s;
+      if (s === 'open' || s === 'min' || s === 'closed') return s;
     } catch(e){}
-    // First visit: minimized on phones (so it never covers content), open on desktop.
-    return (window.innerWidth <= 640) ? 'min' : 'open';
+    // First visit: minimized everywhere so the BOS underneath is never covered.
+    return 'min';
   }
   function setState(s){ try { localStorage.setItem(STATE_KEY, s); } catch(e){} apply(s); }
   function apply(s){
@@ -271,64 +302,182 @@ function assistantWidget(context) {
   }
   apply(getState());
 
-  document.getElementById('aw-min').addEventListener('click', function(){ setState(getState()==='min'?'open':'min'); });
-  document.getElementById('aw-close').addEventListener('click', function(){ setState('closed'); });
-  launch.addEventListener('click', function(){ setState('open'); input.focus(); });
+  document.getElementById('aw-min').addEventListener('click', function(e){
+    e.stopPropagation();
+    setState(getState() === 'min' ? 'open' : 'min');
+  });
+  document.getElementById('aw-close').addEventListener('click', function(e){
+    e.stopPropagation();
+    setState('closed');
+  });
+  launch.addEventListener('click', function(){ setState('open'); setTimeout(function(){ input.focus(); }, 0); });
   document.querySelector('#assistant-widget .aw-head').addEventListener('click', function(e){
-    if (e.target.tagName === 'BUTTON') return;
+    if (e.target.closest('button')) return;
     if (widget.classList.contains('minimized')) setState('open');
   });
 
   fileInput.addEventListener('change', function () {
-    selectedFile = this.files[0] || null;
-    fileLabel.textContent = selectedFile ? '📎 ' + selectedFile.name + ' (sends with your next message)' : '';
+    var f = this.files[0] || null;
+    this.value = '';
+    if (!f) return;
+    // ~4.5MB is Anthropic's inline ceiling; bigger files are stored but not analyzed.
+    if (f.size > 25 * 1024 * 1024) {
+      addBubble('assistant', 'That file is ' + Math.round(f.size / 1024 / 1024) + ' MB — too large to attach here. Add it from the customer or job Files section instead.');
+      return;
+    }
+    fileLabel.textContent = '📎 ' + f.name + ' — uploading…';
+    var fd = new FormData();
+    fd.append('file', f);
+    if (contextCustomerId) fd.append('context_customer_id', contextCustomerId);
+    fetch('/dashboard/assistant/upload', { method: 'POST', headers: awHeaders(), body: fd })
+      .then(readJson)
+      .then(function (d) {
+        if (d && d.ok) {
+          saveAttachment({ file_id: d.file_id, name: d.filename, analyzable: d.analyzable });
+        } else {
+          fileLabel.textContent = '';
+          addBubble('assistant', (d && d.error) || 'That file could not be uploaded. Try again.');
+        }
+      })
+      .catch(function (err) {
+        fileLabel.textContent = '';
+        addBubble('assistant', awNetworkMessage(err));
+      });
   });
 
+  function awHeaders() {
+    // Marks the request as a fetch so an expired session returns JSON 401
+    // instead of an HTML redirect that would blow up r.json().
+    return { 'Accept': 'application/json', 'X-Requested-With': 'fetch' };
+  }
+  function readJson(r) {
+    return r.text().then(function (t) {
+      var d;
+      try { d = t ? JSON.parse(t) : {}; } catch (e) { d = { error: true, _nonjson: true, _status: r.status }; }
+      if (r.status === 401 || (d && d.reauth)) {
+        d = d || {};
+        d.error = true;
+        d.summary = d.error && typeof d.error === 'string' ? d.error : 'Your session expired — reload the page to sign back in.';
+        d._reauth = true;
+      }
+      return d;
+    });
+  }
+  function awNetworkMessage(err) {
+    if (err && err.name === 'AbortError') return 'That took too long and timed out. Your message is kept — press Retry.';
+    return 'Could not reach the assistant (network). Your message is kept — press Retry when you have a connection.';
+  }
+
+  // Safety net for spec 23: if any ISO datetime slips into an assistant reply,
+  // rewrite it to readable local form rather than showing "2026-09-14T13:00:00Z".
+  function humanizeIso(text) {
+    return String(text).replace(/\\b(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2})?(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})?)\\b/g, function (m) {
+      var d = new Date(m);
+      if (isNaN(d.getTime())) return m;
+      return d.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    });
+  }
   function addBubble(role, text) {
     var isUser = role === 'user';
     var div = document.createElement('div');
     div.className = 'aw-bubble ' + (isUser ? 'user' : 'bot');
-    div.textContent = text;
+    div.textContent = isUser ? text : humanizeIso(text);
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
     return div;
   }
+  function restoreInput(message) {
+    // Put the text back so Andrew can tweak and resend instead of only retrying verbatim.
+    if (message && !input.value.trim()) input.value = message;
+  }
+  function showRetry(message) {
+    lastFailedSend = { message: message };
+    var wrap = document.createElement('div');
+    wrap.className = 'aw-retry';
+    var btn = document.createElement('button');
+    btn.type = 'button'; btn.textContent = 'Retry';
+    btn.addEventListener('click', function () {
+      wrap.remove();
+      doSend(message, true);
+    });
+    wrap.appendChild(btn);
+    log.appendChild(wrap);
+    log.scrollTop = log.scrollHeight;
+  }
 
-  fetch('/dashboard/assistant/history').then(function(r){return r.json();}).then(function(d){
-    (d.history || []).forEach(function(m){ addBubble(m.role, m.content); });
+  fetch('/dashboard/assistant/history', { headers: awHeaders() }).then(readJson).then(function(d){
+    (d && d.history || []).forEach(function(m){ addBubble(m.role, m.content); });
   }).catch(function(){});
+
+  function doSend(message, isRetry) {
+    if (!message && !pendingAttachment) return;
+    if (!isRetry) {
+      addBubble('user',
+        (message ? message : '') +
+        (pendingAttachment ? (message ? '\\n' : '') + '📎 ' + pendingAttachment.name : ''));
+      input.value = '';
+    }
+    sendBtn.disabled = true; sendBtn.textContent = '…';
+    var attachmentAtSend = pendingAttachment;
+
+    var fd = new FormData();
+    fd.append('message', message || '');
+    if (contextCustomerId) fd.append('context_customer_id', contextCustomerId);
+    if (attachmentAtSend && attachmentAtSend.file_id) fd.append('file_id', attachmentAtSend.file_id);
+
+    var ctrl = ('AbortController' in window) ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, 120000) : null;
+
+    fetch('/dashboard/assistant/chat', { method: 'POST', headers: awHeaders(), body: fd, signal: ctrl ? ctrl.signal : undefined })
+      .then(readJson)
+      .then(function (data) {
+        data = data || {};
+        var b = addBubble('assistant', data.summary || (data.error ? 'The assistant hit an error.' : '(no response)'));
+        if (data.error) {
+          if (!data._reauth) { restoreInput(message); showRetry(message); }
+          return;
+        }
+        // Success: the attachment has been consumed.
+        if (attachmentAtSend && pendingAttachment && pendingAttachment.file_id === attachmentAtSend.file_id) {
+          saveAttachment(null);
+        }
+        lastFailedSend = null;
+        var dest = data.navigateTo || (data.changedCustomerId ? '/dashboard/customers/' + data.changedCustomerId : null);
+        if (dest && dest !== window.location.pathname) {
+          var n = document.createElement('div');
+          n.className = 'aw-openhint'; n.textContent = 'Opening…';
+          b.appendChild(n);
+          setTimeout(function(){ window.location.href = dest; }, 900);
+        }
+      })
+      .catch(function (err) {
+        addBubble('assistant', awNetworkMessage(err));
+        restoreInput(message);
+        showRetry(message);
+      })
+      .finally(function () {
+        if (timer) clearTimeout(timer);
+        sendBtn.disabled = false; sendBtn.textContent = 'Send';
+        setTimeout(function(){ input.focus(); }, 0);
+      });
+  }
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    var message = input.value.trim();
-    var fileToSend = selectedFile;
-    if (!message && !fileToSend) return;
-    addBubble('user', (message ? message + (fileToSend ? '\\n' : '') : '') + (fileToSend ? '📎 ' + fileToSend.name : ''));
-    input.value = ''; selectedFile = null; fileInput.value = ''; fileLabel.textContent = '';
-    sendBtn.disabled = true; sendBtn.textContent = '…';
-    var fd = new FormData();
-    fd.append('message', message);
-    if (contextCustomerId) fd.append('context_customer_id', contextCustomerId);
-    if (fileToSend) fd.append('file', fileToSend);
-    fetch('/dashboard/assistant/chat', { method: 'POST', body: fd })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        var b = addBubble('assistant', data.summary || '(no response)');
-        if (data.changedCustomerId) {
-          var n = document.createElement('div');
-          n.className = 'aw-openhint'; n.textContent = 'Opening that record…';
-          b.appendChild(n);
-          setTimeout(function(){ window.location.href = '/dashboard/customers/' + data.changedCustomerId; }, 1400);
-        }
-      })
-      .catch(function () { addBubble('assistant', 'Could not reach the assistant.'); })
-      .finally(function () { sendBtn.disabled = false; sendBtn.textContent = 'Send'; input.focus(); });
-    // widget deliberately stays open
+    doSend(input.value.trim(), false);
+  });
+
+  // Enter sends; Shift+Enter (or Ctrl/Cmd+Enter) makes a newline.
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
+      e.preventDefault();
+      doSend(input.value.trim(), false);
+    }
   });
 
   resetBtn.addEventListener('click', function () {
-    fetch('/dashboard/assistant/reset', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'x=1' })
-      .then(function(){ log.innerHTML = ''; }).catch(function(){});
+    fetch('/dashboard/assistant/reset', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'fetch' }, body: 'x=1' })
+      .then(function(){ log.innerHTML = ''; saveAttachment(null); lastFailedSend = null; }).catch(function(){});
   });
 
   // Voice input (Web Speech API) - progressive enhancement only.

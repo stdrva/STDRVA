@@ -7,8 +7,27 @@ const { sendEmail } = require('./email');
 
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
 
+// Canonical public base URL for anything a CUSTOMER sees - booking links, QR
+// codes, status-page links, links inside texts/emails. Never expose localhost
+// or a dev URL in production.
+//   1. BASE_URL              - explicit override, always wins
+//   2. RENDER_EXTERNAL_URL   - injected automatically by Render (https://<svc>.onrender.com)
+//   3. PUBLIC_BASE_URL       - generic alias some hosts set
+//   4. localhost:PORT        - local dev only
 function baseUrl() {
-  return (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+  const fromEnv =
+    process.env.BASE_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.PUBLIC_BASE_URL ||
+    `http://localhost:${process.env.PORT || 3000}`;
+  return String(fromEnv).replace(/\/+$/, '');
+}
+
+// True when we still don't have a real public URL - used to warn in logs so a
+// deploy that forgot to set one is obvious instead of silently shipping
+// localhost links.
+function baseUrlIsLocal() {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)/i.test(baseUrl());
 }
 
 function bookingUrl() {
@@ -152,6 +171,8 @@ module.exports = {
   onOutOfAreaContact,
   notifyCustomer,
   notifyOwner,
+  baseUrl,
+  baseUrlIsLocal,
   bookingUrl,
   statusUrl,
 };
