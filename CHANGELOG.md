@@ -5,6 +5,38 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.4.2 (2026-09-10) — Bug-fix wave 2: booking flow
+
+The self-serve booking flow was rebuilt around a clear sequence (spec 2-8):
+
+- **Flow order (spec 2):** service → name/phone/email → full address → the times we
+  offer → pick one → **review screen** → explicit **Confirm Appointment** → booked →
+  optional discovery. It no longer opens with "what day/time works best", and choosing a
+  time no longer books anything on its own.
+- **Four spread options (spec 3):** after the address is known we show **exactly four**
+  openings, spread across different days *and* times of day (not the first four in a row).
+  A **"Look for more times"** link pulls the next four without restarting — all the
+  contact info is kept.
+- **Final confirmation (spec 4):** a review card shows name, full street address, date and
+  time in plain language, with one **Confirm Appointment** button. Nothing is written
+  until that button. The booked page repeats the date, time and address.
+- **Address entry (spec 5):** one field with proper mobile autocomplete
+  (`autocomplete="street-address"`, `inputmode` on phone/email); you can paste a whole
+  address, including a multi-line block from Contacts / Maps / an email, and it's tidied
+  to one line. The service area isn't evaluated until the address has a ZIP or a
+  city+state; a street-only address prompts for the rest instead of being rejected.
+- **Service area (spec 6):** a booking is **never** auto-rejected for being out of area.
+  The address/ZIP is still captured and Andrew is still notified, but the customer books a
+  real time like anyone else. The old "leave your info, we'll see" dead-end is gone.
+- **Edited details stick (spec 7):** changing your name/phone/email/address on the review
+  screen (e.g. "Donna" → "Donna Test") updates the customer record — earlier steps no
+  longer overwrite a later edit.
+- **Discovery comes after booking (spec 8):** rooms / pets / prior experience / product
+  interest / notes are asked on the confirmation page once the appointment is secured, and
+  are fully optional.
+
+Old links (`/book/confirm`, `POST /book`, `POST /book/out-of-area`) still work.
+
 ## 1.4.1 (2026-09-10) — Bug-fix wave 1: production URLs + assistant widget
 
 Production URLs (spec 1)

@@ -147,11 +147,101 @@ function zoneForAddress(address) {
   return 'out-of-area';
 }
 
+// Which weekdays we'll offer for a given address. This is a ROUTING preference,
+// never a rejection - an unknown / out-of-area address still gets every normal
+// business day (spec 6: don't auto-reject on service area). Andrew is notified
+// separately when an out-of-area address books.
 function allowedDaysForAddress(address) {
   const zone = zoneForAddress(address);
   if (zone === 'wednesday') return [WEDNESDAY_WEEKDAY];
   if (zone === 'core') return CORE_AREA_DAYS;
-  return [];
+  return BUSINESS_DAYS;
+}
+
+// ---------- Address parsing (spec 5) ----------
+// The customer types / pastes one free-text address (single DB column). Pull
+// out the pieces we need for the review screen and the zone check. Handles a
+// one-line "123 Main St, Richmond, VA 23220" and a multi-line block pasted
+// from Contacts / Maps / an email.
+function parseAddress(raw) {
+  const full = String(raw || '').replace(/\s*\n\s*/g, ', ').replace(/\s{2,}/g, ' ').replace(/,\s*,/g, ',').trim();
+  const zipMatch = full.match(/\b(\d{5})(?:-\d{4})?\b/);
+  const zip = zipMatch ? zipMatch[1] : '';
+  const stateMatch = full.match(/\b(A[LKZR]|C[AOT]|DE|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])\b/i);
+  const state = stateMatch ? stateMatch[1].toUpperCase() : '';
+  const parts = full.split(',').map((p) => p.trim()).filter(Boolean);
+  const line1 = parts[0] || '';
+  let city = '';
+  if (parts.length >= 3) city = parts[1];
+  else if (parts.length === 2 && state) {
+    // "123 Main St, Richmond VA 23220"
+    city = parts[1].replace(new RegExp('\\b' + state + '\\b.*$', 'i'), '').trim();
+  }
+  return { full, line1, city, state, zip, hasStreetNumber: /\d/.test(line1) };
+}
+
+// Enough of an address to safely check the service zone and bring the right
+// samples. We need a ZIP, OR a city + state, OR a recognized town name.
+function addressLooksComplete(raw) {
+  const a = parseAddress(raw);
+  if (a.zip) return true;
+  if (a.city && a.state) return true;
+  const zone = zoneForAddress(raw);
+  return zone === 'core' || zone === 'wednesday';
+}
+
+// A long, readable slot label: "Tuesday, March 17 at 2:00 PM".
+function fmtSlotLong(d) {
+  return d.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+// ---------- Pick exactly N appointment options, spread out (spec 3) ----------
+// Not the first N chronological openings - spread across different days and a
+// mix of morning / afternoon so the customer gets a real choice. `offset`
+// drives "Look for more times": it walks further down the same spread ordering
+// without restarting anything.
+function pickSpreadSlots(allowedDays, duration, { count = 4, offset = 0 } = {}) {
+  const days = upcomingBusinessDays(allowedDays);
+  const byDay = days
+    .map((d) => ({ key: dateKey(d), slots: slotsForDate(dateKey(d), duration) }))
+    .filter((x) => x.slots.length);
+  if (!byDay.length) return { slots: [], hasMore: false };
+
+  // Order each day's slots as early, late, 2nd-early, 2nd-late, ... then rotate
+  // by the day's position so consecutive days lead with different times of day
+  // (day 1 -> morning, day 2 -> afternoon, ...). That spreads the four options
+  // across both days AND times, not just days.
+  byDay.forEach((day, i) => {
+    const sorted = day.slots.slice().sort((a, b) => a - b);
+    const out = [];
+    let lo = 0;
+    let hi = sorted.length - 1;
+    let takeLow = true;
+    while (lo <= hi) {
+      out.push(takeLow ? sorted[lo++] : sorted[hi--]);
+      takeLow = !takeLow;
+    }
+    const rot = i % out.length;
+    day.ordered = out.slice(rot).concat(out.slice(0, rot));
+  });
+
+  // Round-robin across days: one slot from day 1, one from day 2, ... then back.
+  const spread = [];
+  let round = 0;
+  let added = true;
+  while (added) {
+    added = false;
+    for (const day of byDay) {
+      if (day.ordered[round]) {
+        spread.push(day.ordered[round]);
+        added = true;
+      }
+    }
+    round++;
+  }
+
+  const window = spread.slice(offset, offset + count);
+  return { slots: window, hasMore: spread.length > offset + count };
 }
 
 function upcomingBusinessDays(allowedDays) {
@@ -363,41 +453,46 @@ function discoveryFromBody(body) {
   return { rooms, notesWithDiscovery: parts.join(' | ') };
 }
 
+// Everything the booking flow threads from step to step, as query params.
+function contactQS(q) {
+  const p = new URLSearchParams();
+  for (const k of ['type', 'name', 'phone', 'email', 'address', 'consultant', 'lead_source', 'src', 'campaign']) {
+    if (q[k]) p.set(k, q[k]);
+  }
+  return p.toString();
+}
+
+function bookingContact(q) {
+  const name = (q.name || '').trim();
+  const phone = (q.phone || '').trim();
+  const email = (q.email || '').trim();
+  const address = (q.address || '').trim();
+  return {
+    name,
+    phone,
+    email,
+    address,
+    hasContact: Boolean(name && phone && isValidEmail(email) && address),
+  };
+}
+
 function register(router) {
+  // ---------- Step 1-2: service + contact/address, then the 4 time options ----------
   router.get('/book', (req, res) => {
     const type = req.query.type || PUBLIC_TYPE_ORDER[0];
-    const dateSel = req.query.date || '';
     const isRequestType = REQUEST_TYPES.includes(type);
-    // Name/phone/address are collected here, BEFORE any day or time is
-    // offered - Andrew needs the physical address up front since these are
-    // in-home appointments. Threaded through as query params on every link
-    // (same stateless pattern as `type`/`date` already used on this page).
-    const name = (req.query.name || '').trim();
-    const phone = (req.query.phone || '').trim();
-    const email = (req.query.email || '').trim();
-    const address = (req.query.address || '').trim();
-    // All four are required at once (name/phone/email/address) so a lead is
-    // never lost for missing contact info - including out-of-area visitors,
-    // who get no day picker at all and need to be reachable another way.
-    const hasContact = Boolean(name && phone && address && isValidEmail(email));
-    const zone = hasContact ? zoneForAddress(address) : null; // 'wednesday' | 'core' | 'out-of-area' | null
-    // "Book anyway" lets an out-of-area visitor push through to a real time
-    // slot instead of just leaving contact info - they still get flagged to
-    // Andrew (see POST /book), just via a real appointment instead of a lead.
-    const forced = req.query.force === '1';
-    const outOfAreaBlocked = zone === 'out-of-area' && !forced;
-    const days = isRequestType || !hasContact || outOfAreaBlocked ? [] : upcomingBusinessDays(forced && zone === 'out-of-area' ? BUSINESS_DAYS : allowedDaysForAddress(address));
+    const { name, phone, email, address, hasContact } = bookingContact(req.query);
     const duration = durationForType(type);
-    const contactQS =
-      `&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}` +
-      `&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}${forced ? '&force=1' : ''}`;
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const qs = contactQS({ ...req.query, type });
 
     const typeOptions = PUBLIC_TYPE_ORDER.map((t) => {
       const selected = t === type;
       const prominent = t === 'Short Design Consultation';
       const cls = ['type-card', prominent ? 'featured' : '', selected ? 'selected' : ''].filter(Boolean).join(' ');
+      const keep = contactQS({ ...req.query, type: t });
       return `
-        <a class="${cls}" href="/book?type=${encodeURIComponent(t)}">
+        <a class="${cls}" href="/book?${keep}">
           <span class="type-name">${escapeHtml(t)}</span>${prominent ? '<span class="type-tag">Most popular</span>' : ''}
           <div class="type-desc">${escapeHtml(TYPE_DESCRIPTIONS[t] || '')}</div>
         </a>`;
@@ -419,9 +514,9 @@ function register(router) {
           <form method="POST" action="/book/request" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
             <input type="hidden" name="type" value="${escapeHtml(type)}">
             <textarea name="notes" placeholder="Tell us what you're looking for..." rows="4"></textarea>
-            <label>Name *</label><input type="text" name="name" required>
-            <label>Phone *</label><input type="tel" name="phone" required placeholder="(804) 555-0100">
-            <label>Email</label><input type="email" name="email">
+            <label>Name *</label><input type="text" name="name" autocomplete="name" required>
+            <label>Phone *</label><input type="tel" name="phone" autocomplete="tel" inputmode="tel" required placeholder="(804) 555-0100">
+            <label>Email</label><input type="email" name="email" autocomplete="email" inputmode="email">
             <div style="margin-top:14px"><button class="btn" type="submit">${type === 'Callback by Owner' ? 'Request a callback' : 'Submit request'}</button></div>
           </form>
         </div>
@@ -429,186 +524,267 @@ function register(router) {
       return res.send(publicLayout({ title: 'Request info', body }));
     }
 
-    const dayButtons = days
-      .map((d) => {
-        const key = dateKey(d);
-        const label = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-        return `<a class="btn ${key === dateSel ? '' : 'secondary'} small" href="/book?type=${encodeURIComponent(type)}&date=${key}${contactQS}" style="margin:0 6px 6px 0">${label}</a>`;
-      })
-      .join('');
-
-    let slotsHtml = '';
-    if (dateSel && hasContact) {
-      const slots = slotsForDate(dateSel, duration);
-      slotsHtml = slots.length
-        ? `<div class="slot-grid">${slots
-            .map((s) => {
-              const hhmm = `${pad(s.getHours())}:${pad(s.getMinutes())}`;
-              const label = s.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-              return `<a class="slot-btn" href="/book/confirm?type=${encodeURIComponent(type)}&date=${dateSel}&time=${hhmm}${contactQS}">${label}</a>`;
-            })
-            .join('')}</div>`
-        : `<p class="subtitle">No open times that day - try another date.</p>`;
-    }
+    const addr = parseAddress(address);
+    const addrComplete = address && addressLooksComplete(address);
+    const zone = addrComplete ? zoneForAddress(address) : null;
 
     const contactPanel = `
       <div class="panel">
-        <h3 style="margin-top:0">2. Your info</h3>
-        <form method="GET" action="/book">
+        <h3 style="margin-top:0">2. Your info &amp; address</h3>
+        <form method="GET" action="/book" id="contact-form">
           <input type="hidden" name="type" value="${escapeHtml(type)}">
-          <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" required>
-          <label>Phone *</label><input type="tel" name="phone" value="${escapeHtml(phone)}" required placeholder="(804) 555-0100">
-          <label>Email *</label><input type="email" name="email" value="${escapeHtml(email)}" required>
-          <label>Home address *</label><input type="text" name="address" value="${escapeHtml(address)}" required placeholder="Street, city, state, zip - we're coming to your home">
-          <div style="margin-top:14px"><button class="btn" type="submit">${hasContact ? 'Update info' : 'Continue'}</button></div>
+          ${req.query.consultant ? `<input type="hidden" name="consultant" value="${escapeHtml(req.query.consultant)}">` : ''}
+          ${req.query.lead_source ? `<input type="hidden" name="lead_source" value="${escapeHtml(req.query.lead_source)}">` : ''}
+          ${req.query.src ? `<input type="hidden" name="src" value="${escapeHtml(req.query.src)}">` : ''}
+          ${req.query.campaign ? `<input type="hidden" name="campaign" value="${escapeHtml(req.query.campaign)}">` : ''}
+          <label>Name *</label>
+          <input type="text" name="name" value="${escapeHtml(name)}" autocomplete="name" required>
+          <label>Phone *</label>
+          <input type="tel" name="phone" value="${escapeHtml(phone)}" autocomplete="tel" inputmode="tel" required placeholder="(804) 555-0100">
+          <label>Email *</label>
+          <input type="email" name="email" value="${escapeHtml(email)}" autocomplete="email" inputmode="email" required>
+          <label>Home address *</label>
+          <textarea name="address" id="addr-field" rows="3" autocomplete="street-address"
+            placeholder="Street, city, state, ZIP — you can paste your whole address here" required>${escapeHtml(address)}</textarea>
+          <p class="subtitle" style="margin:6px 0 0;font-size:.8rem">We come to your home, so we need the full address (including city, state and ZIP) to bring the right samples.</p>
+          ${
+            address && !addrComplete
+              ? `<p class="subtitle" style="margin:8px 0 0;color:#b54f1e">That address looks incomplete — please add the city, state and ZIP so we can schedule your visit.</p>`
+              : ''
+          }
+          <div style="margin-top:14px"><button class="btn" type="submit">${hasContact && addrComplete ? 'Update info' : 'See available times'}</button></div>
         </form>
-      </div>`;
+      </div>
+      <script>
+        (function(){
+          var f = document.getElementById('addr-field');
+          if(!f) return;
+          // Collapse a multi-line pasted address (Contacts / Maps / email) into
+          // one tidy line so it stores and displays cleanly (spec 5).
+          function tidy(){
+            var v = f.value.replace(/\\s*\\n\\s*/g, ', ').replace(/,\\s*,/g, ',').replace(/\\s{2,}/g,' ').trim();
+            if (v !== f.value) f.value = v;
+          }
+          f.addEventListener('paste', function(){ setTimeout(tidy, 0); });
+          f.addEventListener('blur', tidy);
+        })();
+      </script>`;
 
-    const outOfAreaPanel = `
-      <div class="panel">
-        <h3 style="margin-top:0">3. Your area</h3>
-        <p>That address is outside our normal service area. You can have Andrew reach out to see if a visit can be arranged, or book a time anyway and he'll be notified it's outside the usual area.</p>
-        <form method="POST" action="/book/out-of-area" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';" style="margin-bottom:10px">
-          <input type="hidden" name="type" value="${escapeHtml(type)}">
-          <input type="hidden" name="name" value="${escapeHtml(name)}">
-          <input type="hidden" name="phone" value="${escapeHtml(phone)}">
-          <input type="hidden" name="email" value="${escapeHtml(email)}">
-          <input type="hidden" name="address" value="${escapeHtml(address)}">
-          <button class="btn" type="submit">Have Andrew reach out to me</button>
-        </form>
-        <a class="btn secondary" href="/book?type=${encodeURIComponent(type)}${contactQS}&force=1">Book anyway</a>
-      </div>`;
-
-    const outOfAreaBanner = `
-      <div class="panel" style="border-left:3px solid #b54f1e">
-        <p style="margin:0">This address may be outside the normal service area &mdash; booking anyway. Andrew will be notified. This may also be a glitch, book anyway works.</p>
-      </div>`;
-
-    const showScheduler = hasContact && !outOfAreaBlocked;
+    let timesPanel = '';
+    if (hasContact && addrComplete) {
+      const { slots, hasMore } = pickSpreadSlots(allowedDaysForAddress(address), duration, { count: 4, offset });
+      if (slots.length) {
+        const cards = slots
+          .map((s) => {
+            const iso = s.toISOString();
+            const review = `/book/review?${contactQS({ ...req.query, type })}&slot=${encodeURIComponent(iso)}`;
+            return `
+              <a class="slot-card" href="${escapeHtml(review)}">
+                <span class="slot-day">${s.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</span>
+                <span class="slot-time">${s.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</span>
+              </a>`;
+          })
+          .join('');
+        const moreLink = hasMore
+          ? `<a class="btn secondary small" href="/book?${qs}&offset=${offset + 4}" style="margin-top:10px">Look for more times</a>`
+          : offset > 0
+            ? `<a class="btn secondary small" href="/book?${qs}" style="margin-top:10px">Back to the first times</a>`
+            : '';
+        timesPanel = `
+          <div class="panel">
+            <h3 style="margin-top:0">3. Pick a time that works</h3>
+            <p class="subtitle" style="margin-top:0">${escapeHtml(type)} · about ${duration >= 120 ? Math.round(duration / 60) + ' hours' : duration + ' minutes'}. Here are four openings${offset ? ' (more options)' : ''} — pick one and you'll confirm the details next.</p>
+            <div class="slot-cards">${cards}</div>
+            ${moreLink}
+            ${zone === 'out-of-area' ? `<p class="subtitle" style="margin-top:10px">This looks like it may be outside our usual area — that's OK, you can still book and Andrew will confirm.</p>` : ''}
+          </div>`;
+      } else {
+        timesPanel = `
+          <div class="panel">
+            <h3 style="margin-top:0">3. Pick a time</h3>
+            <p class="subtitle">We don't have an opening we can show right now. Leave your info above and Andrew will reach out with times, or call ${escapeHtml(process.env.BUSINESS_PHONE || '(804) 839-7984')}.</p>
+          </div>`;
+      }
+    }
 
     const body = `
       <div class="public-hero">
         <h1>Let's Get Started</h1>
         <div class="rule"></div>
-        <p class="subtitle">Pick a service, tell us where you are, then choose a day and time. No account needed.</p>
+        <p class="subtitle">Pick a service, tell us where you are, then choose from the times we offer. No account needed.</p>
       </div>
       <div class="panel">
         <h3 style="margin-top:0">1. What do you need?</h3>
         ${typeOptions}
       </div>
       ${contactPanel}
-      ${hasContact && outOfAreaBlocked ? outOfAreaPanel : ''}
-      ${hasContact && forced && zone === 'out-of-area' ? outOfAreaBanner : ''}
-      ${showScheduler ? `<div class="panel"><h3 style="margin-top:0">3. Choose a day</h3>${dayButtons}</div>` : ''}
-      ${showScheduler && dateSel ? `<div class="panel"><h3 style="margin-top:0">4. Choose a time</h3>${slotsHtml}</div>` : ''}
+      ${timesPanel}
     `;
-    res.send(publicLayout({ title: 'Book an appointment', body }));
+    return res.send(publicLayout({ title: 'Book an appointment', body }));
   });
 
-  router.get('/book/confirm', (req, res) => {
-    const { type, date, time } = req.query;
-    const name = (req.query.name || '').trim();
-    const phone = (req.query.phone || '').trim();
-    const email = (req.query.email || '').trim();
-    const address = (req.query.address || '').trim();
-    const forced = req.query.force === '1';
-    // Full contact info is required before a time is ever offered on /book,
-    // but guard here too in case someone lands on this URL directly without
-    // it - including a stale out-of-area address, unless they came through
-    // the "book anyway" flow (force=1).
-    const zone = zoneForAddress(address);
-    if (!type || !date || !time || !name || !phone || !email || !address || (zone === 'out-of-area' && !forced)) {
-      return res.redirect('/book');
+  // ---------- Step 4: final confirmation (name, address, date, time) ----------
+  router.get('/book/review', (req, res) => {
+    const type = req.query.type || PUBLIC_TYPE_ORDER[0];
+    const { name, phone, email, address, hasContact } = bookingContact(req.query);
+    const slotIso = req.query.slot || '';
+    const when = slotIso ? new Date(slotIso) : null;
+    if (!hasContact || !when || isNaN(when.getTime())) {
+      return res.redirect(`/book?${contactQS({ ...req.query, type })}`);
     }
-    const when = new Date(`${date}T${time}:00`);
-    const backQS =
-      `type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}` +
-      `&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}${forced ? '&force=1' : ''}`;
+    const addr = parseAddress(address);
+    const backQS = contactQS({ ...req.query, type });
     const body = `
       <div class="public-hero">
         <h1>Confirm your appointment</h1>
-        <p class="subtitle">${escapeHtml(type)} &middot; ${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+        <p class="subtitle">Nothing is booked yet — check the details and confirm.</p>
       </div>
-      ${zone === 'out-of-area' ? `<div class="panel" style="border-left:3px solid #b54f1e"><p style="margin:0">This address is outside the normal service area &mdash; Andrew will be notified this was booked anyway.</p></div>` : ''}
+      <div class="panel review-card">
+        <div class="review-row"><span>Service</span><strong>${escapeHtml(type)}</strong></div>
+        <div class="review-row"><span>When</span><strong>${escapeHtml(fmtSlotLong(when))}</strong></div>
+        <div class="review-row"><span>Name</span><strong>${escapeHtml(name)}</strong></div>
+        <div class="review-row"><span>Address</span><strong>${escapeHtml(addr.full || address)}</strong></div>
+        <div class="review-row"><span>Phone</span><strong>${escapeHtml(phone)}</strong></div>
+        <div class="review-row"><span>Email</span><strong>${escapeHtml(email)}</strong></div>
+      </div>
       <div class="panel">
-        <form method="POST" action="/book" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
+        <form method="POST" action="/book/confirm" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';var b=this.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='Booking…';}">
           <input type="hidden" name="type" value="${escapeHtml(type)}">
-          <input type="hidden" name="date" value="${escapeHtml(date)}">
-          <input type="hidden" name="time" value="${escapeHtml(time)}">
-          <input type="hidden" name="force" value="${forced ? '1' : '0'}">
-          <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" required>
-          <label>Phone *</label><input type="tel" name="phone" value="${escapeHtml(phone)}" required placeholder="(804) 555-0100">
-          <label>Email *</label><input type="email" name="email" value="${escapeHtml(email)}" required>
-          <label>Home address *</label><input type="text" name="address" value="${escapeHtml(address)}" required>
-          ${discoveryWizard(
-            `${escapeHtml(type)} with <strong>Andrew</strong><br>${when.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`,
-            'Skip all of this and confirm appointment',
-            'Confirm booking'
-          )}
+          <input type="hidden" name="slot" value="${escapeHtml(slotIso)}">
+          ${['consultant', 'lead_source', 'src', 'campaign'].map((k) => (req.query[k] ? `<input type="hidden" name="${k}" value="${escapeHtml(req.query[k])}">` : '')).join('')}
+          <details class="review-edit">
+            <summary>Something wrong? Edit your details</summary>
+            <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" autocomplete="name" required>
+            <label>Phone *</label><input type="tel" name="phone" value="${escapeHtml(phone)}" autocomplete="tel" inputmode="tel" required>
+            <label>Email *</label><input type="email" name="email" value="${escapeHtml(email)}" autocomplete="email" inputmode="email" required>
+            <label>Home address *</label><textarea name="address" rows="3" autocomplete="street-address" required>${escapeHtml(address)}</textarea>
+          </details>
+          <!-- Controls inside a closed <details> still submit, so no hidden
+               duplicates are needed - and an edit here always wins (spec 7). -->
+          <div style="margin-top:16px"><button class="btn btn-confirm" type="submit">Confirm Appointment</button></div>
+          <p class="subtitle" style="margin-top:10px"><a href="/book?${backQS}">&larr; pick a different time</a></p>
         </form>
-        <p class="subtitle" style="margin-top:10px"><a href="/book?${backQS}">&larr; pick a different time</a></p>
       </div>
     `;
-    res.send(publicLayout({ title: 'Confirm appointment', body }));
+    return res.send(publicLayout({ title: 'Confirm appointment', body }));
   });
 
-  router.post('/book', async (req, res) => {
-    const { type, date, time, name, phone, email, address, force } = req.body;
-    if (!name || !phone || !email || !address || !date || !time) {
-      return res.send(publicLayout({ title: 'Booking error', body: `<div class="panel"><p>Missing required info (we need a name, phone, email, and home address to schedule an in-home visit). <a href="/book">Start over</a>.</p></div>` }));
+  // Old links keep working.
+  router.get('/book/confirm', (req, res) => res.redirect(`/book/review?${new URLSearchParams(req.query).toString()}`));
+
+  // ---------- The ONLY thing that creates the appointment ----------
+  async function doConfirm(req, res) {
+    const body = req.body || {};
+    const type = body.type || PUBLIC_TYPE_ORDER[0];
+    // A form with the edit-details <details> open sends the field twice - the
+    // last value wins in querystring.parse only when it's an array; take the
+    // last non-empty in that case so an edit ("Donna" -> "Donna Test") sticks
+    // (spec 7).
+    const pick = (v) => (Array.isArray(v) ? v.filter((x) => x && x.trim()).pop() || v[v.length - 1] : v);
+    const name = (pick(body.name) || '').trim();
+    const phone = (pick(body.phone) || '').trim();
+    const email = (pick(body.email) || '').trim();
+    const address = (pick(body.address) || '').trim();
+    const slotIso = body.slot || (body.date && body.time ? new Date(`${body.date}T${body.time}:00`).toISOString() : '');
+    const when = slotIso ? new Date(slotIso) : null;
+
+    if (!name || !phone || !isValidEmail(email) || !address || !when || isNaN(when.getTime())) {
+      return res.send(
+        publicLayout({
+          title: 'Booking error',
+          body: `<div class="panel"><p>We're missing something needed to book an in-home visit (name, phone, a valid email, full address, and a time). <a href="/book?${contactQS({ type, name, phone, email, address })}">Go back</a>.</p></div>`,
+        })
+      );
     }
-    const outOfArea = zoneForAddress(address) === 'out-of-area';
-    if (outOfArea && force !== '1') {
-      // Belt-and-suspenders: the day/time picker never offers slots for an
-      // out-of-area address unless "book anyway" was used (force=1), so
-      // reaching here without it means a crafted URL. Bounce to the normal
-      // out-of-area flow instead of booking a real slot.
-      return res.redirect(`/book?type=${encodeURIComponent(type || '')}&name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}`);
-    }
+
     const phoneNorm = normalizePhone(phone);
-    const emailVal = isValidEmail(email) ? email : null;
-    const { notesWithDiscovery: discoveryNotes } = discoveryFromBody(req.body);
-    const notesWithDiscovery = outOfArea ? ['[OUT OF AREA - booked anyway]', discoveryNotes].filter(Boolean).join(' | ') : discoveryNotes;
+    const emailVal = email;
+    const zone = zoneForAddress(address);
+    const outOfArea = zone === 'out-of-area';
+    const duration = durationForType(type);
+    const scheduledAt = when.toISOString();
+
+    // Attribution / Home Show consultant (spec 9) - captured, never required.
+    const consultant = (body.consultant || req.query.consultant || '').trim();
+    const leadSource = (body.lead_source || req.query.lead_source || '').trim();
+
+    const flags = [];
+    if (outOfArea) flags.push('[Outside normal service area — booked anyway]');
+    if (consultant) flags.push(`[Sales consultant: ${consultant}]`);
+    if (leadSource) flags.push(`[Lead source: ${leadSource}]`);
+    const bookingNote = flags.join(' ');
 
     let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
     if (!customer) {
-      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, address, notes: notesWithDiscovery });
-    } else if (!customer.address && address) {
-      // Existing record with no address on file yet - fill it in from this
-      // booking rather than leaving it blank. Never overwrites an address
-      // that's already there.
-      db.updateCustomer(customer.id, {
-        name: customer.name,
-        phone: customer.phone,
-        email: customer.email,
+      customer = db.createCustomer({
+        name,
+        phone: phoneNorm,
+        email: emailVal,
         address,
-        notes: customer.notes,
+        notes: bookingNote || null,
       });
-      customer = db.getCustomer(customer.id);
+    } else {
+      // Existing record: the booking form is the customer's own latest word -
+      // keep whatever they just typed (spec 7: "Donna" -> "Donna Test" sticks).
+      const merged = {
+        name: name || customer.name,
+        phone: phoneNorm || customer.phone,
+        email: emailVal || customer.email,
+        address: address || customer.address,
+        notes: customer.notes,
+      };
+      if (
+        merged.name !== customer.name ||
+        merged.phone !== customer.phone ||
+        merged.email !== customer.email ||
+        merged.address !== customer.address
+      ) {
+        db.updateCustomer(customer.id, merged, { actor: 'public' });
+        customer = db.getCustomer(customer.id);
+      }
     }
-    // Make sure this customer is represented in the funnel.
+
+    // Funnel lead.
     const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
     let lead = existingLeads.find((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
-    if (!lead) lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: 'Self-service booking' });
+    if (!lead) {
+      lead = db.createLead({
+        customer_id: customer.id,
+        stage: 'Contacted',
+        source: leadSource || 'Self-service booking',
+        notes: bookingNote || null,
+      });
+    }
 
-    const scheduledAt = new Date(`${date}T${time}:00`).toISOString();
-    const duration = durationForType(type);
-
-    // Idempotency guard: a double-click, slow-network retry, or a resubmit via
-    // the browser's back button can all fire this same POST twice. If this
-    // customer already has an appointment at this exact time/type, treat the
-    // resubmit as a no-op instead of creating a duplicate.
+    // Idempotency: a double submit / back-button resubmit shouldn't double-book.
     let appt = db
       .listAppointments()
       .find((a) => a.customer_id === customer.id && a.scheduled_at === scheduledAt && a.type === type);
     if (!appt) {
+      // Re-check the slot is still free (someone else may have taken it).
+      const dayStart = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_START, 0, 0);
+      const dayEnd = new Date(when.getFullYear(), when.getMonth(), when.getDate(), HOURS_END, 0, 0);
+      const taken = db.listAppointmentsBetween(dayStart.toISOString(), dayEnd.toISOString()).some((a) => {
+        const aStart = new Date(a.scheduled_at);
+        const aEnd = new Date(aStart.getTime() + (a.duration_min || 60) * 60000);
+        return when < aEnd && new Date(when.getTime() + duration * 60000) > aStart;
+      });
+      if (taken) {
+        return res.send(
+          publicLayout({
+            title: 'That time was just taken',
+            body: `<div class="panel"><p>Sorry — someone grabbed <strong>${escapeHtml(fmtSlotLong(when))}</strong> a moment ago. <a href="/book?${contactQS({ type, name, phone, email, address })}">Pick another time</a>.</p></div>`,
+          })
+        );
+      }
       appt = db.createAppointment({
         customer_id: customer.id,
         lead_id: lead.id,
         type,
         scheduled_at: scheduledAt,
         duration_min: duration,
-        notes: notesWithDiscovery,
+        notes: bookingNote || null,
+        created_by: consultant ? `consultant:${consultant}` : 'public',
       });
       try {
         await automations.onAppointmentBooked(appt, customer);
@@ -618,18 +794,84 @@ function register(router) {
       }
     }
 
+    // Post-Redirect-Get so a refresh on the success page doesn't resubmit.
+    return res.redirect(`/book/booked?appt=${encodeURIComponent(appt.id)}`);
+  }
+
+  router.post('/book/confirm', doConfirm);
+  router.post('/book', doConfirm); // back-compat with the old confirm form
+  router.post('/book/out-of-area', doConfirm); // spec 6: book them, don't shunt to a "leave your info" dead end
+
+  // ---------- Step 5: booked + post-booking discovery (spec 8) ----------
+  router.get('/book/booked', (req, res) => {
+    const appt = req.query.appt ? db.getAppointment(req.query.appt) : null;
+    if (!appt) {
+      return res.send(publicLayout({ title: 'Booked', body: `<div class="panel"><p>Your appointment is booked. We'll be in touch with a reminder. <a href="/book">Back to booking</a>.</p></div>` }));
+    }
+    const customer = db.getCustomer(appt.customer_id);
+    const when = new Date(appt.scheduled_at);
+    const addr = parseAddress(customer && customer.address);
+    const discoveryDone = /Rooms:|Interested in:|Pets:/.test((appt.notes || '') + (customer && customer.notes ? customer.notes : ''));
+
     const body = `
       <div class="public-hero">
         <h1>You're booked!</h1>
-        <p class="subtitle">${escapeHtml(type)} on ${new Date(scheduledAt).toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</p>
+        <p class="subtitle">${escapeHtml(appt.type)}</p>
+      </div>
+      <div class="panel review-card">
+        <div class="review-row"><span>When</span><strong>${escapeHtml(fmtSlotLong(when))}</strong></div>
+        <div class="review-row"><span>Where</span><strong>${escapeHtml(addr.full || (customer && customer.address) || '')}</strong></div>
       </div>
       <div class="panel">
-        <p>We've sent a confirmation${customer.phone ? ' text' : ''}${customer.phone && customer.email ? ' and' : ''}${customer.email ? ' email' : ''} to you. We'll also remind you before your appointment.</p>
-        <p>See you then!</p>
+        <p>We've sent a confirmation${customer && customer.phone ? ' text' : ''}${customer && customer.phone && customer.email ? ' and' : ''}${customer && customer.email ? ' email' : ''}, and we'll remind you before your appointment.</p>
       </div>
+      ${
+        discoveryDone
+          ? ''
+          : `<div class="panel">
+        <h3 style="margin-top:0">A few quick details (optional)</h3>
+        <p class="subtitle" style="margin-top:0">This helps Andrew bring the right samples. You can skip it — your appointment is already set.</p>
+        <form method="POST" action="/book/discovery">
+          <input type="hidden" name="appt" value="${escapeHtml(appt.id)}">
+          ${discoveryWizard('', "Skip — I'm all set", 'Save these details')}
+        </form>
+      </div>`
+      }
     `;
-    res.send(publicLayout({ title: 'Booked', body }));
+    return res.send(publicLayout({ title: 'Booked', body }));
   });
+
+  router.post('/book/discovery', (req, res) => {
+    const appt = req.body.appt ? db.getAppointment(req.body.appt) : null;
+    if (!appt) return res.redirect('/book');
+    const { rooms, notesWithDiscovery } = discoveryFromBody(req.body);
+    if (notesWithDiscovery) {
+      const apptNotes = [appt.notes, notesWithDiscovery].filter(Boolean).join(' | ');
+      try {
+        db.updateAppointment(appt.id, { notes: apptNotes }, { actor: 'public' });
+      } catch (e) {
+        console.error('discovery updateAppointment failed', e);
+      }
+      const customer = db.getCustomer(appt.customer_id);
+      if (customer) {
+        const custNotes = [customer.notes, notesWithDiscovery].filter(Boolean).join(' | ');
+        db.updateCustomer(
+          customer.id,
+          { name: customer.name, phone: customer.phone, email: customer.email, address: customer.address, notes: custNotes },
+          { actor: 'public' }
+        );
+      }
+    }
+    const body = `
+      <div class="public-hero">
+        <h1>Thanks!</h1>
+        <p class="subtitle">You're all set.</p>
+      </div>
+      <div class="panel"><p>We've got your details. See you at your appointment — we'll send a reminder beforehand.</p></div>
+    `;
+    return res.send(publicLayout({ title: 'All set', body }));
+  });
+
 
   router.post('/book/request', async (req, res) => {
     const { type, name, phone, email } = req.body;
@@ -674,60 +916,6 @@ function register(router) {
     res.send(publicLayout({ title: 'Request received', body }));
   });
 
-  // A visitor whose address fell outside the service area (see zoneForAddress
-  // above) never gets a day/time picker - this saves their full contact info
-  // as a lead instead, so it's not just lost when they close the tab. Andrew
-  // follows up manually to see if a visit can be arranged.
-  router.post('/book/out-of-area', async (req, res) => {
-    const { type, name, phone, email, address } = req.body;
-    if (!name || !phone || !email || !address) {
-      return res.send(publicLayout({ title: 'Request error', body: `<div class="panel"><p>Missing required info. <a href="/book">Start over</a>.</p></div>` }));
-    }
-    const phoneNorm = normalizePhone(phone);
-    const emailVal = isValidEmail(email) ? email : null;
-    const notes = `[Out of area request${type ? ' - ' + type : ''}]`;
-
-    let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
-    if (!customer) {
-      customer = db.createCustomer({ name, phone: phoneNorm, email: emailVal, address, notes });
-    } else if (!customer.address && address) {
-      db.updateCustomer(customer.id, {
-        name: customer.name,
-        phone: customer.phone,
-        email: customer.email,
-        address,
-        notes: customer.notes,
-      });
-      customer = db.getCustomer(customer.id);
-    }
-
-    // Idempotency guard, same reasoning as /book/request.
-    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    let lead = db
-      .listLeads()
-      .find((l) => l.customer_id === customer.id && l.source === 'Out of area' && l.created_at >= fiveMinAgo);
-    if (!lead) {
-      lead = db.createLead({ customer_id: customer.id, stage: 'Contacted', source: 'Out of area', notes });
-      try {
-        await automations.onLeadCreated(lead, customer);
-        await automations.onOutOfAreaContact('lead', customer, { type });
-      } catch (e) {
-        console.error('onLeadCreated failed', e);
-      }
-    }
-
-    const body = `
-      <div class="public-hero">
-        <h1>Got it!</h1>
-        <p class="subtitle">We have your info</p>
-      </div>
-      <div class="panel">
-        <p>Your address is outside our normal service area, but Andrew has your contact info and will reach out directly to see if a visit can be arranged.</p>
-      </div>
-    `;
-    res.send(publicLayout({ title: 'Request received', body }));
-  });
-
   // ---------- Public job status page ----------
   router.get('/status/:token', (req, res) => {
     const job = db.getJobByToken(req.params.token);
@@ -764,4 +952,12 @@ function register(router) {
   });
 }
 
-module.exports = { register };
+module.exports = {
+  register,
+  // exported for tests
+  parseAddress,
+  addressLooksComplete,
+  pickSpreadSlots,
+  zoneForAddress,
+  allowedDaysForAddress,
+};
