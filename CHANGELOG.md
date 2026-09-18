@@ -5,6 +5,16 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.7.0 (pending) — Sep 18 update batch (sections A-H)
+
+- **A — `[hidden]` vs `.btn`/`.aw-mic`:** added a global `[hidden] { display: none !important; }` rule
+  (`public/css/style.css`). Fixes the discovery wizard's `Back`/`Next`/`Submit` buttons (all `class="btn"`,
+  previously stayed visible on every step because `.btn`'s `display: inline-flex` beat the `hidden`
+  attribute) and the assistant's mic button (`.aw-mic`, same collision - it was visible even when the
+  browser has no Web Speech API support). The four existing per-widget `[hidden]` `!important` overrides
+  (`#assistant-widget`, `#assistant-launch`, `#voice-launch`, `#voice-overlay`) are now redundant but left
+  in place untouched.
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing
