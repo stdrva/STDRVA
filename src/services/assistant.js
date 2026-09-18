@@ -330,6 +330,19 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'move_file_to_customer',
+    description:
+      "Re-file a file to the correct customer - e.g. it was uploaded unassigned, or filed under the wrong person. Call find_customers first to resolve customer_id. This corrects a filing mistake, it does not need Andrew's confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string' },
+        customer_id: { type: 'string' },
+      },
+      required: ['file_id', 'customer_id'],
+    },
+  },
+  {
     name: 'save_file_extraction',
     description:
       "After reading an uploaded file, record what you found on it so it's searchable later. Pass a compact JSON object of the key fields (products and quantities, unit/total pricing, date sold, promised/due dates, customer name/address, invoice number, etc.) plus a plain-text version. This does NOT create any CRM records - it only annotates the file.",
@@ -341,26 +354,6 @@ const BASE_TOOLS = [
         extracted_text: { type: 'string', description: 'A plain-text summary of the document contents, for search.' },
       },
       required: ['file_id', 'extracted_text'],
-    },
-  },
-  {
-    name: 'create_product',
-    description:
-      'Add a product / factory-order line to a job (a cabinet, a set of pull-outs, etc). Like log_payment/log_expense, this writes real data: state the exact line(s) back to Andrew and wait for his explicit confirmation, then call with confirmed:true. Never create products straight from a document without his yes.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        job_id: { type: 'string' },
-        name: { type: 'string' },
-        quantity: { type: 'number' },
-        unit_price: { type: 'number' },
-        deadline: { type: 'string', description: 'ISO date' },
-        factory: { type: 'string' },
-        measurements: { type: 'string' },
-        notes: { type: 'string' },
-        confirmed: { type: 'boolean', description: 'Only true once Andrew has explicitly confirmed this exact line in the conversation.' },
-      },
-      required: ['job_id', 'name', 'confirmed'],
     },
   },
   {
@@ -1011,6 +1004,14 @@ function runTool(name, input) {
       db.attachFileToJob(input.file_id, input.job_id);
       return { ok: true, file_id: input.file_id, job_id: input.job_id, customer_id: file.customer_id };
     }
+    case 'move_file_to_customer': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file) return { error: 'File not found' };
+      const customer = db.getCustomer(input.customer_id);
+      if (!customer) return { error: 'Customer not found' };
+      db.setFileAssignment(input.file_id, { customer_id: customer.id, assignment_status: 'confirmed' });
+      return { ok: true, file_id: input.file_id, customer_id: customer.id, customer_name: customer.name };
+    }
     case 'save_file_extraction': {
       const file = db.getCustomerFile(input.file_id);
       if (!file) return { error: 'File not found' };
@@ -1020,24 +1021,6 @@ function runTool(name, input) {
         status: 'done',
       });
       return { ok: true, file_id: input.file_id, customer_id: file.customer_id };
-    }
-    case 'create_product': {
-      if (input.confirmed !== true) {
-        return { error: 'Not created - restate the exact product line (name, quantity, price, deadline) and wait for Andrew to confirm before calling this again.' };
-      }
-      const job = db.getJob(input.job_id);
-      if (!job) return { error: 'Job not found' };
-      const product = db.createProduct({
-        job_id: input.job_id,
-        name: input.name,
-        quantity: input.quantity || 1,
-        unit_price: input.unit_price,
-        deadline: input.deadline,
-        factory: input.factory,
-        measurements: input.measurements,
-        notes: input.notes,
-      });
-      return { product, customer_id: job.customer_id };
     }
     case 'update_job': {
       if (input.confirmed !== true) {
@@ -1122,10 +1105,26 @@ function callClaude(messages, opts = {}) {
         });
       }
     );
+    // 30s per-request timeout, so a hung Anthropic call fails cleanly instead
+    // of holding the connection until the browser's own 120s abort.
+    req.setTimeout(30000, () => req.destroy(new Error('Anthropic request timed out after 30s')));
     req.on('error', reject);
     req.write(body);
     req.end();
   });
+}
+
+// The tool loop below runs up to 6 rounds of callClaude(); on a slow
+// multi-round turn the per-call 30s timeouts could still add up past the
+// browser's 120s abort. This gives the whole turn one shared budget so a
+// slow turn fails with a real message from the server itself.
+const CHAT_TURN_BUDGET_MS = 100000;
+function withBudget(promise, budgetMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), budgetMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 const SYSTEM_PROMPT = `You are the office manager AND financial analyst for the Shelves to Drawers RVA BOS
@@ -1178,7 +1177,7 @@ Financial reasoning rules - these matter more than being fast:
   that a job's remaining balance is due the day of its Install appointment. A job with no
   Install scheduled yet has no known due date - report that plainly ("no install scheduled,
   timing unknown") instead of estimating one.
-- log_payment, log_expense, create_product, and update_job are real writes. Before calling
+- log_payment, log_expense, and update_job are real writes. Before calling
   any of them, state the exact entry (amount, category/vendor, method, date; or the product
   line; or the job change) back to Andrew in plain text and wait for him to confirm in a
   later message - then, and only then, call the tool with confirmed:true. Never set
@@ -1190,12 +1189,13 @@ Files: when Andrew uploads a file it has already been saved and its id is given 
 the message. Read it, then call save_file_extraction with a compact JSON of the key fields
 (products and quantities, unit and total pricing, date sold, promised or due dates, customer
 name and address, invoice or order number) and a short plain-text summary - this only
-annotates the file so it's searchable later, it creates nothing. If the document implies CRM
-records - a signed order means a job sold_amount plus product lines plus deadlines; a
-supplier invoice means an expense - propose each entry in plain text and wait for Andrew's
-explicit confirmation before any confirmed:true call. Never create records straight from a
-document. Use attach_file_to_job to tie a file to the right job. Use search_files to find an
-existing document Andrew refers to.
+annotates the file so it's searchable later, it creates nothing. If the document implies an
+expense (a supplier invoice), propose the expense entry in plain text and wait for Andrew's
+explicit confirmation before any confirmed:true call. There is no tool to create product /
+factory-order lines from a document - do not propose or offer to create one; tell Andrew
+product lines are added from the job page. Use attach_file_to_job to tie a file to the right
+job, and move_file_to_customer to re-file a file that landed under the wrong customer (or no
+customer). Use search_files to find an existing document Andrew refers to.
 
 You can see the recent conversation, so pronouns and follow-ups ("her", "that job", "do the
 same for the other one") refer back to what was already discussed - use that context instead
@@ -1350,6 +1350,10 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
     }
   }
 
+  // The whole turn (up to 6 rounds, each with its own 30s callClaude timeout)
+  // gets one shared budget, so a slow multi-round turn fails cleanly from the
+  // server - with a real message - well before the browser's 120s abort.
+  async function runLoop() {
   for (let i = 0; i < 6; i++) {
     let response;
     try {
@@ -1479,6 +1483,18 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
 
   remember('(stopped after several steps without a final answer)');
   return { summary: 'Stopped after several steps without a final answer - try rephrasing.', error: true, toolLog };
+  }
+
+  try {
+    return await withBudget(
+      runLoop(),
+      CHAT_TURN_BUDGET_MS,
+      'This is taking too long (a multi-step request that is not finishing in time). Try a simpler request, or try again.'
+    );
+  } catch (err) {
+    remember(`(error: ${err.message})`);
+    return { summary: err.message, error: true, toolLog };
+  }
 }
 
 module.exports = { handleMessage, assistantConfigured, resetConversation, getHistory, runTool, TOOLS };

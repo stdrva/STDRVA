@@ -76,7 +76,7 @@ function customerUploadsDir(customerId) {
 // records it in customer_files, optionally tagged to a job. Returns the new
 // file id. Shared by the customer Files panel, the job Files panel, and the
 // Assistant chat upload.
-function saveUpload({ customer_id, job_id, upload, note }) {
+function saveUpload({ customer_id, job_id, upload, note, assignment_status, suggested_customer_id }) {
   const ext = path.extname(upload.filename || '') || '';
   const storedName = `${newId()}${ext}`;
   fs.writeFileSync(path.join(customerUploadsDir(customer_id), storedName), upload.data);
@@ -88,6 +88,8 @@ function saveUpload({ customer_id, job_id, upload, note }) {
     mime_type: upload.mimeType || null,
     size: upload.data.length,
     note: note || null,
+    assignment_status,
+    suggested_customer_id,
   });
 }
 
@@ -568,7 +570,7 @@ function register(router, requireAuth) {
          }`
       )}
     `;
-    res.send(dashboardLayout({ title: c.name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query), context: { customerId: c.id } }));
+    res.send(dashboardLayout({ title: c.name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query), context: { customerId: c.id, customerName: c.name } }));
   });
 
   router.post('/dashboard/customers/:id', requireAuth, (req, res) => {
@@ -1623,12 +1625,72 @@ function register(router, requireAuth) {
     res.redirect(`/dashboard/jobs/${req.params.id}?ok=File moved to Deleted Files (recoverable)`);
   });
 
+  // ---------- Unfiled assistant uploads: confirm / reassign / undo ----------
+  router.post('/dashboard/customer-files/:id/confirm', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.id);
+    if (!f || f.assignment_status !== 'unconfirmed' || !f.suggested_customer_id) {
+      return res.status(400).json({ error: 'Nothing to confirm.' });
+    }
+    db.setFileAssignment(f.id, { customer_id: f.suggested_customer_id, assignment_status: 'confirmed' });
+    res.json({ ok: true });
+  });
+  router.post('/dashboard/customer-files/:id/undo', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.id);
+    if (!f) return res.status(404).json({ error: 'File not found' });
+    db.setFileAssignment(f.id, { customer_id: null, assignment_status: 'needs_review' });
+    res.json({ ok: true });
+  });
+  router.post('/dashboard/customer-files/:id/assign', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.id);
+    if (!f) return res.status(404).send('File not found');
+    const customer = db.getCustomer(req.body.customer_id);
+    if (!customer) return res.redirect('/dashboard/files?err=Pick a customer#needs-review');
+    db.setFileAssignment(f.id, { customer_id: customer.id, assignment_status: 'confirmed' });
+    res.redirect(`/dashboard/files?ok=${encodeURIComponent('Filed under ' + customer.name)}#needs-review`);
+  });
+
   // ---------- Files search (across all customers + jobs) ----------
   router.get('/dashboard/files', requireAuth, (req, res) => {
     const q = (req.query.q || '').trim();
     const results = q ? db.searchFiles(q) : [];
+    const needsReview = db.listFilesNeedingReview();
+    const allCustomers = db.listCustomers();
+    const customerOptions = (selectedId) =>
+      `<option value="">Pick a customer…</option>${allCustomers
+        .map((c) => `<option value="${c.id}" ${c.id === selectedId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`)
+        .join('')}`;
     const body = `
       <h1>Files</h1>
+      ${
+        needsReview.length
+          ? `<div class="panel" id="needs-review">
+              <h2 style="margin-top:0">Needs review (${needsReview.length})</h2>
+              <p class="subtitle">Uploaded through the AI Assistant with no confident customer match. Nothing here is attached to any customer's record yet.</p>
+              <table><tr><th>File</th><th>Uploaded</th><th>Suggested</th><th>Assign to</th><th></th></tr>${needsReview
+                .map(
+                  (f) => `<tr>
+                    <td>${escapeHtml(f.original_name)}</td>
+                    <td>${fmtDate(f.created_at)}</td>
+                    <td>${f.assignment_status === 'unconfirmed' ? escapeHtml(f.suggested_customer_name || '') + ' (unconfirmed)' : 'Needs Review - no suggestion'}</td>
+                    <td>
+                      <form class="inline" method="POST" action="/dashboard/customer-files/${f.id}/assign">
+                        <select name="customer_id">${customerOptions(f.suggested_customer_id)}</select>
+                        <button class="btn small" type="submit">Assign</button>
+                      </form>
+                    </td>
+                    <td>
+                      ${
+                        f.assignment_status === 'unconfirmed'
+                          ? `<form class="inline" method="POST" action="/dashboard/customer-files/${f.id}/assign"><input type="hidden" name="customer_id" value="${f.suggested_customer_id}"><button class="btn small" type="submit">Confirm</button></form>`
+                          : ''
+                      }
+                    </td>
+                  </tr>`
+                )
+                .join('')}</table>
+            </div>`
+          : ''
+      }
       <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents.</p>
       <div class="panel">
         <form method="GET" action="/dashboard/files">
@@ -2402,12 +2464,15 @@ function register(router, requireAuth) {
       if (!upload || !upload.filename) {
         return res.status(400).json({ error: 'No file received. Pick a file and try again.' });
       }
-      const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
+      // Uploads always save unassigned (spec B4) - the customer on screen is
+      // NOT enough to file it there. Resolution happens in /assistant/chat
+      // once the accompanying message names someone (or doesn't).
       const fileId = saveUpload({
-        customer_id: ctxCustomer ? ctxCustomer.id : null,
+        customer_id: null,
         job_id: null,
         upload,
         note: 'Uploaded via assistant chat',
+        assignment_status: 'needs_review',
       });
       const analyzable =
         (upload.mimeType || '').startsWith('image/') ||
@@ -2458,10 +2523,11 @@ function register(router, requireAuth) {
       } else if (req.files && req.files[0] && req.files[0].filename) {
         const upload = req.files[0];
         const fileId = saveUpload({
-          customer_id: ctxCustomer ? ctxCustomer.id : null,
+          customer_id: null,
           job_id: null,
           upload,
           note: 'Uploaded via assistant chat',
+          assignment_status: 'needs_review',
         });
         file = {
           id: fileId,
@@ -2473,6 +2539,26 @@ function register(router, requireAuth) {
 
       if (!message && !file) {
         return res.status(400).json({ error: 'Type something or attach a file first.' });
+      }
+
+      // Decide who an unfiled attachment belongs to (spec B4). A customer
+      // named IN THE MESSAGE always wins, even over the record on screen -
+      // the on-screen customer only ever produces an "unconfirmed" suggestion,
+      // never a silent attach. Only runs once per file (guarded on
+      // assignment_status), so a file already confirmed/corrected earlier in
+      // this conversation is never re-decided by a later message.
+      let fileAssignment = null;
+      stage = 'fileAssignment';
+      if (file) {
+        const fileRow = db.getCustomerFile(file.id);
+        if (fileRow && fileRow.assignment_status === 'needs_review' && !fileRow.customer_id) {
+          const decision = db.decideFileAssignment({ message, ctxCustomer });
+          db.setFileAssignment(file.id, decision);
+          if (decision.assignment_status !== 'needs_review') {
+            fileAssignment = { file_id: file.id, status: decision.assignment_status, customer_id: decision.customer_id, suggested_customer_id: decision.suggested_customer_id, customer_name: decision.customer.name };
+          }
+          // else: no name, no on-screen customer - stays needs_review, surfaced later from the Files page.
+        }
       }
 
       stage = 'handleMessage';
@@ -2487,6 +2573,7 @@ function register(router, requireAuth) {
         error: !!result.error,
         changedCustomerId: result.changedCustomerId || null,
         navigateTo: result.navigateTo || null,
+        fileAssignment,
       });
     } catch (err) {
       console.error(

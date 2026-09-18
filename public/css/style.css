@@ -516,13 +516,19 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
 #assistant-widget.minimized { width: auto; max-height: none; }
 #assistant-widget.minimized .aw-body { display: none; }
 #assistant-widget.minimized .aw-head { cursor: pointer; }
-.aw-log { flex: 1 1 auto; max-height: 42vh; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.aw-log { flex: 1 1 auto; max-height: 42vh; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
 .aw-retry { align-self: flex-start; margin: 2px 0 4px; }
 .aw-retry button {
   border: 1px solid #4a7dfc; background: transparent; color: #a9c2ff; border-radius: 8px;
   padding: 5px 14px; font: inherit; font-size: 0.82rem; cursor: pointer; font-weight: 700;
 }
 .aw-retry button:hover { background: rgba(74,125,252,0.15); }
+.aw-fileassign { align-self: flex-start; margin: 2px 0 4px; padding: 8px 10px; border: 1px solid #3a4150; border-radius: 8px; font-size: 0.82rem; display: flex; flex-direction: column; gap: 6px; }
+.aw-fileassign > div:first-child { color: #cfd3da; }
+.aw-fileassign button, .aw-fileassign a {
+  border: 1px solid #4a7dfc; background: transparent; color: #a9c2ff; border-radius: 8px;
+  padding: 4px 12px; font: inherit; font-size: 0.8rem; cursor: pointer; font-weight: 700; text-decoration: none; margin-right: 6px; display: inline-block;
+}
 .aw-bubble { border-radius: 10px; padding: 7px 10px; font-size: 0.86rem; max-width: 86%; white-space: pre-wrap; word-wrap: break-word; }
 .aw-bubble.user { align-self: flex-end; background: #4a7dfc; }
 .aw-bubble.bot { align-self: flex-start; background: #333a48; }

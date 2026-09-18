@@ -401,6 +401,19 @@ CREATE TABLE IF NOT EXISTS sales_consultants (
   if (!existing.has('deleted_by')) db.exec(`ALTER TABLE customer_files ADD COLUMN deleted_by TEXT`);
 })();
 
+// ---- Migration: file-filing state for assistant uploads (spec B4, 2026-09-18).
+// assignment_status is null for every file uploaded the normal way (the
+// customer/job Files panel - customer_id was explicit and unambiguous).
+// Assistant-widget uploads instead start 'needs_review' with customer_id NULL,
+// and get resolved to 'confirmed' (named customer, or manually assigned) or
+// 'unconfirmed' (suggested_customer_id set to the on-screen customer, pending
+// Andrew's Confirm/Undo) once the accompanying message is sent. ----
+(function migrateCustomerFilesAssignmentStatus() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
+  if (!existing.has('assignment_status')) db.exec(`ALTER TABLE customer_files ADD COLUMN assignment_status TEXT`);
+  if (!existing.has('suggested_customer_id')) db.exec(`ALTER TABLE customer_files ADD COLUMN suggested_customer_id TEXT`);
+})();
+
 // ---- Migration: customer_files.customer_id must be NULLABLE. A file uploaded
 // through the Assistant chat while Andrew is NOT on a customer page (Overview,
 // KPI, etc.) has no customer to attach to yet - the old NOT NULL constraint
@@ -951,14 +964,68 @@ function syncFileSearch(id) {
     f.extracted_text || ''
   );
 }
-function createCustomerFile({ customer_id, job_id, stored_name, original_name, mime_type, size, note }) {
+function createCustomerFile({ customer_id, job_id, stored_name, original_name, mime_type, size, note, assignment_status, suggested_customer_id }) {
   const id = newId();
   db.prepare(
-    `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?)`
-  ).run(id, customer_id || null, job_id || null, stored_name, original_name, mime_type || null, size || 0, note || null, nowIso());
+    `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at, assignment_status, suggested_customer_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    customer_id || null,
+    job_id || null,
+    stored_name,
+    original_name,
+    mime_type || null,
+    size || 0,
+    note || null,
+    nowIso(),
+    assignment_status || null,
+    suggested_customer_id || null
+  );
   syncFileSearch(id);
   return id;
+}
+// Resolves (or corrects) which customer an assistant-uploaded file belongs
+// to. Passing customer_id clears suggested_customer_id and marks 'confirmed'
+// unless a different status is given explicitly (used to move a file back to
+// 'needs_review' on Undo).
+function setFileAssignment(id, { customer_id, assignment_status, suggested_customer_id }) {
+  db.prepare(`UPDATE customer_files SET customer_id = ?, assignment_status = ?, suggested_customer_id = ? WHERE id = ?`).run(
+    customer_id || null,
+    assignment_status || null,
+    suggested_customer_id || null,
+    id
+  );
+  return getCustomerFile(id);
+}
+function listFilesNeedingReview() {
+  return db
+    .prepare(
+      `SELECT customer_files.*, customers.name as suggested_customer_name
+       FROM customer_files LEFT JOIN customers ON customers.id = customer_files.suggested_customer_id
+       WHERE customer_files.deleted_at IS NULL AND customer_files.assignment_status IN ('unconfirmed', 'needs_review')
+       ORDER BY customer_files.created_at DESC`
+    )
+    .all();
+}
+// A simple, deliberately conservative name match: only fires when exactly one
+// customer's full name appears in the text, so an ambiguous or absent name
+// never causes a guess (spec B4 - "never the sole basis" without confidence).
+function findConfidentCustomerByName(text) {
+  if (!text) return null;
+  const lower = String(text).toLowerCase();
+  const matches = listCustomers().filter((c) => c.name && lower.includes(c.name.toLowerCase()));
+  return matches.length === 1 ? matches[0] : null;
+}
+// Pure decision for where an unfiled assistant upload should land (spec B4):
+// a customer named in the message always wins, even over the on-screen
+// customer; the on-screen customer alone only ever produces an unconfirmed
+// suggestion; neither signal means Needs Review, never a guess.
+function decideFileAssignment({ message, ctxCustomer }) {
+  const named = findConfidentCustomerByName(message);
+  if (named) return { customer_id: named.id, assignment_status: 'confirmed', suggested_customer_id: null, customer: named };
+  if (ctxCustomer) return { customer_id: null, assignment_status: 'unconfirmed', suggested_customer_id: ctxCustomer.id, customer: ctxCustomer };
+  return { customer_id: null, assignment_status: 'needs_review', suggested_customer_id: null, customer: null };
 }
 function listCustomerFiles(customer_id, { includeDeleted } = {}) {
   return db
@@ -2266,6 +2333,10 @@ module.exports = {
   createProductOption,
   deleteProductOption,
   createCustomerFile,
+  setFileAssignment,
+  listFilesNeedingReview,
+  findConfidentCustomerByName,
+  decideFileAssignment,
   listCustomerFiles,
   listJobFiles,
   getCustomerFile,

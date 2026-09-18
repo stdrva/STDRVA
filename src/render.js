@@ -221,11 +221,12 @@ function phone(v) {
 //  - Panel is size-capped so the BOS underneath stays usable on a laptop.
 function assistantWidget(context) {
   const customerId = context && context.customerId ? context.customerId : '';
+  const customerName = context && context.customerName ? context.customerName : '';
   return `
 <button id="assistant-launch" type="button" aria-label="Open AI assistant" hidden>AI</button>
-<div id="assistant-widget" data-context-customer-id="${customerId}" hidden>
+<div id="assistant-widget" data-context-customer-id="${customerId}" data-context-customer-name="${escapeHtml(customerName)}" hidden>
   <div class="aw-head">
-    <span class="aw-title">AI Assistant${customerId ? ' · this customer' : ''}</span>
+    <span class="aw-title" id="aw-title">AI Assistant${customerName ? ` · <span id="aw-title-customer">${escapeHtml(customerName)}</span> <button type="button" id="aw-detach" title="Stop attaching to ${escapeHtml(customerName)} - uploads/messages will not name a customer" style="margin-left:2px;background:none;border:0;color:inherit;opacity:.65;cursor:pointer;font-size:0.85em;padding:0 2px">✕</button>` : ''}</span>
     <span class="aw-head-btns">
       <button type="button" id="aw-min" aria-label="Minimize" title="Minimize">–</button>
       <button type="button" id="aw-close" aria-label="Close" title="Close">×</button>
@@ -253,6 +254,45 @@ function assistantWidget(context) {
   var launch = document.getElementById('assistant-launch');
   if (!widget) return;
   var contextCustomerId = widget.getAttribute('data-context-customer-id') || '';
+  var detachBtn = document.getElementById('aw-detach');
+  if (detachBtn) {
+    detachBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      contextCustomerId = '';
+      var titleCustomer = document.getElementById('aw-title-customer');
+      if (titleCustomer) titleCustomer.parentNode.removeChild(titleCustomer);
+      detachBtn.parentNode.removeChild(detachBtn);
+    });
+  }
+  function renderFileAssignment(fa) {
+    if (!fa) return;
+    if (fa.status === 'unconfirmed') {
+      var wrap = document.createElement('div');
+      wrap.className = 'aw-fileassign';
+      var text = document.createElement('div');
+      text.textContent = '📎 Filed as unconfirmed under ' + fa.customer_name + ' - not saved to their record yet.';
+      wrap.appendChild(text);
+      var confirmBtn = document.createElement('button');
+      confirmBtn.type = 'button'; confirmBtn.textContent = 'Confirm';
+      confirmBtn.addEventListener('click', function () {
+        fetch('/dashboard/customer-files/' + fa.file_id + '/confirm', { method: 'POST', headers: awHeaders() })
+          .then(readJson).then(function(){ wrap.remove(); addBubble('assistant', 'Filed under ' + fa.customer_name + '.'); });
+      });
+      var undoBtn = document.createElement('button');
+      undoBtn.type = 'button'; undoBtn.textContent = 'Undo';
+      undoBtn.addEventListener('click', function () {
+        fetch('/dashboard/customer-files/' + fa.file_id + '/undo', { method: 'POST', headers: awHeaders() })
+          .then(readJson).then(function(){ wrap.remove(); addBubble('assistant', 'Undone - moved to Needs Review on the Files page.'); });
+      });
+      var correctLink = document.createElement('a');
+      correctLink.href = '/dashboard/files#needs-review'; correctLink.target = '_blank'; correctLink.textContent = 'Correct…';
+      wrap.appendChild(confirmBtn); wrap.appendChild(undoBtn); wrap.appendChild(correctLink);
+      log.appendChild(wrap);
+      log.scrollTop = log.scrollHeight;
+    } else if (fa.status === 'confirmed') {
+      addBubble('assistant', '📎 Filed under ' + fa.customer_name + '.');
+    }
+  }
   var log = document.getElementById('assistant-log');
   var form = document.getElementById('assistant-form');
   var input = document.getElementById('assistant-input');
@@ -269,6 +309,7 @@ function assistantWidget(context) {
   var pendingAttachment = null;
   try { pendingAttachment = JSON.parse(sessionStorage.getItem(ATT_KEY) || 'null'); } catch (e) {}
   var lastFailedSend = null; // { message } kept for Retry
+  var lastFailedUpload = null; // the raw File, kept for Retry
 
   function saveAttachment(a) {
     pendingAttachment = a;
@@ -317,15 +358,23 @@ function assistantWidget(context) {
     if (widget.classList.contains('minimized')) setState('open');
   });
 
-  fileInput.addEventListener('change', function () {
-    var f = this.files[0] || null;
-    this.value = '';
-    if (!f) return;
-    // ~4.5MB is Anthropic's inline ceiling; bigger files are stored but not analyzed.
-    if (f.size > 25 * 1024 * 1024) {
-      addBubble('assistant', 'That file is ' + Math.round(f.size / 1024 / 1024) + ' MB — too large to attach here. Add it from the customer or job Files section instead.');
-      return;
-    }
+  function showUploadRetry(f, message) {
+    lastFailedUpload = f;
+    addBubble('assistant', message);
+    var wrap = document.createElement('div');
+    wrap.className = 'aw-retry';
+    var btn = document.createElement('button');
+    btn.type = 'button'; btn.textContent = 'Retry';
+    btn.addEventListener('click', function () {
+      wrap.remove();
+      attemptUpload(f);
+    });
+    wrap.appendChild(btn);
+    log.appendChild(wrap);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function attemptUpload(f) {
     fileLabel.textContent = '📎 ' + f.name + ' — uploading…';
     var fd = new FormData();
     fd.append('file', f);
@@ -334,16 +383,34 @@ function assistantWidget(context) {
       .then(readJson)
       .then(function (d) {
         if (d && d.ok) {
+          lastFailedUpload = null;
           saveAttachment({ file_id: d.file_id, name: d.filename, analyzable: d.analyzable });
         } else {
           fileLabel.textContent = '';
-          addBubble('assistant', (d && d.error) || 'That file could not be uploaded. Try again.');
+          // d.error is a string on a real server error, but a plain boolean
+          // true on a non-JSON response (e.g. a raw 400 from the router) -
+          // never show that flag itself as if it were the message.
+          var msg = (d && typeof d.error === 'string' && d.error) || 'That file could not be uploaded. Your file was not lost - press Retry.';
+          showUploadRetry(f, msg);
         }
       })
       .catch(function (err) {
         fileLabel.textContent = '';
-        addBubble('assistant', awNetworkMessage(err));
+        showUploadRetry(f, awNetworkMessage(err));
       });
+  }
+
+  fileInput.addEventListener('change', function () {
+    var f = this.files[0] || null;
+    this.value = '';
+    if (!f) return;
+    // Matches the server's hard 20MB request-body cap (router.js) - a larger
+    // file would fail server-side anyway, so reject it before even trying.
+    if (f.size > 20 * 1024 * 1024) {
+      addBubble('assistant', 'That file is ' + Math.round(f.size / 1024 / 1024) + ' MB — too large to attach here (20MB max). Add it from the customer or job Files section instead.');
+      return;
+    }
+    attemptUpload(f);
   });
 
   function awHeaders() {
@@ -442,6 +509,7 @@ function assistantWidget(context) {
         if (attachmentAtSend && pendingAttachment && pendingAttachment.file_id === attachmentAtSend.file_id) {
           saveAttachment(null);
         }
+        renderFileAssignment(data.fileAssignment);
         lastFailedSend = null;
         var dest = data.navigateTo || (data.changedCustomerId ? '/dashboard/customers/' + data.changedCustomerId : null);
         if (dest && dest !== window.location.pathname) {

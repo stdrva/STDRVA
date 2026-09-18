@@ -15,6 +15,44 @@ below that carry a `-beta.N` suffix predate that decision.
   (`#assistant-widget`, `#assistant-launch`, `#voice-launch`, `#voice-overlay`) are now redundant but left
   in place untouched.
 
+- **B1 — timeouts:** 30s timeout on the Anthropic call (`callClaude`, `assistant.js`), the Twilio SMS
+  request (`sms.js`), and nodemailer's `connectionTimeout`/`greetingTimeout`/`socketTimeout`
+  (`email.js`), all resolving/erroring cleanly rather than hanging. The 6-round tool loop now also
+  shares one 100s overall budget (`CHAT_TURN_BUDGET_MS`) so a slow multi-round turn fails from the
+  server with a real message before the browser's 120s abort. B2 (intermittent connection errors):
+  no separate change beyond B1, per instruction - its exact cause needs Render-side log correlation
+  I can't do from the repo.
+- **B3 — scroll bleed:** `.aw-log` gets `overscroll-behavior: contain` so scrolling the assistant log
+  no longer bleeds into the page behind it at the ends.
+- **B4 — uploads filed to the wrong customer (rewritten):** assistant uploads (`/dashboard/assistant/upload`
+  and the legacy multipart fallback in `/dashboard/assistant/chat`) now always save unassigned
+  (`customer_id: null`, `assignment_status: 'needs_review'`) - the record open behind the widget is
+  never enough to file a upload there on its own. When the accompanying message is sent,
+  `db.decideFileAssignment()` resolves it: a customer named in the message always wins (even over
+  the on-screen customer) and is filed as `confirmed`; otherwise, if there is an on-screen customer,
+  the file becomes an `unconfirmed` suggestion (still `customer_id: null`, `suggested_customer_id`
+  set) that the widget shows with Confirm / Undo / Correct; with neither signal it stays
+  `needs_review`. New `assignment_status`/`suggested_customer_id` columns on `customer_files`. New
+  `move_file_to_customer` assistant tool re-files a file on request. The widget header now shows the
+  real on-screen customer name with a one-tap ✕ detach (stops that page from supplying a customer to
+  new uploads/messages for the rest of the session). The Files page (`/dashboard/files`) gained a
+  "Needs review" panel listing every unresolved file with a Confirm button (for suggestions) and an
+  Assign-to-customer picker (for everything, including plain Needs Review).
+- **B (upload UX):** a failed upload keeps the original `File` object and offers Retry (previously
+  the file was dropped on failure with no way to resend). The error message shown is never the raw
+  `error:true` flag from a non-JSON response - always a real sentence. Client and server file-size
+  limits both now 20MB (previously 25MB client / 20MB server, so a 20-25MB file failed server-side
+  with a confusing "true" message - this is exactly the flag-leak bug just fixed, plus the size
+  mismatch that triggered it).
+- **B6 — no product lines from the assistant:** `create_product` tool removed entirely (definition,
+  case, system-prompt mentions and the "propose product lines from a document" guidance). The
+  dashboard's own job-page product form and existing product data are untouched.
+- **B7 (VERIFY, no code change):** confirmed in code - `aw-close` sets the widget to `closed`; Enter
+  sends unless Shift/Ctrl/Cmd is held (Shift+Enter makes a newline via default textarea behavior);
+  `navigate_to_record` sets `navigateTo` and the widget follows it. Not verified on a live device.
+- **B8:** left alone, per instruction - unconfirmed reports (name-field escaping, "collapses after
+  send", mobile float-over) need a reproduction, not a guess.
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing

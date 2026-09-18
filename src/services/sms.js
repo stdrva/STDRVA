@@ -38,6 +38,7 @@ function sendRaw({ to, body }) {
         });
       }
     );
+    req.setTimeout(30000, () => req.destroy(new Error('Twilio request timed out after 30s')));
     req.on('error', (err) => resolve({ ok: false, error: String(err) }));
     req.write(params);
     req.end();
