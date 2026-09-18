@@ -456,7 +456,7 @@ const BASE_TOOLS = [
   {
     name: 'send_customer_message',
     description:
-      "Send a text or email to a customer THROUGH the BOS (same pipeline the dashboard uses). It is recorded in the communication history with its real delivery status. If Twilio / Resend aren't configured it is recorded but NOT delivered and you must tell Andrew that plainly - never imply it went out. This is outward-facing: state the exact recipient, channel, and message and get Andrew's explicit yes, then pass confirmed:true.",
+      "Send a text or email to a customer THROUGH the BOS (same pipeline the dashboard uses). It is recorded in the communication history with its real delivery status. If Twilio / Gmail aren't configured it is recorded but NOT delivered and you must tell Andrew that plainly - never imply it went out. This is outward-facing: state the exact recipient, channel, and message and get Andrew's explicit yes, then pass confirmed:true.",
     input_schema: {
       type: 'object',
       properties: {
@@ -1406,7 +1406,7 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
             when: booking().fmtSlotLong(new Date(br.appt.scheduled_at)),
             out_of_area: !!br.outOfArea,
             note:
-              'Appointment booked and the confirmation text/email was triggered (it is only actually delivered if Twilio/Resend are configured).' +
+              'Appointment booked and the confirmation text/email was triggered (it is only actually delivered if Twilio/Gmail are configured).' +
               (br.outOfArea ? ' Address is outside the normal area - Andrew was notified.' : ''),
           };
         } else {

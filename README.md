@@ -164,21 +164,24 @@ you can see exactly what would have gone out.
 No `twilio` npm package is used - the app calls Twilio's REST API directly
 over HTTPS (see `src/services/sms.js`), so there's nothing to install.
 
-## Emailing customers (Resend)
+## Emailing customers (Gmail SMTP)
 
 Same idea - until configured, emails print to the console instead of
-sending.
+sending. Uses an existing Gmail account via SMTP, so there's no separate
+sending service or domain to set up.
 
-1. Create a free account at resend.com, verify a sending domain (or use
-   their test domain while you try it out).
-2. Create an API key.
-3. In `.env`, set `RESEND_API_KEY` and `EMAIL_FROM` (e.g.
-   `Shelves to Drawers RVA <hello@yourdomain.com>`).
-4. Restart the server.
+1. On the Gmail account you want to send from, turn on 2-Step Verification,
+   then create an **App password** (Google Account -> Security -> 2-Step
+   Verification -> App passwords). Use a plain 16-character app password,
+   never the account's real login password.
+2. In `.env`, set `GMAIL_USER` (the full Gmail address) and
+   `GMAIL_APP_PASSWORD` (the 16-char app password).
+3. Restart the server.
 
-Prefer SendGrid, Mailgun, or Postmark instead? They're all a single JSON
-HTTPS POST just like Resend - swap the request in
-`src/services/email.js` (`sendRaw`).
+This is the one exception to the zero-dependency rule: sending goes through
+the `nodemailer` npm package (`src/services/email.js`), talking to
+`smtp.gmail.com:587` over STARTTLS. Gmail's sending limits (500/day on a
+free account) are far above this app's volume.
 
 ## Self-serve booking + QR code
 
@@ -302,7 +305,7 @@ src/
     public.js          customer-facing pages (booking, job status)
   services/
     sms.js             Twilio REST API over HTTPS
-    email.js           Resend REST API over HTTPS
+    email.js           Gmail SMTP via nodemailer
     automations.js     what gets sent when (new lead, sold, status change...)
     reminders.js       background appointment reminder loop
 public/css/style.css    the one stylesheet

@@ -1,46 +1,47 @@
-// Email via the Resend HTTPS API (https://resend.com) called directly - no
-// nodemailer/SMTP setup required. Swap the endpoint/body in sendRaw() if you
-// prefer SendGrid, Mailgun, Postmark, etc. - they're all a single JSON POST.
-// If RESEND_API_KEY isn't set, emails are logged instead of sent.
-const https = require('https');
+// Email via Gmail SMTP (smtp.gmail.com:587, STARTTLS), sent with nodemailer -
+// the one npm dependency in this otherwise zero-dependency codebase (see
+// CHANGELOG). Auth is a Gmail "app password" (16 chars, generated in the
+// Google Account's security settings), never the real account password.
+// If GMAIL_USER/GMAIL_APP_PASSWORD aren't set, emails are logged instead of sent.
+const nodemailer = require('nodemailer');
 const { isValidEmail } = require('../util');
 
 function emailConfigured() {
-  return !!(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+  return !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
 }
 
-function sendRaw({ to, subject, html }) {
-  return new Promise((resolve) => {
-    const payload = JSON.stringify({
-      from: process.env.EMAIL_FROM,
-      to: [to],
+let cachedTransporter = null;
+let cachedForUser = null;
+
+// Rebuilds the transporter if GMAIL_USER changes (e.g. between tests) rather
+// than caching one forever across a process that never changes its own env.
+function transporter() {
+  if (cachedTransporter && cachedForUser === process.env.GMAIL_USER) return cachedTransporter;
+  cachedForUser = process.env.GMAIL_USER;
+  cachedTransporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // STARTTLS, not implicit TLS
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
+  return cachedTransporter;
+}
+
+async function sendRaw({ to, subject, html }) {
+  try {
+    const info = await transporter().sendMail({
+      from: `${process.env.BUSINESS_NAME || 'Shelves to Drawers RVA'} <${process.env.GMAIL_USER}>`,
+      to,
       subject,
       html,
     });
-    const req = https.request(
-      {
-        hostname: 'api.resend.com',
-        path: '/emails',
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
-        },
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) resolve({ ok: true, status: res.statusCode, data });
-          else resolve({ ok: false, status: res.statusCode, data });
-        });
-      }
-    );
-    req.on('error', (err) => resolve({ ok: false, error: String(err) }));
-    req.write(payload);
-    req.end();
-  });
+    return { ok: true, messageId: info.messageId };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
 }
 
 async function sendEmail({ to, subject, html, customer_id, logMessage }) {
@@ -60,7 +61,7 @@ async function sendEmail({ to, subject, html, customer_id, logMessage }) {
       direction: 'out',
       channel: 'email',
       body: subject,
-      status: result.ok ? 'sent' : `failed: ${result.status || result.error}`,
+      status: result.ok ? 'sent' : `failed: ${result.error}`,
     });
   }
   if (!result.ok) console.error('Email send failed:', result);

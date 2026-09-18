@@ -5,6 +5,39 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
+
+Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing
+Gmail account (`shelvestodrawersrva@gmail.com`) via an app password. Low volume
+(~20 customers/month, occasional sub-100-person newsletter) is well within Gmail's
+sending limits, and this removes a separate paid-service dependency.
+
+- **`src/services/email.js`** rewritten to send via `smtp.gmail.com:587` (STARTTLS)
+  using the new `GMAIL_USER` / `GMAIL_APP_PASSWORD` env vars, replacing
+  `RESEND_API_KEY` / `EMAIL_FROM`. From-address displays as
+  `Shelves to Drawers RVA <shelvestodrawersrva@gmail.com>`.
+- **Same contract, zero caller changes**: `sendEmail()` keeps its exact signature
+  and return shape; `send_customer_message`, booking confirmations
+  (`automations.js`), and the dashboard Email tab all work unmodified. Unset
+  credentials still behave exactly like the old NOT CONFIGURED path — the message
+  is recorded, marked not delivered, and nothing throws.
+- **Dependency exception**: this codebase has otherwise used zero npm packages
+  (`"dependencies": {}`) by deliberate choice, hand-rolling Twilio/Resend over raw
+  HTTPS instead of pulling in SDKs. Hand-rolling raw SMTP (as opposed to a JSON-over-
+  HTTPS API) is materially more error-prone - MIME, auth handshakes, TLS upgrade -
+  so this one time we pull in **`nodemailer`** (a free, standard, widely-used
+  package) rather than reinvent SMTP by hand. Every other Twilio/Resend/Anthropic
+  integration in this app remains raw HTTPS, no SDK.
+- Removed everywhere: `RESEND_API_KEY`, `EMAIL_FROM`, all Resend-specific code,
+  `.env.example` entries, and every "Resend" mention in `README.md`,
+  `docs/phase-2-report.md`, the dashboard's NOT CONFIGURED banner text, and the
+  assistant's tool description/result text.
+- Tests added (`tests/email.test.js`): successful send (mocked transporter), NOT
+  CONFIGURED when env vars are unset, invalid-address short-circuit, and an SMTP
+  failure path - all asserting delivery status is recorded and nothing throws.
+- Out of scope (unchanged from before): no inbound email reading - replies sit in
+  the Gmail inbox and are not pulled into the BOS or matched to customers.
+
 ## 1.5.0 (2026-09-10) — Voice Mode for Home Show booking (spec 10-15, 24-25)
 
 A first usable **full conversational Voice Mode** — the same assistant, spoken. Zero new

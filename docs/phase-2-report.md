@@ -23,7 +23,7 @@ _Generated 2026-09-04. Status at time of writing: all implementation done and te
 
 **Appointments** — create / **edit / reschedule / cancel / complete**. Reschedule re-arms the reminder. A past `scheduled` appointment becomes an attention item and shows "(missed)". `google_event_id` column reserved; appointments are a standalone table with a clean status lifecycle so Google Calendar can become authoritative later without a rework.
 
-**Texting / Email** — real BOS actions from the customer page and the assistant (`send_customer_message`), through the existing Twilio/Resend pipeline. Delivery status is verified and recorded; UI shows **NOT CONFIGURED** in red and records "recorded, NOT delivered" — never fakes success. Communication history preserved.
+**Texting / Email** — real BOS actions from the customer page and the assistant (`send_customer_message`), through the existing Twilio/Gmail SMTP pipeline (email later migrated from Resend to Gmail SMTP, see CHANGELOG 1.6.0). Delivery status is verified and recorded; UI shows **NOT CONFIGURED** in red and records "recorded, NOT delivered" — never fakes success. Communication history preserved.
 
 **Files** — signature workflow now has a clear **Cancel** (link + button, back-link) and states nothing saves until "Save signed copy". Global rule applied: Cancel/Back on appointment-edit, campaign-edit, expense-edit, sign. Deletion is now **soft** — file hidden + pulled from search, recoverable from **Deleted Files**; permanent purge is a separate explicit, confirmed action that also erases the bytes.
 
@@ -65,7 +65,7 @@ _Generated 2026-09-04. Status at time of writing: all implementation done and te
 | `DASHBOARD_PASSWORD` | Dashboard is open (dev). Set it → `/login` is enforced. |
 | `SESSION_SECRET` | Optional. Session cookie signed from the password instead (changing password logs everyone out). |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` | Texts are recorded, shown as **NOT CONFIGURED**, not delivered. |
-| `RESEND_API_KEY` / `EMAIL_FROM` | Emails recorded, **NOT CONFIGURED**, not delivered. |
+| `GMAIL_USER` / `GMAIL_APP_PASSWORD` | Emails recorded, **NOT CONFIGURED**, not delivered. |
 | `ANTHROPIC_API_KEY` | Assistant replies "not configured". |
 | Persistent disk for `data/` | Uploaded + soft-deleted files and the DB must survive redeploys. |
 

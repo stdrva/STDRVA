@@ -381,7 +381,7 @@ function register(router, requireAuth) {
         'Text / Email',
         `<p id="send-text"></p>
          ${!smsOn ? '<div class="msg err" style="margin:0 0 10px">Texting NOT CONFIGURED — set TWILIO_* env vars. Messages below are recorded but not delivered.</div>' : ''}
-         ${!emailOn ? '<div class="msg err" style="margin:0 0 10px">Email NOT CONFIGURED — set RESEND_API_KEY / EMAIL_FROM. Messages below are recorded but not delivered.</div>' : ''}
+         ${!emailOn ? '<div class="msg err" style="margin:0 0 10px">Email NOT CONFIGURED — set GMAIL_USER / GMAIL_APP_PASSWORD. Messages below are recorded but not delivered.</div>' : ''}
          <form method="POST" action="/dashboard/customers/${c.id}/message">
            <label>Channel</label>
            <select name="channel">
