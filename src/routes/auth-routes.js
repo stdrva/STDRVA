@@ -29,6 +29,12 @@ function register(router) {
           ${err}
           <form method="POST" action="/login">
             <input type="hidden" name="next" value="${escapeHtml(next)}">
+            <!-- Password-only auth (spec D1) - this field is not checked server-side,
+                 it exists so iOS/browser password managers pair it with the password
+                 and offer to save/fill the login, which a lone password field often
+                 doesn't trigger. -->
+            <label>Username</label>
+            <input type="text" name="username" autocomplete="username" value="${escapeHtml(process.env.DASHBOARD_USER || 'admin')}">
             <label>Password</label>
             <input type="password" name="password" autocomplete="current-password" autofocus required>
             <label class="check"><input type="checkbox" name="remember" value="1" checked> Keep me signed in on this device</label>

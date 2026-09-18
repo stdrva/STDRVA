@@ -75,13 +75,14 @@ const PRIMARY_NAV = [
   ['/dashboard/appointments', 'Appts'],
   ['/dashboard/jobs', 'Jobs'],
   ['/dashboard/finances', 'Bookkeeping'],
+  // Same page as the old buried "Booking Link / QR" More-menu entry - renamed
+  // and promoted to a primary tab (spec D3) because it wasn't findable there.
+  ['/dashboard/booking-link', 'Show Prep and Materials'],
 ];
 const MORE_NAV = [
   ['/dashboard/production', 'Production Queue'],
   ['/dashboard/marketing', 'Marketing'],
   ['/dashboard/files', 'Files'],
-  ['/dashboard/booking-link', 'Booking Link / QR'],
-  ['/dashboard/settings/product-options', 'Product Options'],
   ['/dashboard/files/deleted', 'Deleted Files'],
 ];
 

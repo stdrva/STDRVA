@@ -84,6 +84,19 @@ below that carry a `-beta.N` suffix predate that decision.
 - **C7 (VERIFY, no code change):** not verified this pass - deferred, flagging for a live-device check.
 - **C8:** no action (dead X button is the assistant widget's, covered under Section B).
 
+- **D1:** added a visible username field (prefilled with `DASHBOARD_USER`, `autocomplete="username"`)
+  next to the password field on `/login`. Not checked server-side (this is still single-password
+  auth) - it exists only so iOS/browser password managers pair it with the password field and offer
+  to save/fill the login, which a lone password field often doesn't trigger.
+- **D2 (VERIFY, no code change):** confirmed in code - cookie sessions (not Basic Auth) plus the
+  existing inline boot splash are both already in place, which is exactly what would fix the iOS
+  Home Screen black-screen report. Not verified on a live device.
+- **D3:** the Booking Link / QR page (already had per-consultant link + QR generation - it only
+  needed to be findable) is promoted out of the "More" menu into a primary, always-visible nav tab,
+  renamed "Show Prep and Materials".
+- **D4:** "Product Options" removed from the More menu (nav only - the route, its data, and the job
+  page's link to it are all untouched).
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing
