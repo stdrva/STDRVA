@@ -424,9 +424,18 @@ function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
           if (nextBtn) nextBtn.hidden = step === total;
           if (submitBtn) submitBtn.hidden = step !== total;
         }
+        var formEl = document.querySelector('.wizard-nav') && document.querySelector('.wizard-nav').closest('form');
+        function saveProgress() {
+          // Save-on-Next (spec C6) - partial answers are expected and fine.
+          // The server overwrites its own previous save rather than appending.
+          if (!formEl) return;
+          var fd = new FormData(formEl);
+          fetch(formEl.action, { method: 'POST', headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }, body: fd }).catch(function(){});
+        }
         window.wqNav = function(delta) {
           step = Math.min(total, Math.max(1, step + delta));
           show();
+          if (delta > 0) saveProgress();
         };
         window.wqToggle = function(id, on) {
           var el = document.getElementById(id);
@@ -435,6 +444,16 @@ function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
         show();
       })();
     </script>`;
+}
+
+// Repeated saves (one per wizard step, spec C6) must overwrite the previous
+// discovery text, never append another copy of it - keeps the delimited
+// block after this marker in sync, leaving any note written before it alone.
+const DISCOVERY_MARKER = '[Discovery]\n';
+function upsertDiscoverySection(existingNotes, notesWithDiscovery) {
+  const base = (existingNotes || '').split(DISCOVERY_MARKER)[0].replace(/\n+$/, '');
+  if (!notesWithDiscovery) return base;
+  return (base ? base + '\n' : '') + DISCOVERY_MARKER + notesWithDiscovery;
 }
 
 function discoveryFromBody(body) {
@@ -466,7 +485,20 @@ function bookingContact(q) {
   const name = (q.name || '').trim();
   const phone = (q.phone || '').trim();
   const email = (q.email || '').trim();
-  const address = (q.address || '').trim();
+  let address = (q.address || '').trim();
+  // Split address fields (spec C3) recombine into the same single `address`
+  // string every downstream piece (parseAddress, zone check, createBooking,
+  // storage) already expects - nothing else needed to change. Mutating q
+  // (== req.query for every caller) means contactQS() and every link built
+  // from {...req.query} pick the combined value straight up.
+  if (!address && (q.address_line1 || q.address_city || q.address_state || q.address_zip)) {
+    const line1 = (q.address_line1 || '').trim();
+    const city = (q.address_city || '').trim();
+    const state = (q.address_state || '').trim();
+    const zip = (q.address_zip || '').trim();
+    address = [line1, city, [state, zip].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+    if (address) q.address = address;
+  }
   return {
     name,
     phone,
@@ -686,7 +718,7 @@ function register(router) {
       const cls = ['type-card', prominent ? 'featured' : '', selected ? 'selected' : ''].filter(Boolean).join(' ');
       const keep = contactQS({ ...req.query, type: t });
       return `
-        <a class="${cls}" href="/book?${keep}">
+        <a class="${cls}" href="/book?${keep}#step-contact">
           <span class="type-name">${escapeHtml(t)}</span>${prominent ? '<span class="type-tag">Most popular</span>' : ''}
           <div class="type-desc">${escapeHtml(TYPE_DESCRIPTIONS[t] || '')}</div>
         </a>`;
@@ -719,11 +751,20 @@ function register(router) {
     }
 
     const addr = parseAddress(address);
+    // Prefer whatever the split fields carried on this exact request (so a
+    // half-typed value isn't clobbered by round-tripping through parseAddress),
+    // falling back to the combined address parsed apart for prefill otherwise.
+    const addrParts = {
+      line1: req.query.address_line1 !== undefined ? req.query.address_line1 : addr.line1,
+      city: req.query.address_city !== undefined ? req.query.address_city : addr.city,
+      state: req.query.address_state !== undefined ? req.query.address_state : addr.state,
+      zip: req.query.address_zip !== undefined ? req.query.address_zip : addr.zip,
+    };
     const addrComplete = address && addressLooksComplete(address);
     const zone = addrComplete ? zoneForAddress(address) : null;
 
     const contactPanel = `
-      <div class="panel">
+      <div class="panel" id="step-contact">
         <h3 style="margin-top:0">2. Your info &amp; address</h3>
         <form method="GET" action="/book" id="contact-form">
           <input type="hidden" name="type" value="${escapeHtml(type)}">
@@ -737,10 +778,13 @@ function register(router) {
           <input type="tel" name="phone" value="${escapeHtml(phone)}" autocomplete="tel" inputmode="tel" required placeholder="(804) 555-0100">
           <label>Email *</label>
           <input type="email" name="email" value="${escapeHtml(email)}" autocomplete="email" inputmode="email" required>
-          <label>Home address *</label>
-          <textarea name="address" id="addr-field" rows="3" autocomplete="street-address"
-            placeholder="Street, city, state, ZIP — you can paste your whole address here" required>${escapeHtml(address)}</textarea>
-          <p class="subtitle" style="margin:6px 0 0;font-size:.8rem">We come to your home, so we need the full address (including city, state and ZIP) to bring the right samples.</p>
+          <label>Street address *</label>
+          <input type="text" name="address_line1" value="${escapeHtml(addrParts.line1)}" autocomplete="address-line1" required>
+          <div class="grid cols-3" style="margin-top:10px">
+            <div><label>City</label><input type="text" name="address_city" value="${escapeHtml(addrParts.city)}" autocomplete="address-level2"></div>
+            <div><label>State</label><input type="text" name="address_state" value="${escapeHtml(addrParts.state)}" autocomplete="address-level1" maxlength="2" style="text-transform:uppercase" placeholder="VA"></div>
+            <div><label>ZIP</label><input type="text" name="address_zip" value="${escapeHtml(addrParts.zip)}" autocomplete="postal-code" inputmode="numeric" placeholder="23220"></div>
+          </div>
           ${
             address && !addrComplete
               ? `<p class="subtitle" style="margin:8px 0 0;color:#b54f1e">That address looks incomplete — please add the city, state and ZIP so we can schedule your visit.</p>`
@@ -750,17 +794,17 @@ function register(router) {
         </form>
       </div>
       <script>
-        (function(){
-          var f = document.getElementById('addr-field');
-          if(!f) return;
-          // Collapse a multi-line pasted address (Contacts / Maps / email) into
-          // one tidy line so it stores and displays cleanly (spec 5).
-          function tidy(){
-            var v = f.value.replace(/\\s*\\n\\s*/g, ', ').replace(/,\\s*,/g, ',').replace(/\\s{2,}/g,' ').trim();
-            if (v !== f.value) f.value = v;
-          }
-          f.addEventListener('paste', function(){ setTimeout(tidy, 0); });
-          f.addEventListener('blur', tidy);
+        (function () {
+          var f = document.getElementById('contact-form');
+          if (!f) return;
+          // Native GET-form submission doesn't reliably keep a fragment
+          // through to the reloaded page, so build the URL by hand (spec C5)
+          // and land smoothly on the times section once it renders.
+          f.addEventListener('submit', function (e) {
+            e.preventDefault();
+            var params = new URLSearchParams(new FormData(f));
+            window.location.href = '/book?' + params.toString() + '#step-times';
+          });
         })();
       </script>`;
 
@@ -785,7 +829,7 @@ function register(router) {
             ? `<a class="btn secondary small" href="/book?${qs}" style="margin-top:10px">Back to the first times</a>`
             : '';
         timesPanel = `
-          <div class="panel">
+          <div class="panel" id="step-times">
             <h3 style="margin-top:0">3. Pick a time that works</h3>
             <p class="subtitle" style="margin-top:0">${escapeHtml(type)} · about ${duration >= 120 ? Math.round(duration / 60) + ' hours' : duration + ' minutes'}. Here are four openings${offset ? ' (more options)' : ''} — pick one and you'll confirm the details next.</p>
             <div class="slot-cards">${cards}</div>
@@ -967,7 +1011,7 @@ function register(router) {
         <p class="subtitle" style="margin-top:0">This helps Andrew bring the right samples. You can skip it — your appointment is already set.</p>
         <form method="POST" action="/book/discovery">
           <input type="hidden" name="appt" value="${escapeHtml(appt.id)}">
-          ${discoveryWizard('', "Skip — I'm all set", 'Save these details')}
+          ${discoveryWizard('', "Skip — I'm all set", 'Finished')}
         </form>
       </div>`
       }
@@ -976,11 +1020,12 @@ function register(router) {
   });
 
   router.post('/book/discovery', (req, res) => {
+    const isFetch = req.headers['x-requested-with'] === 'fetch';
     const appt = req.body.appt ? db.getAppointment(req.body.appt) : null;
-    if (!appt) return res.redirect('/book');
-    const { rooms, notesWithDiscovery } = discoveryFromBody(req.body);
+    if (!appt) return isFetch ? res.status(400).json({ error: 'Appointment not found' }) : res.redirect('/book');
+    const { notesWithDiscovery } = discoveryFromBody(req.body);
     if (notesWithDiscovery) {
-      const apptNotes = [appt.notes, notesWithDiscovery].filter(Boolean).join(' | ');
+      const apptNotes = upsertDiscoverySection(appt.notes, notesWithDiscovery);
       try {
         db.updateAppointment(appt.id, { notes: apptNotes }, { actor: 'public' });
       } catch (e) {
@@ -988,7 +1033,7 @@ function register(router) {
       }
       const customer = db.getCustomer(appt.customer_id);
       if (customer) {
-        const custNotes = [customer.notes, notesWithDiscovery].filter(Boolean).join(' | ');
+        const custNotes = upsertDiscoverySection(customer.notes, notesWithDiscovery);
         db.updateCustomer(
           customer.id,
           { name: customer.name, phone: customer.phone, email: customer.email, address: customer.address, notes: custNotes },
@@ -996,6 +1041,9 @@ function register(router) {
         );
       }
     }
+    // A background save-on-Next (spec C6) just needs an ack - it must not
+    // navigate the customer away from the wizard they're still filling out.
+    if (isFetch) return res.json({ ok: true });
     const body = `
       <div class="public-hero">
         <h1>Thanks!</h1>
@@ -1098,4 +1146,7 @@ module.exports = {
   allowedDaysForAddress,
   durationForType,
   fmtSlotLong,
+  bookingContact,
+  upsertDiscoverySection,
+  discoveryFromBody,
 };

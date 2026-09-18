@@ -53,6 +53,37 @@ below that carry a `-beta.N` suffix predate that decision.
 - **B8:** left alone, per instruction - unconfirmed reports (name-field escaping, "collapses after
   send", mobile float-over) need a reproduction, not a guess.
 
+- **C1:** removed the "We come to your home..." helper paragraph under the address field.
+- **C2 — times list + stale CSS:** `.slot-cards` is now a vertical flex list (one full-width row per
+  option) instead of a `grid(auto-fit)`, which is what was rendering as underlined text run together
+  on narrow screens. Checked `public/sw.js`: it registers ONLY from `dashboardLayout` (the internal
+  dashboard) - `publicLayout` (used by `/book`) never registers a service worker at all, so SW
+  staleness was not actually the cause of the `/book` symptom. Switched `/static/` to network-first
+  anyway (falls back to cache only when the network fails) since it's a real bug for the dashboard
+  pages that DO register the SW, where the cache name never changes between deploys. If stale `/book`
+  CSS recurs, the next suspect is the browser's own HTTP cache on `style.css` (no `Cache-Control`
+  header is set in `router.js`'s static file serving) - flagging for later, not changed here.
+- **C3 — split address fields:** the single free-text address textarea is now four fields (street,
+  city, state, ZIP) with `address-line1` / `address-level2` / `address-level1` / `postal-code`
+  autocomplete, recombined server-side in `bookingContact()` into the same `address` string every
+  downstream piece (parseAddress, zone check, createBooking, storage) already expects - nothing else
+  changed. Google Places autocomplete and the street-only-address lookup/suggestion flow are
+  explicitly skipped for this pass, per instruction. The review page's separate "edit your details"
+  quick-fix form (a different code path, POSTs straight to `/book/confirm`) was left as a single
+  textarea - out of scope for this pass.
+- **C5 — section scrolling:** service-type links now navigate to `#step-contact` and the info form
+  redirects (via a small JS handler, since native GET-form submission doesn't reliably carry a
+  fragment) to `#step-times`; `html { scroll-behavior: smooth }` makes the landing glide rather than
+  jump.
+- **C6 — discovery wizard:** default submit label changed from "Save these details" to "Finished"
+  (Back/Next/Submit visibility on the right step was already fixed by Section A's `[hidden]` fix).
+  Each "Next" now fires a background save of progress so far; the server (`/book/discovery`)
+  overwrites its own previous discovery text via a `[Discovery]` marker block instead of appending
+  another copy each time, while leaving any note written before that block alone. "Skip — I'm all
+  set" unchanged.
+- **C7 (VERIFY, no code change):** not verified this pass - deferred, flagging for a live-device check.
+- **C8:** no action (dead X button is the assistant widget's, covered under Section B).
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing

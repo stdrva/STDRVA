@@ -20,7 +20,19 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.pathname.startsWith('/static/')) {
-    e.respondWith(caches.match(req).then((hit) => hit || fetch(req)));
+    // Network-first, not cache-first (spec C2): the cache name never changes
+    // between deploys, and sw.js itself often doesn't change either, so a
+    // cache-first strategy could serve stale CSS/images indefinitely. Falling
+    // back to cache only keeps the app usable offline.
+    e.respondWith(
+      fetch(req)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(SHELL).then((c) => c.put(req, copy));
+          return res;
+        })
+        .catch(() => caches.match(req))
+    );
     return;
   }
   // Everything else: network only, with a tiny offline fallback for navigations.
