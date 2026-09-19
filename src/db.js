@@ -468,6 +468,52 @@ CREATE TABLE IF NOT EXISTS sales_consultants (
   db.exec('PRAGMA foreign_keys = ON;');
 })();
 
+// ---- Migration: messages.customer_id must be NULLABLE (spec F2.3) - a
+// send-to-anyone message (F3) or an inbound message from an unrecognized
+// sender has no customer to attach to. Same rebuild approach as
+// customer_files above (SQLite can't ALTER a column constraint away). ----
+(function migrateMessagesNullableCustomer() {
+  const info = db.prepare(`PRAGMA table_info(messages)`).all();
+  const cid = info.find((c) => c.name === 'customer_id');
+  if (!cid || cid.notnull === 0) return; // table absent or already nullable
+
+  const cols = info.map((c) => c.name);
+  const defs = info.map((c) => {
+    if (c.pk) return `${c.name} ${c.type || 'TEXT'} PRIMARY KEY`;
+    if (c.name === 'customer_id') return `customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL`;
+    let d = `${c.name} ${c.type || 'TEXT'}`;
+    if (c.notnull) d += ' NOT NULL';
+    if (c.dflt_value !== null && c.dflt_value !== undefined) d += ` DEFAULT ${c.dflt_value}`;
+    return d;
+  });
+
+  db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec('BEGIN;');
+  try {
+    db.exec(`CREATE TABLE messages_new (\n  ${defs.join(',\n  ')}\n);`);
+    db.exec(`INSERT INTO messages_new (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM messages;`);
+    db.exec('DROP TABLE messages;');
+    db.exec('ALTER TABLE messages_new RENAME TO messages;');
+    db.exec('COMMIT;');
+  } catch (e) {
+    db.exec('ROLLBACK;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    throw e;
+  }
+  db.exec('PRAGMA foreign_keys = ON;');
+})();
+
+// ---- Migration: messages gains subject (email) and to_address (F2/F3) -
+// who a no-customer send actually went to, since there's no customer record
+// to look the address up on - plus the full provider response (F1.1), so
+// Communication History can show more than a bare "sent". Additive/nullable. ----
+(function migrateMessagesColumns() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(messages)`).all().map((c) => c.name));
+  if (!existing.has('subject')) db.exec(`ALTER TABLE messages ADD COLUMN subject TEXT`);
+  if (!existing.has('to_address')) db.exec(`ALTER TABLE messages ADD COLUMN to_address TEXT`);
+  if (!existing.has('provider_response')) db.exec(`ALTER TABLE messages ADD COLUMN provider_response TEXT`);
+})();
+
 // ---- Chart of Accounts seed (only if empty). Small-shop Schedule-C shaped
 // buckets; editable later. ----
 (function seedChartOfAccounts() {
@@ -1158,15 +1204,47 @@ function listTrainingSessions(rep_id, limit = 20) {
 }
 
 // ---- Messages ----
-function logMessage({ customer_id, direction, channel, body, status }) {
+function logMessage({ customer_id, direction, channel, subject, body, status, to_address, provider_response }) {
   const id = newId();
   db.prepare(
-    `INSERT INTO messages (id, customer_id, direction, channel, body, status, created_at) VALUES (?,?,?,?,?,?,?)`
-  ).run(id, customer_id, direction || 'out', channel || 'sms', body || '', status || 'sent', nowIso());
+    `INSERT INTO messages (id, customer_id, direction, channel, subject, body, status, to_address, provider_response, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    id,
+    customer_id || null,
+    direction || 'out',
+    channel || 'sms',
+    subject || null,
+    body || '',
+    status || 'sent',
+    to_address || null,
+    provider_response || null,
+    nowIso()
+  );
   return id;
 }
 function listMessagesForCustomer(customer_id) {
   return db.prepare(`SELECT * FROM messages WHERE customer_id = ? ORDER BY created_at ASC`).all(customer_id);
+}
+// Every message, newest first, customer optional (spec F2.2/F2.3) - a plain
+// LEFT JOIN so a send-to-anyone or unmatched-sender message (no customer_id)
+// still shows up instead of silently disappearing from the list.
+function listAllMessages({ limit = 200 } = {}) {
+  return db
+    .prepare(
+      `SELECT messages.*, customers.name as customer_name FROM messages
+       LEFT JOIN customers ON customers.id = messages.customer_id
+       ORDER BY messages.created_at DESC LIMIT ?`
+    )
+    .all(limit);
+}
+function getMessage(id) {
+  return db
+    .prepare(
+      `SELECT messages.*, customers.name as customer_name FROM messages
+       LEFT JOIN customers ON customers.id = messages.customer_id
+       WHERE messages.id = ?`
+    )
+    .get(id);
 }
 function listRecentMessages(limit = 50) {
   return db
@@ -2396,6 +2474,8 @@ module.exports = {
   logMessage,
   listMessagesForCustomer,
   listRecentMessages,
+  listAllMessages,
+  getMessage,
   createPayment,
   listPayments,
   totalIncome,

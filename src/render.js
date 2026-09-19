@@ -82,6 +82,7 @@ const PRIMARY_NAV = [
 const MORE_NAV = [
   ['/dashboard/production', 'Production Queue'],
   ['/dashboard/marketing', 'Marketing'],
+  ['/dashboard/messages', 'Messages'],
   ['/dashboard/files', 'Files'],
   ['/dashboard/files/deleted', 'Deleted Files'],
 ];

@@ -11,6 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
+const { isValidEmail } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -477,6 +478,22 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'send_email',
+    description:
+      "Send an email to ANY address - not just the customer on the record (send_customer_message is for that). Use this when Andrew asks to be sent a copy of something, or to email someone who isn't a customer. It is recorded in the communication history the same as any other send (with no customer attached if none applies), and Gmail's daily send limit still applies. Outward-facing: state the exact recipient, subject, and full message and get Andrew's explicit yes, then pass confirmed:true. No automatic BCC to anyone - only send to who was actually asked for.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Exact email address' },
+        subject: { type: 'string' },
+        body: { type: 'string' },
+        customer_id: { type: 'string', description: 'Optional - only if this email is actually about/for a specific customer on file' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['to', 'subject', 'body', 'confirmed'],
+    },
+  },
+  {
     name: 'capture_expense',
     description:
       "Record a business expense from a sentence ('spent $84.27 at Lowe's for cabinet hardware') or an uploaded receipt. Capture amount, merchant, date, memo, and a suggested Chart-of-Accounts category. If the category is reasonably obvious, suggest it and let Andrew confirm/correct; if not, leave coa_account empty and it is saved as Uncategorized / Needs Review - do NOT invent certainty. If a receipt file was uploaded this turn, pass its file_id as receipt_file_id. This writes to the books - state the entry and get Andrew's yes, then confirmed:true.",
@@ -859,6 +876,18 @@ function runTool(name, input) {
       // handled async in the loop below via a marker; do it inline synchronously is not possible,
       // so we perform it here through a promise the caller awaits. runTool is sync, so queue it.
       return { __async_send: { customer: c, channel: input.channel, body: input.body } };
+    }
+    case 'send_email': {
+      if (input.confirmed !== true) {
+        return { error: 'Not sent - restate the exact recipient, subject, and message, and wait for Andrew to confirm.' };
+      }
+      if (!isValidEmail(input.to)) return { error: 'Not a valid email address' };
+      let customer = null;
+      if (input.customer_id) {
+        customer = db.getCustomer(input.customer_id);
+        if (!customer) return { error: 'Customer not found' };
+      }
+      return { __async_email: { to: input.to, subject: input.subject, body: input.body, customer_id: customer ? customer.id : null } };
     }
     case 'capture_expense': {
       if (input.confirmed !== true) {
@@ -1475,6 +1504,42 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
               ? 'Message delivered and recorded.'
               : `Recorded in history but NOT delivered${sendRes && sendRes.reason ? ` (${sendRes.reason})` : ''}. Tell Andrew it did not actually send.`,
           customer_id: customer.id,
+        };
+      }
+      // send_email (spec F3) - same shape as send_customer_message above, but
+      // to an arbitrary address and with no customer required.
+      if (result && result.__async_email) {
+        const { to, subject, body, customer_id } = result.__async_email;
+        let sendRes;
+        try {
+          sendRes = await email.sendEmail({
+            to,
+            subject,
+            html: `<p>${String(body).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>')}</p>`,
+            customer_id,
+            logMessage: db.logMessage,
+          });
+        } catch (e) {
+          sendRes = { ok: false, reason: String(e.message || e) };
+        }
+        db.logActivity({
+          entity_type: 'message',
+          entity_id: customer_id || to,
+          customer_id: customer_id || null,
+          field: 'email_sent',
+          new_value: String(subject).slice(0, 80),
+          note: sendRes && sendRes.ok ? `delivered to ${to}` : `not delivered to ${to} (${(sendRes && sendRes.reason) || 'error'})`,
+          actor: 'assistant',
+        });
+        result = {
+          ok: !!(sendRes && sendRes.ok),
+          delivered: !!(sendRes && sendRes.ok),
+          recorded: true,
+          note:
+            sendRes && sendRes.ok
+              ? `Email sent to ${to} and recorded.`
+              : `Recorded in history but NOT delivered to ${to}${sendRes && sendRes.reason ? ` (${sendRes.reason})` : ''}. Tell Andrew it did not actually send.`,
+          customer_id: customer_id || null,
         };
       }
       toolLog.push({ tool: block.name, input: block.input, result });

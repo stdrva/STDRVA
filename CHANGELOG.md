@@ -140,6 +140,33 @@ below that carry a `-beta.N` suffix predate that decision.
 - **E12:** no action - ad funnel on the job page not found in code; the financial-data-mismatch report
   needs a reproduction, not a guess.
 
+- **F1.1 — Gmail's full response:** `email.js`'s `sendRaw()` now captures nodemailer's `info.response`
+  (Gmail's raw SMTP acceptance line) and records it on the message (`provider_response` - new column).
+  Acceptance by Gmail is not proof of inbox arrival, so this doesn't resolve the AOL question by
+  itself - Andrew still needs to check the Gmail inbox by hand for a Mail Delivery Subsystem notice,
+  then AOL's spam folder, per the original note. F1.3/F1.4 unchanged (SPF/DKIM dead end, no Sent-folder
+  entry both left alone as instructed/expected).
+- **F1.2 — plain-text alternative:** every email now also sends a `text` part (`email.htmlToText()`,
+  new/exported), derived from the same HTML body, alongside the existing HTML part.
+- **F2.1 — store full bodies:** `sendEmail()` was logging the SUBJECT as the message `body` (a real
+  bug, not just a gap) - it now logs the actual HTML body, with `subject` in its own new column. Fixes
+  every caller at once (dashboard compose, automations, the assistant) since they all log through this
+  one function.
+- **F2.2 — Messages page:** new `/dashboard/messages` (list, newest first, customer/channel/direction/
+  status) and `/dashboard/messages/:id` (full text + provider response), linked from the per-customer
+  Communication History table (previously truncated at 120 characters with no way to see more) and
+  from a new "Messages" More-menu entry.
+- **F2.3 — no-customer messages:** `messages.customer_id` is now nullable (same table-rebuild approach
+  as `customer_files` in Section B) so a send-to-anyone message (F3) or a future unmatched inbound one
+  (F4, not built) can be stored and listed instead of failing to insert.
+- **F3 — send to anyone:** new assistant tool `send_email` - confirm-gated like `send_customer_message`,
+  but takes an arbitrary `to` address and an optional `customer_id` (only if the email is actually
+  about a specific customer). Logs every send, customer or not. No automatic BCC, per Andrew's standing
+  no. Gmail's ~500/day free-account limit is noted in the tool description; I have not independently
+  verified that figure against Google's current docs, per the instruction to verify before relying on
+  it - flagging as unconfirmed rather than asserting it.
+- **F4:** skipped entirely, per instruction.
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing

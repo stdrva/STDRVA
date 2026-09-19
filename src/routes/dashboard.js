@@ -441,7 +441,7 @@ function register(router, requireAuth) {
              ? `<table><tr><th>When</th><th>Ch.</th><th>Dir.</th><th>Message</th><th>Delivery</th></tr>${messages
                  .map(
                    (m) =>
-                     `<tr><td>${fmtDateTime(m.created_at)}</td><td>${escapeHtml(m.channel)}</td><td>${escapeHtml(m.direction)}</td><td>${escapeHtml((m.body || '').slice(0, 120))}</td><td>${escapeHtml(m.status || '')}</td></tr>`
+                     `<tr><td>${fmtDateTime(m.created_at)}</td><td>${escapeHtml(m.channel)}</td><td>${escapeHtml(m.direction)}</td><td><a href="/dashboard/messages/${m.id}">${escapeHtml((m.channel === 'email' ? email.htmlToText(m.body) : m.body || '').slice(0, 120))}</a></td><td>${escapeHtml(m.status || '')}</td></tr>`
                  )
                  .join('')}</table>`
              : '<p class="subtitle">No messages yet.</p>'
@@ -1694,6 +1694,55 @@ function register(router, requireAuth) {
     if (!customer) return res.redirect('/dashboard/files?err=Pick a customer#needs-review');
     db.setFileAssignment(f.id, { customer_id: customer.id, assignment_status: 'confirmed' });
     res.redirect(`/dashboard/files?ok=${encodeURIComponent('Filed under ' + customer.name)}#needs-review`);
+  });
+
+  // ---------- Messages: every send/receive, across all customers (spec F2.2) ----------
+  router.get('/dashboard/messages', requireAuth, (req, res) => {
+    const messages = db.listAllMessages({ limit: 200 });
+    const body = `
+      <h1>Messages</h1>
+      <p class="subtitle">Every message sent or received, newest first. The per-customer Communication History table (truncated to 120 characters) links here for the full text.</p>
+      <div class="panel">
+        ${
+          messages.length
+            ? `<table><tr><th>When</th><th>Customer</th><th>Ch.</th><th>Dir.</th><th>Preview</th><th>Status</th></tr>${messages
+                .map(
+                  (m) => `<tr>
+                    <td>${fmtDateTime(m.created_at)}</td>
+                    <td>${m.customer_id ? `<a href="/dashboard/customers/${m.customer_id}">${escapeHtml(m.customer_name || '')}</a>` : `<span class="subtitle" style="margin:0">${escapeHtml(m.to_address || 'no customer')}</span>`}</td>
+                    <td>${escapeHtml(m.channel)}</td>
+                    <td>${escapeHtml(m.direction)}</td>
+                    <td><a href="/dashboard/messages/${m.id}">${escapeHtml((m.subject || m.body || '').slice(0, 80))}</a></td>
+                    <td>${escapeHtml(m.status || '')}</td>
+                  </tr>`
+                )
+                .join('')}</table>`
+            : '<p class="subtitle">No messages yet.</p>'
+        }
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Messages', active: '/dashboard/messages', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.get('/dashboard/messages/:id', requireAuth, (req, res) => {
+    const m = db.getMessage(req.params.id);
+    if (!m) return res.status(404).send('Message not found');
+    const body = `
+      ${backLink('/dashboard/messages', 'All messages')}
+      <h1>Message</h1>
+      <div class="panel">
+        <p><strong>When:</strong> ${fmtDateTime(m.created_at)}<br>
+        <strong>Customer:</strong> ${m.customer_id ? `<a href="/dashboard/customers/${m.customer_id}">${escapeHtml(m.customer_name || '')}</a>` : 'None on file'}<br>
+        <strong>To:</strong> ${escapeHtml(m.to_address || '')}<br>
+        <strong>Channel:</strong> ${escapeHtml(m.channel)} · <strong>Direction:</strong> ${escapeHtml(m.direction)}<br>
+        <strong>Status:</strong> ${escapeHtml(m.status || '')}</p>
+        ${m.subject ? `<p><strong>Subject:</strong> ${escapeHtml(m.subject)}</p>` : ''}
+        <p><strong>Message:</strong></p>
+        <p style="white-space:pre-wrap;background:var(--bg);padding:10px;border-radius:8px">${escapeHtml(m.channel === 'email' ? email.htmlToText(m.body) : m.body || '')}</p>
+        ${m.provider_response ? `<p class="subtitle">Provider response: ${escapeHtml(m.provider_response)}</p>` : ''}
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Message', active: '/dashboard/messages', body, flash: flashFromQuery(req.query) }));
   });
 
   // ---------- Files search (across all customers + jobs) ----------
