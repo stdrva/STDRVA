@@ -241,7 +241,7 @@ function assistantWidget(context) {
       <div class="aw-controls">
         <button id="assistant-send" type="submit">Send</button>
         <label class="aw-file" title="Attach a photo / PDF / receipt">
-          <input type="file" name="file" accept=".pdf,.txt,.csv,.jpg,.jpeg,.png,.webp,.gif">📎
+          <input type="file" name="file" accept=".pdf,.txt,.csv,.xlsx,.jpg,.jpeg,.png,.webp,.gif">📎
         </label>
         <button type="button" id="aw-mic" class="aw-mic" title="Voice input" hidden>🎤</button>
         <button type="button" id="assistant-reset" class="aw-reset" title="New conversation">⟲</button>

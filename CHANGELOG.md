@@ -5,6 +5,23 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.7.2 (2026-09-19) — unassign_file tool, .xlsx uploads
+
+- **`unassign_file` tool:** new assistant tool that takes a file off whichever customer it's
+  currently filed under (`customer_id: null`, `assignment_status: 'needs_review'`) - for when a file
+  landed on the wrong record and there's no correct customer to move it to yet (if there is one, use
+  the existing `move_file_to_customer` instead). No `confirmed:true` needed - reversible via the Files
+  page. It reuses `db.setFileAssignment()` from Section B, so it automatically shows up in the Files
+  page's existing Needs Review panel - no new UI needed there.
+- **`.xlsx` uploads:** added to the assistant widget's file picker `accept` list. Checked first: Claude's
+  `document` content block only supports actual PDFs (confirmed against Anthropic's current docs) - an
+  `.xlsx` can't be "read the same way a PDF is read" because there is no such native path. Given that,
+  and per your choice, an uploaded `.xlsx` is stored and flagged for manual review, exactly like any
+  other file type the assistant can't parse (e.g. `.docx`) - it already fell through to that existing
+  branch once the file type was accepted; no other assistant.js logic needed to change.
+
+No other changes.
+
 ## 1.7.1 (2026-09-19) — Fix: mobile "More" menu didn't open
 
 `.nav-more-menu` switches from `position: absolute` (desktop) to `position: fixed` on mobile to

@@ -344,6 +344,18 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'unassign_file',
+    description:
+      "Remove a file from whichever customer it's currently filed under, leaving it with no customer. Use this when a file was attached to the wrong record and there's no correct customer to move it to yet - it lands in Needs Review on the Files page instead. Does not need Andrew's confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string' },
+      },
+      required: ['file_id'],
+    },
+  },
+  {
     name: 'save_file_extraction',
     description:
       "After reading an uploaded file, record what you found on it so it's searchable later. Pass a compact JSON object of the key fields (products and quantities, unit/total pricing, date sold, promised/due dates, customer name/address, invoice number, etc.) plus a plain-text version. This does NOT create any CRM records - it only annotates the file.",
@@ -1055,6 +1067,12 @@ function runTool(name, input) {
       db.setFileAssignment(input.file_id, { customer_id: customer.id, assignment_status: 'confirmed' });
       return { ok: true, file_id: input.file_id, customer_id: customer.id, customer_name: customer.name };
     }
+    case 'unassign_file': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file) return { error: 'File not found' };
+      db.setFileAssignment(input.file_id, { customer_id: null, assignment_status: 'needs_review', suggested_customer_id: null });
+      return { ok: true, file_id: input.file_id, customer_id: null };
+    }
     case 'save_file_extraction': {
       const file = db.getCustomerFile(input.file_id);
       if (!file) return { error: 'File not found' };
@@ -1242,8 +1260,10 @@ expense (a supplier invoice), propose the expense entry in plain text and wait f
 explicit confirmation before any confirmed:true call. There is no tool to create product /
 factory-order lines from a document - do not propose or offer to create one; tell Andrew
 product lines are added from the job page. Use attach_file_to_job to tie a file to the right
-job, and move_file_to_customer to re-file a file that landed under the wrong customer (or no
-customer). Use search_files to find an existing document Andrew refers to.
+job, move_file_to_customer to re-file a file that landed under the wrong customer (or no
+customer), and unassign_file to take a file off a customer entirely (it lands in Needs Review
+on the Files page) when there's no correct customer to move it to yet. Use search_files to find
+an existing document Andrew refers to.
 
 You can see the recent conversation, so pronouns and follow-ups ("her", "that job", "do the
 same for the other one") refer back to what was already discussed - use that context instead
