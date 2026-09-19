@@ -468,6 +468,19 @@ CREATE TABLE IF NOT EXISTS sales_consultants (
   db.exec('PRAGMA foreign_keys = ON;');
 })();
 
+// ---- Migration: appointments get a private public_token (like jobs already
+// have) and a separate `confirmed` flag (spec G2.4) - NOT a new status value,
+// since much of the app filters on status = 'scheduled'. Additive/backfilled. ----
+(function migrateAppointmentsTokenAndConfirmed() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(appointments)`).all().map((c) => c.name));
+  if (!existing.has('public_token')) db.exec(`ALTER TABLE appointments ADD COLUMN public_token TEXT`);
+  if (!existing.has('confirmed')) db.exec(`ALTER TABLE appointments ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0`);
+  const missingToken = db.prepare(`SELECT id FROM appointments WHERE public_token IS NULL`).all();
+  for (const row of missingToken) {
+    db.prepare(`UPDATE appointments SET public_token = ? WHERE id = ?`).run(newToken(), row.id);
+  }
+})();
+
 // ---- Migration: messages.customer_id must be NULLABLE (spec F2.3) - a
 // send-to-anyone message (F3) or an inbound message from an unrecognized
 // sender has no customer to attach to. Same rebuild approach as
@@ -782,10 +795,11 @@ function updateLead(id, { estimate_value, notes, source }) {
 function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes, created_by, consultant_id }) {
   const id = newId();
   const ts = nowIso();
+  const token = newToken();
   db.prepare(
-    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at, updated_at, created_by, consultant_id)
-     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?, ?, ?, ?)`
-  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, ts, ts, created_by || 'user', consultant_id || null);
+    `INSERT INTO appointments (id, customer_id, lead_id, type, scheduled_at, duration_min, status, reminder_sent, notes, created_at, updated_at, created_by, consultant_id, public_token, confirmed)
+     VALUES (?,?,?,?,?,?, 'scheduled', 0, ?, ?, ?, ?, ?, ?, 0)`
+  ).run(id, customer_id, lead_id || null, type || 'Consultation', scheduled_at, duration_min || 60, notes || null, ts, ts, created_by || 'user', consultant_id || null, token);
   logActivity({
     entity_type: 'appointment',
     entity_id: id,
@@ -798,6 +812,13 @@ function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_
 }
 function getAppointment(id) {
   return db.prepare(`SELECT * FROM appointments WHERE id = ?`).get(id);
+}
+function getAppointmentByToken(token) {
+  return db.prepare(`SELECT * FROM appointments WHERE public_token = ?`).get(token);
+}
+function confirmAppointment(id) {
+  db.prepare(`UPDATE appointments SET confirmed = 1 WHERE id = ?`).run(id);
+  return getAppointment(id);
 }
 function listAppointments({ upcomingOnly } = {}) {
   let sql = `SELECT appointments.*, customers.name as customer_name, customers.phone as customer_phone, customers.email as customer_email
@@ -2431,6 +2452,8 @@ module.exports = {
   updateLead,
   createAppointment,
   getAppointment,
+  getAppointmentByToken,
+  confirmAppointment,
   listAppointments,
   listAppointmentsBetween,
   markReminderSent,

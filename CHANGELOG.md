@@ -167,6 +167,27 @@ below that carry a `-beta.N` suffix predate that decision.
   it - flagging as unconfirmed rather than asserting it.
 - **F4:** skipped entirely, per instruction.
 
+- **G — automated customer emails/texts (partial scope, per instruction):** built only the
+  confirmation email, the Confirm/Change/Cancel links, and the reminder's cabinet-prep line. Reviews/
+  referrals, the info-page link, and the product email (G3) are explicitly skipped for this pass.
+  - **G1 confirmation** (`onAppointmentBooked`): now says where (the customer's address) and how long
+    (`formatDuration(duration_min)`, e.g. "about 90 minutes"), not just service and time. Subject is
+    "You're booked: [type], [date and time]"; body invites a reply for changes (replies land in the
+    Gmail inbox, unread by the BOS until F4). SMS got the same address addition, kept short, plus the
+    business phone number.
+  - **G2 private links** (`appointments.public_token`, new column, same pattern as `jobs.public_token`,
+    backfilled for existing rows): new `GET /appointment/:token` shows the appointment with Confirm/
+    Change/Cancel. **Confirm** (`POST .../confirm`) sets a new `appointments.confirmed` flag only -
+    never touches `status`, since most of the app filters on `status = 'scheduled'`. **Change**
+    (`GET .../change`) redirects to `/book` prefilled with the customer's name/phone/email/address and
+    appointment type - does not itself cancel the original slot. **Cancel** requires an explicit POST
+    (a confirmation page renders on GET first) - sets the existing `'canceled'` status (frees the slot
+    via the same filtering every other cancel path already relies on - no new status) and notifies
+    Andrew via `notifyOwner`.
+  - **G2 cabinet-prep line**: added to the reminder email/text ("you do not need to empty your
+    cabinets... basic access is fine"), alongside the new appointment link.
+  - **G3 (product email):** skipped entirely, per instruction - nothing built.
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing

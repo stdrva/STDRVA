@@ -6,6 +6,7 @@ const { sendSms } = require('./sms');
 const { sendEmail } = require('./email');
 
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
+const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
 
 // Canonical public base URL for anything a CUSTOMER sees - booking links, QR
 // codes, status-page links, links inside texts/emails. Never expose localhost
@@ -36,6 +37,17 @@ function bookingUrl() {
 
 function statusUrl(token) {
   return `${baseUrl()}/status/${token}`;
+}
+
+function appointmentUrl(token) {
+  return `${baseUrl()}/appointment/${token}`;
+}
+
+// "about 1 hour", "about 90 minutes" - reused by the confirmation email (G1).
+function formatDuration(min) {
+  if (!min) return '';
+  if (min % 60 === 0) return `${min / 60} hour${min === 60 ? '' : 's'}`;
+  return `${min} minutes`;
 }
 
 // Notifies Andrew himself (not the customer) - used for anything that needs
@@ -127,8 +139,12 @@ async function onJobStatusChanged(job, customer, status) {
   });
 }
 
-// Fired by the reminders scheduler ahead of an appointment.
+// Fired by the reminders scheduler ahead of an appointment. Carries the extras
+// the plain booking confirmation doesn't (spec G2): a cabinet-prep line, and
+// private Confirm / Change / Cancel links. Reviews/referrals and the info-page
+// link are explicitly out of scope for this pass.
 async function onAppointmentReminder(appt) {
+  const fullCustomer = db.getCustomer(appt.customer_id) || {};
   const customer = { id: appt.customer_id, name: appt.customer_name, phone: appt.customer_phone, email: appt.customer_email };
   const when = new Date(appt.scheduled_at).toLocaleString('en-US', {
     weekday: 'short',
@@ -137,15 +153,24 @@ async function onAppointmentReminder(appt) {
     hour: 'numeric',
     minute: '2-digit',
   });
-  const body = `Reminder from ${BUSINESS_NAME}: you have a "${appt.type}" appointment on ${when}. Reply if you need to reschedule.`;
-  return notifyCustomer(customer, {
+  const link = appointmentUrl(appt.public_token);
+  const body = `Reminder from ${BUSINESS_NAME}: you have a "${appt.type}" appointment on ${when}. No need to empty your cabinets - basic access is fine. Confirm, change, or cancel: ${link}`;
+  const emailHtml = `<p>Hi ${customer.name},</p>
+    <p>This is a reminder of your upcoming appointment:</p>
+    <p><strong>${appt.type}</strong><br>${when}</p>
+    <p>You don't need to empty out your cabinets before we come by - basic access to the space is all we need.</p>
+    <p><a href="${link}">Confirm, change, or cancel this appointment</a></p>
+    <p>${BUSINESS_NAME}</p>`;
+  return notifyCustomer(fullCustomer.id ? fullCustomer : customer, {
     smsBody: body,
     emailSubject: `Reminder: your ${BUSINESS_NAME} appointment - ${when}`,
-    emailHtml: `<p>Hi ${customer.name},</p><p>This is a reminder of your upcoming appointment:</p><p><strong>${appt.type}</strong><br>${when}</p><p>Reply to this message or call us if you need to reschedule.</p>`,
+    emailHtml,
   });
 }
 
 // Fired when a customer books their own appointment via the public page.
+// Template is deliberately simple (spec G1) but no longer bare - it now says
+// where and how long, and how to reach a person if something's wrong.
 async function onAppointmentBooked(appt, customer) {
   const when = new Date(appt.scheduled_at).toLocaleString('en-US', {
     weekday: 'short',
@@ -154,11 +179,14 @@ async function onAppointmentBooked(appt, customer) {
     hour: 'numeric',
     minute: '2-digit',
   });
-  const body = `You're booked with ${BUSINESS_NAME}: "${appt.type}" on ${when}. We'll send a reminder before your appointment.`;
+  const firstName = (customer.name || '').split(' ')[0];
+  const address = customer.address || 'the address on file';
+  const duration = formatDuration(appt.duration_min);
+  const body = `You're booked with ${BUSINESS_NAME}: "${appt.type}" on ${when} at ${address}. Questions? Call ${BUSINESS_PHONE}.`;
   return notifyCustomer(customer, {
     smsBody: body,
-    emailSubject: `Booking confirmed - ${BUSINESS_NAME}`,
-    emailHtml: `<p>Hi ${customer.name},</p><p>You're booked!</p><p><strong>${appt.type}</strong><br>${when}</p><p>We'll send a reminder before your appointment.</p>`,
+    emailSubject: `You're booked: ${appt.type}, ${when}`,
+    emailHtml: `<p>Hi ${firstName},</p><p>You're booked for a ${appt.type} on ${when} at ${address}. It runs about ${duration}.</p><p>Need to change the time? Just reply to this email.</p><p>Andrew<br>${BUSINESS_NAME}</p>`,
   });
 }
 
@@ -175,4 +203,5 @@ module.exports = {
   baseUrlIsLocal,
   bookingUrl,
   statusUrl,
+  appointmentUrl,
 };

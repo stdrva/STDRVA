@@ -1132,6 +1132,98 @@ function register(router) {
     `;
     res.send(publicLayout({ title: 'Your project status', body }));
   });
+
+  // ---------- Appointment self-service: Confirm / Change / Cancel (spec G2.4) ----------
+  // Each appointment has its own private token (separate from the job token).
+  // Confirm only sets a `confirmed` flag - never the status field, since most
+  // of the app filters on status = 'scheduled'. Cancel requires an explicit
+  // POST (never fires from a bare GET, which an email client's own link
+  // scanner could otherwise trigger) and frees the slot via the existing
+  // 'canceled' status - no new status value.
+  function notFoundAppointment(res) {
+    return res.status(404).send(publicLayout({ title: 'Not found', body: `<div class="panel"><p>We couldn't find that appointment. Double check the link, or contact us.</p></div>` }));
+  }
+
+  router.get('/appointment/:token', (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    const customer = db.getCustomer(appt.customer_id);
+    const when = fmtSlotLong(new Date(appt.scheduled_at));
+    const canAct = appt.status === 'scheduled';
+    const body = `
+      <div class="public-hero">
+        <h1>Your appointment</h1>
+      </div>
+      <div class="panel review-card">
+        <div class="review-row"><span>Service</span><strong>${escapeHtml(appt.type)}</strong></div>
+        <div class="review-row"><span>When</span><strong>${escapeHtml(when)}</strong></div>
+        <div class="review-row"><span>Status</span><strong>${escapeHtml(appt.status)}${appt.confirmed ? ' · confirmed' : ''}</strong></div>
+      </div>
+      ${
+        canAct
+          ? `<div class="panel" style="display:flex;gap:10px;flex-wrap:wrap">
+              <form method="POST" action="/appointment/${appt.public_token}/confirm"><button class="btn" type="submit">${appt.confirmed ? 'Confirmed ✓' : 'Confirm'}</button></form>
+              <a class="btn secondary" href="/appointment/${appt.public_token}/change">Change</a>
+              <a class="btn secondary" href="/appointment/${appt.public_token}/cancel">Cancel</a>
+            </div>`
+          : `<div class="panel"><p class="subtitle" style="margin:0">This appointment is ${escapeHtml(appt.status)} - contact us if that's not right.</p></div>`
+      }
+    `;
+    res.send(publicLayout({ title: 'Your appointment', body }));
+  });
+
+  router.post('/appointment/:token/confirm', (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    if (appt.status === 'scheduled') db.confirmAppointment(appt.id);
+    res.redirect(`/appointment/${appt.public_token}`);
+  });
+
+  router.get('/appointment/:token/change', (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    const customer = db.getCustomer(appt.customer_id);
+    const qs = contactQS({ type: appt.type, name: customer.name, phone: customer.phone, email: customer.email, address: customer.address });
+    res.redirect(`/book?${qs}`);
+  });
+
+  router.get('/appointment/:token/cancel', (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    if (appt.status !== 'scheduled') return res.redirect(`/appointment/${appt.public_token}`);
+    const when = fmtSlotLong(new Date(appt.scheduled_at));
+    const body = `
+      <div class="public-hero"><h1>Cancel this appointment?</h1></div>
+      <div class="panel review-card">
+        <div class="review-row"><span>Service</span><strong>${escapeHtml(appt.type)}</strong></div>
+        <div class="review-row"><span>When</span><strong>${escapeHtml(when)}</strong></div>
+      </div>
+      <div class="panel" style="display:flex;gap:10px">
+        <form method="POST" action="/appointment/${appt.public_token}/cancel"><button class="btn danger" type="submit">Yes, cancel it</button></form>
+        <a class="btn secondary" href="/appointment/${appt.public_token}">Never mind</a>
+      </div>
+    `;
+    res.send(publicLayout({ title: 'Cancel appointment', body }));
+  });
+
+  router.post('/appointment/:token/cancel', async (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    if (appt.status === 'scheduled') {
+      db.updateAppointmentStatus(appt.id, 'canceled');
+      const customer = db.getCustomer(appt.customer_id);
+      try {
+        await automations.notifyOwner({
+          smsBody: `${customer ? customer.name : 'A customer'} canceled their ${appt.type} appointment (was ${fmtSlotLong(new Date(appt.scheduled_at))}).`,
+          emailSubject: `Appointment canceled: ${customer ? customer.name : 'customer'}`,
+          emailHtml: `<p>${escapeHtml(customer ? customer.name : 'A customer')} canceled their <strong>${escapeHtml(appt.type)}</strong> appointment (was ${escapeHtml(fmtSlotLong(new Date(appt.scheduled_at)))}).</p>`,
+        });
+      } catch (e) {
+        console.error('cancel notifyOwner failed', e);
+      }
+    }
+    res.redirect(`/appointment/${appt.public_token}`);
+  });
 }
 
 module.exports = {
