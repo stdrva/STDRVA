@@ -54,14 +54,15 @@ below that carry a `-beta.N` suffix predate that decision.
   send", mobile float-over) need a reproduction, not a guess.
 
 - **C1:** removed the "We come to your home..." helper paragraph under the address field.
-- **C2 — times list + stale CSS:** `.slot-cards` is now a vertical flex list (one full-width row per
-  option) instead of a `grid(auto-fit)`, which is what was rendering as underlined text run together
-  on narrow screens. Checked `public/sw.js`: it registers ONLY from `dashboardLayout` (the internal
-  dashboard) - `publicLayout` (used by `/book`) never registers a service worker at all, so SW
-  staleness was not actually the cause of the `/book` symptom. Switched `/static/` to network-first
-  anyway (falls back to cache only when the network fails) since it's a real bug for the dashboard
-  pages that DO register the SW, where the cache name never changes between deploys. If stale `/book`
-  CSS recurs, the next suspect is the browser's own HTTP cache on `style.css` (no `Cache-Control`
+- **C2 — stale CSS caching only:** available times work correctly on the live layout as of this pass -
+  confirmed with Andrew, so `.slot-cards`/`.slot-card` are left exactly as they were (the earlier draft
+  of this entry that converted them to a vertical list was reverted). Checked `public/sw.js`: it
+  registers ONLY from `dashboardLayout` (the internal dashboard) - `publicLayout` (used by `/book`)
+  never registers a service worker at all, so SW staleness was not actually the cause of the original
+  `/book` report anyway. Switched `/static/` to network-first regardless (falls back to cache only when
+  the network fails), since it's a real bug for the dashboard pages that DO register the SW, where the
+  cache name never changes between deploys. If stale `/book` CSS recurs, the next suspect is the
+  browser's own HTTP cache on `style.css` (no `Cache-Control`
   header is set in `router.js`'s static file serving) - flagging for later, not changed here.
 - **C3 — split address fields:** the single free-text address textarea is now four fields (street,
   city, state, ZIP) with `address-line1` / `address-level2` / `address-level1` / `postal-code`

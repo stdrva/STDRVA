@@ -192,14 +192,11 @@ textarea { min-height: 70px; }
 
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
 
-/* Booking: the four spread time options (spec 3) - one full-width row each
-   (spec C2), not a grid, so they read as separate tappable buttons instead of
-   inline text on a phone-width screen. */
-.slot-cards { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+/* Booking: the four spread time options (spec 3) */
+.slot-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 6px; }
 .slot-card {
-  display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 10px;
-  width: 100%; box-sizing: border-box;
-  border: 2px solid var(--line); background: #fff; border-radius: 10px; padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 3px; align-items: flex-start;
+  border: 2px solid var(--line); background: #fff; border-radius: 10px; padding: 14px 14px;
   text-decoration: none; color: inherit; transition: all 0.15s ease;
 }
 .slot-card:hover { border-color: var(--gold); background: #fffbf0; box-shadow: 0 2px 8px rgba(217,166,40,0.15); }
