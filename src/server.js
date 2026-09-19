@@ -60,6 +60,15 @@ server.listen(PORT, () => {
   console.log(`Public base URL: ${base}`);
   console.log(`Dashboard:    ${base}/dashboard`);
   console.log(`Booking page: ${base}/book\n`);
+  // Log-only (spec H) - confirms what time zone this process is actually
+  // running in, so a 9 AM / 5 AM discrepancy can be diagnosed from the Render
+  // logs. Does not change how any date/time is computed, stored, or
+  // displayed, and touches no existing appointment.
+  console.log(
+    `[startup] Server clock: ${new Date().toString()} | ` +
+      `resolved time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone} | ` +
+      `TZ env var: ${process.env.TZ || '(unset)'}\n`
+  );
   if (automations.baseUrlIsLocal() && process.env.NODE_ENV === 'production') {
     console.warn(
       '[config] WARNING: running in production but the public base URL is still localhost. ' +

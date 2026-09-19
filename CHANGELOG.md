@@ -5,7 +5,7 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
-## 1.7.0 (pending) — Sep 18 update batch (sections A-H)
+## 1.7.0 (2026-09-18) — Sep 18 update batch (sections A-H)
 
 - **A — `[hidden]` vs `.btn`/`.aw-mic`:** added a global `[hidden] { display: none !important; }` rule
   (`public/css/style.css`). Fixes the discovery wizard's `Back`/`Next`/`Submit` buttons (all `class="btn"`,
@@ -187,6 +187,11 @@ below that carry a `-beta.N` suffix predate that decision.
   - **G2 cabinet-prep line**: added to the reminder email/text ("you do not need to empty your
     cabinets... basic access is fine"), alongside the new appointment link.
   - **G3 (product email):** skipped entirely, per instruction - nothing built.
+
+- **H — startup time-zone log (log-only, per instruction):** the server now logs its actual clock,
+  resolved IANA time zone, and `TZ` env var once on startup. No time-zone behavior, appointment data,
+  or date/time computation was changed - this only makes the server's actual time zone visible in the
+  Render logs so the 9 AM / 5 AM question can be confirmed before anything is touched.
 
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
