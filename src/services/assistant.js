@@ -265,7 +265,7 @@ const BASE_TOOLS = [
   },
   {
     name: 'get_job_detail',
-    description: 'Full detail on one job: its line items/products, every payment made against it, and its remaining balance.',
+    description: 'Full detail on one job: every payment made against it and its remaining balance. Does not include factory-order/product lines - that data exists but is not exposed to the assistant right now.',
     input_schema: {
       type: 'object',
       properties: { job_id: { type: 'string' } },
@@ -354,6 +354,21 @@ const BASE_TOOLS = [
         extracted_text: { type: 'string', description: 'A plain-text summary of the document contents, for search.' },
       },
       required: ['file_id', 'extracted_text'],
+    },
+  },
+  {
+    name: 'create_job',
+    description:
+      "Create a job directly. Normally a job is created automatically by marking a lead Sold on the dashboard - use this only for the rare case a job needs to exist without that (e.g. Andrew describes a job that was somehow never created). Call find_customers first to resolve customer_id. This writes real data: state the exact customer and sold amount back to Andrew and wait for his explicit confirmation, then call with confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        sold_amount: { type: 'number' },
+        notes: { type: 'string' },
+        confirmed: { type: 'boolean', description: 'Only true once Andrew has explicitly confirmed this exact job.' },
+      },
+      required: ['customer_id', 'confirmed'],
     },
   },
   {
@@ -767,10 +782,9 @@ function runTool(name, input) {
     case 'get_job_detail': {
       const job = db.getJob(input.job_id);
       if (!job) return { error: 'Job not found' };
-      const products = db.listProductsForJob(input.job_id);
       const payments = db.listPayments({}).filter((p) => p.job_id === input.job_id);
       const balance_due = db.getJobBalance(input.job_id);
-      return { job, products, payments, balance_due };
+      return { job, payments, balance_due };
     }
     case 'list_production_queue': {
       return { queue: db.listProductionQueue({ includeDelivered: input.includeDelivered }) };
@@ -1022,6 +1036,15 @@ function runTool(name, input) {
       });
       return { ok: true, file_id: input.file_id, customer_id: file.customer_id };
     }
+    case 'create_job': {
+      if (input.confirmed !== true) {
+        return { error: 'Not created - restate the exact customer and sold amount and wait for Andrew to confirm before calling this again.' };
+      }
+      const customer = db.getCustomer(input.customer_id);
+      if (!customer) return { error: 'Customer not found' };
+      const job = db.createJob({ customer_id: customer.id, sold_amount: input.sold_amount, notes: input.notes });
+      return { ok: true, job, customer_id: customer.id };
+    }
     case 'update_job': {
       if (input.confirmed !== true) {
         return { error: 'Not changed - restate the exact change (sold amount and/or status) and wait for Andrew to confirm before calling this again.' };
@@ -1029,11 +1052,7 @@ function runTool(name, input) {
       const job = db.getJob(input.job_id);
       if (!job) return { error: 'Job not found' };
       if (input.sold_amount !== undefined && input.sold_amount !== null) {
-        db.db.prepare(`UPDATE jobs SET sold_amount = ?, updated_at = ? WHERE id = ?`).run(
-          Number(input.sold_amount),
-          new Date().toISOString(),
-          input.job_id
-        );
+        db.updateJobSoldAmount(input.job_id, input.sold_amount);
       }
       if (input.status && input.status !== job.status) {
         db.updateJobStatus(input.job_id, input.status, input.note || 'Updated via assistant');
@@ -1177,7 +1196,7 @@ Financial reasoning rules - these matter more than being fast:
   that a job's remaining balance is due the day of its Install appointment. A job with no
   Install scheduled yet has no known due date - report that plainly ("no install scheduled,
   timing unknown") instead of estimating one.
-- log_payment, log_expense, and update_job are real writes. Before calling
+- log_payment, log_expense, create_job, and update_job are real writes. Before calling
   any of them, state the exact entry (amount, category/vendor, method, date; or the product
   line; or the job change) back to Andrew in plain text and wait for him to confirm in a
   later message - then, and only then, call the tool with confirmed:true. Never set

@@ -12,6 +12,7 @@ const {
   formatPhone,
   telHref,
   newId,
+  humanizeActivityValue,
 } = require('../util');
 const automations = require('../services/automations');
 const assistant = require('../services/assistant');
@@ -122,10 +123,30 @@ function register(router, requireAuth) {
     // Attention: open follow-ups (overdue first) + missed appointments.
     const openF = db.listOpenFollowups();
     const missed = db.listPastUncompletedAppointments();
+    // Real action buttons directly on each item (spec E8) - previously these
+    // only existed on the customer's own page, so an item here (regardless of
+    // whether its due date was set manually, by the AI, or by an automatic
+    // trigger) could go stale indefinitely with no way to close it from here.
     const attn = [
       ...openF.map((f) => ({
         overdue: f.due_at && new Date(f.due_at) < new Date(),
-        html: `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name)}</a> — ${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}`,
+        html: `<div><a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name)}</a> — ${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}
+          ${f.waiting_on ? `<span class="badge">waiting on: ${escapeHtml(f.waiting_on)}</span>` : ''}</div>
+          <div class="attn-actions" style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="done"><input type="hidden" name="return_to" value="/dashboard"><button class="btn small" type="submit">Done</button></form>
+            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="dismissed"><input type="hidden" name="return_to" value="/dashboard"><button class="btn small secondary" type="submit">Dismiss</button></form>
+            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/snooze" style="display:flex;gap:4px;align-items:center">
+              <input type="hidden" name="return_to" value="/dashboard">
+              <input type="date" name="due_at" style="width:auto;padding:4px" title="Snooze / reschedule to">
+              <button class="btn small secondary" type="submit">Snooze</button>
+            </form>
+            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/waiting" style="display:flex;gap:4px;align-items:center">
+              <input type="hidden" name="return_to" value="/dashboard">
+              <input type="text" name="waiting_on" value="${escapeHtml(f.waiting_on || '')}" placeholder="Waiting on…" style="width:120px;padding:4px">
+              <button class="btn small secondary" type="submit">Set</button>
+            </form>
+            <a class="btn-link" href="/dashboard/customers/${f.customer_id}">Edit</a>
+          </div>`,
       })),
       ...missed.map((a) => ({
         overdue: true,
@@ -178,7 +199,7 @@ function register(router, requireAuth) {
               ? `<table><tr><th>When</th><th>Customer</th><th>What</th></tr>${acts
                   .map(
                     (a) =>
-                      `<tr><td>${fmtDateTime(a.created_at)}</td><td>${a.customer_id ? `<a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name || '')}</a>` : ''}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(String(a.new_value).slice(0, 40)) : ''}</td></tr>`
+                      `<tr><td>${fmtDateTime(a.created_at)}</td><td>${a.customer_id ? `<a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name || '')}</a>` : ''}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(humanizeActivityValue(a.new_value).slice(0, 40)) : ''}</td></tr>`
                   )
                   .join('')}</table>`
               : '<p class="subtitle">No activity yet.</p>';
@@ -271,7 +292,6 @@ function register(router, requireAuth) {
     const c = db.getCustomer(req.params.id);
     if (!c) return res.status(404).send('Customer not found');
     const jobs = db.listJobs().filter((j) => j.customer_id === c.id);
-    const activeJobs = jobs.filter((j) => j.status !== 'Complete');
     const appts = db.listAppointmentsForCustomer(c.id);
     const messages = db.listMessagesForCustomer(c.id).slice().reverse();
     const files = db.listCustomerFiles(c.id);
@@ -324,19 +344,28 @@ function register(router, requireAuth) {
     const openFollowupList = openFollowups.length
       ? `<ul style="margin:8px 0 0;padding-left:0;list-style:none">${openFollowups
           .map(
-            (f) => `<li style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)">
-              <span class="${f.due_at && new Date(f.due_at) < new Date() ? 'overdue' : ''}">${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}</span>
-              <span style="white-space:nowrap">
+            (f) => `<li style="padding:6px 0;border-bottom:1px solid var(--line)">
+              <div class="${f.due_at && new Date(f.due_at) < new Date() ? 'overdue' : ''}">${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}
+                ${f.waiting_on ? `<span class="badge">waiting on: ${escapeHtml(f.waiting_on)}</span>` : ''}</div>
+              <div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
                 <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="done"><button class="btn small" type="submit">Done</button></form>
                 <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="dismissed"><button class="btn small secondary" type="submit">Dismiss</button></form>
-              </span>
+                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/snooze" style="display:flex;gap:4px;align-items:center">
+                  <input type="date" name="due_at" style="width:auto;padding:4px" title="Snooze / reschedule to">
+                  <button class="btn small secondary" type="submit">Snooze</button>
+                </form>
+                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/waiting" style="display:flex;gap:4px;align-items:center">
+                  <input type="text" name="waiting_on" value="${escapeHtml(f.waiting_on || '')}" placeholder="Waiting on…" style="width:120px;padding:4px">
+                  <button class="btn small secondary" type="submit">Set</button>
+                </form>
+              </div>
             </li>`
           )
           .join('')}</ul>`
       : '<p class="subtitle" style="margin:8px 0 0">No open follow-ups.</p>';
 
-    const jobsBlock = activeJobs.length
-      ? activeJobs
+    const jobsBlock = jobs.length
+      ? jobs
           .map(
             (j) => `<div class="panel" style="margin-bottom:10px">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
@@ -386,14 +415,26 @@ function register(router, requireAuth) {
          ${!emailOn ? '<div class="msg err" style="margin:0 0 10px">Email NOT CONFIGURED — set GMAIL_USER / GMAIL_APP_PASSWORD. Messages below are recorded but not delivered.</div>' : ''}
          <form method="POST" action="/dashboard/customers/${c.id}/message">
            <label>Channel</label>
-           <select name="channel">
+           <select name="channel" id="message-channel">
              <option value="sms" ${c.phone ? '' : 'disabled'}>Text (SMS)${c.phone ? '' : ' — no phone on file'}</option>
              <option value="email" ${c.email ? '' : 'disabled'}>Email${c.email ? '' : ' — no email on file'}</option>
            </select>
+           <div id="message-subject-row">
+             <label>Subject (email only)</label>
+             <input type="text" name="subject" placeholder="Message from ${escapeHtml(require('../render').BUSINESS_NAME)}">
+           </div>
            <label>Message</label>
            <textarea name="body" id="send-email" placeholder="Type a message…" required></textarea>
            <div style="margin-top:10px"><button class="btn" type="submit">Send &amp; record</button></div>
          </form>
+         <script>
+           (function () {
+             var sel = document.getElementById('message-channel');
+             var subjectRow = document.getElementById('message-subject-row');
+             function sync() { if (subjectRow) subjectRow.style.display = sel && sel.value === 'email' ? '' : 'none'; }
+             if (sel) { sel.addEventListener('change', sync); sync(); }
+           })();
+         </script>
          <h3>Communication history</h3>
          ${
            messages.length
@@ -547,7 +588,7 @@ function register(router, requireAuth) {
              ? `<ul class="timeline">${stageHistory
                  .map(
                    (h) =>
-                     `<li class="done"><div class="status">${escapeHtml(h.field)}: ${escapeHtml(h.old_value || '—')} → ${escapeHtml(h.new_value || '—')}</div><div class="when">${fmtDateTime(h.created_at)} · ${escapeHtml(h.actor)}${h.note ? ' · ' + escapeHtml(h.note) : ''}</div></li>`
+                     `<li class="done"><div class="status">${escapeHtml(h.field)}: ${escapeHtml(humanizeActivityValue(h.old_value) || '—')} → ${escapeHtml(humanizeActivityValue(h.new_value) || '—')}</div><div class="when">${fmtDateTime(h.created_at)} · ${escapeHtml(h.actor)}${h.note ? ' · ' + escapeHtml(h.note) : ''}</div></li>`
                  )
                  .join('')}</ul>`
              : '<p class="subtitle">No stage changes recorded yet.</p>'
@@ -556,7 +597,7 @@ function register(router, requireAuth) {
          <table><tr><th>When</th><th>What</th><th>By</th></tr>${activity
            .map(
              (a) =>
-               `<tr><td>${fmtDateTime(a.created_at)}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(String(a.new_value).slice(0, 60)) : ''}</td><td>${escapeHtml(a.actor)}</td></tr>`
+               `<tr><td>${fmtDateTime(a.created_at)}</td><td>${escapeHtml(a.field || a.entity_type)}${a.new_value ? ': ' + escapeHtml(humanizeActivityValue(a.new_value).slice(0, 60)) : ''}</td><td>${escapeHtml(a.actor)}</td></tr>`
            )
            .join('')}</table>
          <h3>Closed follow-ups</h3>
@@ -616,6 +657,20 @@ function register(router, requireAuth) {
     const status = req.body.status === 'dismissed' ? 'dismissed' : 'done';
     db.closeFollowup(f.id, status, actorOf(req));
     res.redirect(`${req.body.return_to || `/dashboard/customers/${f.customer_id}`}?ok=Follow-up ${status}`);
+  });
+
+  router.post('/dashboard/followups/:id/snooze', requireAuth, (req, res) => {
+    const f = db.getFollowup(req.params.id);
+    if (!f) return res.status(404).send('Not found');
+    if (req.body.due_at) db.setFollowupDueDate(f.id, new Date(req.body.due_at).toISOString(), actorOf(req));
+    res.redirect(`${req.body.return_to || `/dashboard/customers/${f.customer_id}`}?ok=Follow-up rescheduled`);
+  });
+
+  router.post('/dashboard/followups/:id/waiting', requireAuth, (req, res) => {
+    const f = db.getFollowup(req.params.id);
+    if (!f) return res.status(404).send('Not found');
+    db.setFollowupWaiting(f.id, req.body.waiting_on, actorOf(req));
+    res.redirect(`${req.body.return_to || `/dashboard/customers/${f.customer_id}`}?ok=Updated`);
   });
 
   // ---------- Marketing attribution (append-only) ----------
@@ -853,13 +908,13 @@ function register(router, requireAuth) {
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {
     const c = db.getCustomer(req.params.id);
     if (!c) return res.status(404).send('Customer not found');
-    const { channel, body } = req.body;
+    const { channel, body, subject } = req.body;
     if (!body || !body.trim()) return res.redirect(`/dashboard/customers/${c.id}?err=Message is empty`);
     let result;
     if (channel === 'email') {
       result = await email.sendEmail({
         to: c.email,
-        subject: `Message from ${require('../render').BUSINESS_NAME}`,
+        subject: (subject && subject.trim()) || `Message from ${require('../render').BUSINESS_NAME}`,
         html: `<p>${escapeHtml(body).replace(/\n/g, '<br>')}</p>`,
         customer_id: c.id,
         logMessage: db.logMessage,
@@ -1443,9 +1498,10 @@ function register(router, requireAuth) {
     const jobs = db.listJobs();
     const body = `
       <h1>Jobs</h1>
-      <p class="subtitle">Created automatically when a lead is marked "Sold". Each has a customer-facing status link.</p>
+      <p class="subtitle">Usually created automatically when a lead is marked "Sold" - can also be added directly below. Each has a customer-facing status link.</p>
       <div class="panel">
-        <table>
+        <a class="btn" href="/dashboard/jobs/new">+ Add job</a>
+        <table style="margin-top:14px">
           <tr><th>Customer</th><th>Status</th><th>Amount</th><th>Updated</th><th></th></tr>
           ${jobs
             .map(
@@ -1455,7 +1511,7 @@ function register(router, requireAuth) {
               <td>${escapeHtml(j.status)}</td>
               <td>${j.sold_amount ? fmtMoney(j.sold_amount) : ''}</td>
               <td>${fmtDate(j.updated_at)}</td>
-              <td><a class="btn small secondary" href="/dashboard/jobs/${j.id}">Open</a></td>
+              <td><a class="btn small secondary" href="/dashboard/jobs/${j.id}">Edit</a></td>
             </tr>`
             )
             .join('')}
@@ -1466,6 +1522,41 @@ function register(router, requireAuth) {
     res.send(dashboardLayout({ title: 'Jobs', active: '/dashboard/jobs', body, flash: flashFromQuery(req.query) }));
   });
 
+  router.get('/dashboard/jobs/new', requireAuth, (req, res) => {
+    const customers = db.listCustomers();
+    const body = `
+      ${backLink('/dashboard/jobs', 'All jobs')}
+      <h1>Add a job</h1>
+      <p class="subtitle">For the rare case a job needs to exist without a lead being marked Sold first (the normal path).</p>
+      <div class="panel">
+        <form method="POST" action="/dashboard/jobs">
+          <label>Customer *</label>
+          <select name="customer_id" required>
+            <option value="">Pick a customer…</option>
+            ${customers.map((c) => `<option value="${c.id}" ${c.id === req.query.customer_id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
+          </select>
+          <label>Sold amount ($)</label>
+          <input type="number" step="0.01" name="sold_amount">
+          <label>Notes</label>
+          <input type="text" name="notes">
+          <div style="margin-top:12px"><button class="btn" type="submit">Create job</button></div>
+        </form>
+      </div>
+    `;
+    res.send(dashboardLayout({ title: 'Add job', active: '/dashboard/jobs', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/jobs', requireAuth, (req, res) => {
+    const customer = db.getCustomer(req.body.customer_id);
+    if (!customer) return res.redirect(`/dashboard/jobs/new?err=Pick a customer`);
+    const job = db.createJob({
+      customer_id: customer.id,
+      sold_amount: req.body.sold_amount ? Number(req.body.sold_amount) : null,
+      notes: req.body.notes || null,
+    });
+    res.redirect(`/dashboard/jobs/${job.id}?ok=Job created`);
+  });
+
   router.get('/dashboard/jobs/:id', requireAuth, (req, res) => {
     const job = db.getJob(req.params.id);
     if (!job) return res.status(404).send('Job not found');
@@ -1474,7 +1565,6 @@ function register(router, requireAuth) {
     const payments = db.listPayments().filter((p) => p.job_id === job.id);
     const paidTotal = payments.reduce((s, p) => s + Number(p.amount), 0);
     const statusUrl = automations.statusUrl(job.public_token);
-    const products = db.listProductsForJob(job.id);
     const jobFiles = db.listJobFiles(job.id);
 
     const body = `
@@ -1487,7 +1577,7 @@ function register(router, requireAuth) {
           <form method="POST" action="/dashboard/jobs/${job.id}/status">
             <label>New status</label>
             <select name="status">${db.JOB_STAGES.map((s) => `<option value="${s}" ${s === job.status ? 'selected' : ''}>${s}</option>`).join('')}</select>
-            <label>Note (optional, shown to customer's team, not on public page)</label>
+            <label>Note (optional, shown to customer, not on public page)</label>
             <input type="text" name="note">
             <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
               <input type="checkbox" name="notify" value="1" style="width:auto" checked> Text/email the customer about this update
@@ -1502,81 +1592,38 @@ function register(router, requireAuth) {
 
         <div class="panel">
           <h2 style="margin-top:0">Payments</h2>
-          <p>Sold amount: <strong>${job.sold_amount ? fmtMoney(job.sold_amount) : 'not set'}</strong><br>
-          Paid so far: <strong>${fmtMoney(paidTotal)}</strong></p>
+          <p>Sold amount: <strong>${job.sold_amount ? fmtMoney(job.sold_amount) : 'not set'}</strong>
+            <details class="inline-details" style="display:inline">
+              <summary class="btn-link" style="display:inline;cursor:pointer">Change</summary>
+              <form method="POST" action="/dashboard/jobs/${job.id}/sold-amount" style="margin-top:8px">
+                <div class="grid cols-2">
+                  <div><label>New sold amount ($)</label><input type="number" step="0.01" name="sold_amount" value="${job.sold_amount || ''}"></div>
+                  <div style="align-self:end"><button class="btn small" type="submit">Save</button></div>
+                </div>
+              </form>
+            </details><br>
+          Paid so far: <strong>${fmtMoney(paidTotal)}</strong><br>
+          Total due: <strong>${fmtMoney(Math.max(0, (job.sold_amount || 0) - paidTotal))}</strong></p>
           <form method="POST" action="/dashboard/jobs/${job.id}/payments">
             <div class="grid cols-2">
               <div><label>Amount ($) *</label><input type="number" step="0.01" name="amount" required></div>
               <div><label>Method</label><input type="text" name="method" placeholder="Check, card, cash, ACH..."></div>
               <div><label>Date</label><input type="date" name="paid_at"></div>
-              <div><label>Note</label><input type="text" name="note" placeholder="Deposit, final payment..."></div>
+              <div><label>Tax ($, optional)</label><input type="number" step="0.01" name="tax" placeholder="Tax portion of this payment"></div>
+              <div style="grid-column:1 / -1"><label>Note</label><input type="text" name="note" placeholder="Deposit, final payment..."></div>
             </div>
             <div style="margin-top:12px"><button class="btn" type="submit">Record payment</button></div>
           </form>
           ${
             payments.length
-              ? `<table style="margin-top:14px"><tr><th>Date</th><th>Amount</th><th>Method</th><th>Note</th></tr>${payments
-                  .map((p) => `<tr><td>${fmtDate(p.paid_at)}</td><td>${fmtMoney(p.amount)}</td><td>${escapeHtml(p.method || '')}</td><td>${escapeHtml(p.note || '')}</td></tr>`)
+              ? `<table style="margin-top:14px"><tr><th>Date</th><th>Amount</th><th>Tax</th><th>Method</th><th>Note</th></tr>${payments
+                  .map((p) => `<tr><td>${fmtDate(p.paid_at)}</td><td>${fmtMoney(p.amount)}</td><td>${p.tax ? fmtMoney(p.tax) : ''}</td><td>${escapeHtml(p.method || '')}</td><td>${escapeHtml(p.note || '')}</td></tr>`)
                   .join('')}</table>`
               : ''
           }
         </div>
       </div>
 
-      <div class="panel">
-        <h2 style="margin-top:0">Factory order - products</h2>
-        <p class="subtitle">Each line sent to the factory, with its own specs, deadline, and status. Shows up on the <a href="/dashboard/production">Factory Queue</a> until delivered. Need a new cabinet type, mount style, rail type, or color in the dropdowns? Add it on the <a href="/dashboard/settings/product-options">Product Options</a> page.</p>
-        <form method="POST" action="/dashboard/jobs/${job.id}/products">
-          <div class="grid cols-4">
-            <div><label>Product / piece name *</label><input type="text" name="name" placeholder="Upper pantry cabinet" required></div>
-            <div><label>Cabinet / product type</label>${optionSelect('cabinet_type', '')}</div>
-            <div><label>Type code</label>${optionSelect('type_code', '')}</div>
-            <div><label>Mount style</label>${optionSelect('mount_style', '')}</div>
-            <div><label>Rail type</label>${optionSelect('rail_type', '')}</div>
-            <div><label>Color</label>${optionSelect('color', '')}</div>
-            <div><label>Divider</label>${optionSelect('divider', '')}</div>
-            <div><label>Opening width (mm)</label><input type="number" step="0.1" name="opening_width_mm"></div>
-            <div><label>Unit price ($)</label><input type="number" step="0.01" name="unit_price"></div>
-            <div><label>Quantity</label><input type="number" name="quantity" value="1" min="1"></div>
-            <div><label>Deadline</label><input type="date" name="deadline"></div>
-            <div><label>Factory / vendor</label><input type="text" name="factory" placeholder="Who's building it"></div>
-            <div><label>Measurements (free text, optional)</label><input type="text" name="measurements" placeholder="36&quot;W x 84&quot;H x 24&quot;D"></div>
-            <div><label>Notes</label><input type="text" name="notes"></div>
-          </div>
-          <div style="margin-top:12px"><button class="btn" type="submit">Add to factory order</button></div>
-        </form>
-        ${
-          products.length
-            ? `<div style="overflow-x:auto"><table style="margin-top:16px">
-                <tr><th>Product</th><th>Type</th><th>Mount</th><th>Rail</th><th>Color</th><th>Width</th><th>Qty</th><th>Deadline</th><th>Factory</th><th>Status</th></tr>
-                ${products
-                  .map((p) => {
-                    const overdue = p.deadline && p.status !== 'Delivered' && new Date(p.deadline) < new Date();
-                    return `<tr>
-                      <td>${escapeHtml(p.name)}${p.cabinet_type ? `<div class="subtitle" style="margin:0">${escapeHtml(p.cabinet_type)}</div>` : ''}${p.measurements ? `<div class="subtitle" style="margin:0">${escapeHtml(p.measurements)}</div>` : ''}</td>
-                      <td>${escapeHtml(p.type_code || '')}</td>
-                      <td>${escapeHtml(p.mount_style || '')}</td>
-                      <td>${escapeHtml(p.rail_type || '')}</td>
-                      <td>${escapeHtml(p.color || '')}</td>
-                      <td>${p.opening_width_mm ? p.opening_width_mm + 'mm' : ''}</td>
-                      <td>${p.quantity}</td>
-                      <td class="${overdue ? 'overdue' : ''}">${p.deadline ? fmtDate(p.deadline) : ''}${overdue ? ' (overdue)' : ''}</td>
-                      <td>${escapeHtml(p.factory || '')}</td>
-                      <td>
-                        <form method="POST" action="/dashboard/products/${p.id}/status">
-                          <input type="hidden" name="return_to" value="/dashboard/jobs/${job.id}">
-                          <select name="status" onchange="this.form.submit()">
-                            ${db.PRODUCT_STAGES.map((s) => `<option value="${s}" ${s === p.status ? 'selected' : ''}>${s}</option>`).join('')}
-                          </select>
-                        </form>
-                      </td>
-                    </tr>`;
-                  })
-                  .join('')}
-              </table></div>`
-            : `<p class="subtitle">No products added to this job's factory order yet.</p>`
-        }
-      </div>
 
       <div class="panel">
         <h2 style="margin-top:0">Files</h2>
@@ -1893,7 +1940,7 @@ function register(router, requireAuth) {
   router.post('/dashboard/jobs/:id/payments', requireAuth, (req, res) => {
     const job = db.getJob(req.params.id);
     if (!job) return res.status(404).send('Job not found');
-    const { amount, method, note, paid_at } = req.body;
+    const { amount, method, note, paid_at, tax } = req.body;
     if (!amount) return res.redirect(`/dashboard/jobs/${job.id}?err=Amount is required`);
     db.createPayment({
       job_id: job.id,
@@ -1901,8 +1948,16 @@ function register(router, requireAuth) {
       method,
       note,
       paid_at: paid_at ? new Date(paid_at).toISOString() : undefined,
+      tax,
     });
     res.redirect(`/dashboard/jobs/${job.id}?ok=Payment recorded`);
+  });
+
+  router.post('/dashboard/jobs/:id/sold-amount', requireAuth, (req, res) => {
+    const job = db.getJob(req.params.id);
+    if (!job) return res.status(404).send('Job not found');
+    db.updateJobSoldAmount(job.id, req.body.sold_amount);
+    res.redirect(`/dashboard/jobs/${job.id}?ok=Sold amount updated`);
   });
 
   // ---------- Bookkeeping (Finances) ----------

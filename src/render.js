@@ -580,6 +580,15 @@ function assistantWidget(context) {
       e.preventDefault();
       var p = el.parentElement;
       while (p) { if (p.tagName === 'DETAILS') p.open = true; p = p.parentElement; }
+      // Clicking Email (or Text) should actually select that channel, not just
+      // scroll near the compose form (spec E9).
+      var form = el.closest ? el.closest('form') : null;
+      var channelSelect = form && form.querySelector('select[name="channel"]');
+      if (channelSelect) {
+        if (id === 'send-email' && !channelSelect.querySelector('option[value="email"][disabled]')) channelSelect.value = 'email';
+        else if (id === 'send-text' && !channelSelect.querySelector('option[value="sms"][disabled]')) channelSelect.value = 'sms';
+        channelSelect.dispatchEvent(new Event('change'));
+      }
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       var f = el.matches && el.matches('textarea,input') ? el : el.parentElement.querySelector('textarea,input');
       if (f) setTimeout(function(){ f.focus(); }, 300);

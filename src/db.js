@@ -395,6 +395,21 @@ CREATE TABLE IF NOT EXISTS sales_consultants (
   for (const [col, type] of cols) if (!existing.has(col)) db.exec(`ALTER TABLE expenses ADD COLUMN ${col} ${type}`);
 })();
 
+// ---- Migration: "waiting on someone" state for follow-ups (spec E8) - a
+// separate free-text note, not a new status value, since much of the app
+// filters on followups.status = 'open'. ----
+(function migrateFollowupsWaiting() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(followups)`).all().map((c) => c.name));
+  if (!existing.has('waiting_on')) db.exec(`ALTER TABLE followups ADD COLUMN waiting_on TEXT`);
+})();
+
+// ---- Migration: tax on payments (spec E10) - the tax portion of a deposit,
+// separate from the payment amount itself. Additive, nullable. ----
+(function migratePaymentsTax() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(payments)`).all().map((c) => c.name));
+  if (!existing.has('tax')) db.exec(`ALTER TABLE payments ADD COLUMN tax REAL`);
+})();
+
 (function migrateCustomerFilesSoftDelete() {
   const existing = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
   if (!existing.has('deleted_at')) db.exec(`ALTER TABLE customer_files ADD COLUMN deleted_at TEXT`);
@@ -772,6 +787,14 @@ function createJob({ lead_id, customer_id, sold_amount, notes }) {
      VALUES (?,?,?,?, 'Order Confirmed', ?, ?, ?, ?)`
   ).run(id, lead_id || null, customer_id, token, sold_amount || null, notes || null, ts, ts);
   addJobStatusHistory(id, 'Order Confirmed', 'Job created');
+  return getJob(id);
+}
+function updateJobSoldAmount(id, sold_amount) {
+  db.prepare(`UPDATE jobs SET sold_amount = ?, updated_at = ? WHERE id = ?`).run(
+    sold_amount === undefined || sold_amount === null || sold_amount === '' ? null : Number(sold_amount),
+    nowIso(),
+    id
+  );
   return getJob(id);
 }
 function getJob(id) {
@@ -1157,10 +1180,10 @@ function listRecentMessages(limit = 50) {
 
 // ---- Payments / income ----
 // job_id is optional - a payment can be logged without a job for misc/other income.
-function createPayment({ job_id, customer_id, category, amount, method, note, paid_at }) {
+function createPayment({ job_id, customer_id, category, amount, method, note, paid_at, tax }) {
   const id = newId();
   db.prepare(
-    `INSERT INTO payments (id, job_id, customer_id, category, amount, method, note, paid_at, created_at) VALUES (?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO payments (id, job_id, customer_id, category, amount, method, note, paid_at, created_at, tax) VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     job_id || null,
@@ -1170,7 +1193,8 @@ function createPayment({ job_id, customer_id, category, amount, method, note, pa
     method || null,
     note || null,
     paid_at || nowIso(),
-    nowIso()
+    nowIso(),
+    tax === undefined || tax === null || tax === '' ? null : Number(tax)
   );
   return id;
 }
@@ -1663,6 +1687,23 @@ function listOpenFollowups() {
        ORDER BY (followups.due_at IS NULL), followups.due_at ASC`
     )
     .all();
+}
+// Snooze/reschedule (spec E8) - just moves due_at, doesn't touch status.
+function setFollowupDueDate(id, due_at, actor) {
+  const f = getFollowup(id);
+  if (!f) return null;
+  db.prepare(`UPDATE followups SET due_at = ? WHERE id = ?`).run(due_at || null, id);
+  logActivity({ entity_type: 'followup', entity_id: id, customer_id: f.customer_id, field: 'due_at', old_value: f.due_at, new_value: due_at || null, actor: actor || 'user' });
+  return getFollowup(id);
+}
+// "Waiting on someone" (spec E8) - a note, not a new status; empty string clears it.
+function setFollowupWaiting(id, waiting_on, actor) {
+  const f = getFollowup(id);
+  if (!f) return null;
+  const value = (waiting_on || '').trim() || null;
+  db.prepare(`UPDATE followups SET waiting_on = ? WHERE id = ?`).run(value, id);
+  logActivity({ entity_type: 'followup', entity_id: id, customer_id: f.customer_id, field: 'waiting_on', old_value: f.waiting_on, new_value: value, actor: actor || 'user' });
+  return getFollowup(id);
 }
 function closeFollowup(id, status, actor) {
   const f = getFollowup(id);
@@ -2267,6 +2308,8 @@ module.exports = {
   listFollowups,
   listOpenFollowups,
   closeFollowup,
+  setFollowupDueDate,
+  setFollowupWaiting,
   // marketing
   createSource,
   getSource,
@@ -2315,6 +2358,7 @@ module.exports = {
   markReminderSent,
   updateAppointmentStatus,
   createJob,
+  updateJobSoldAmount,
   getJob,
   getJobByToken,
   listJobs,

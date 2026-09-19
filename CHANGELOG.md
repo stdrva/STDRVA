@@ -98,6 +98,48 @@ below that carry a `-beta.N` suffix predate that decision.
 - **D4:** "Product Options" removed from the More menu (nav only - the route, its data, and the job
   page's link to it are all untouched).
 
+- **E1:** job note label corrected to "shown to customer" per instruction.
+- **E2 / E3:** added Total Due (`sold_amount - paid`) next to Sold amount/Paid so far, and a "Change"
+  disclosure with its own small form (`POST /dashboard/jobs/:id/sold-amount`, new `db.updateJobSoldAmount`)
+  to edit the sold amount directly - previously only the assistant could change it.
+- **E4/E5 superseded - product lines hidden entirely, not just reduced:** mid-section, the plan changed
+  from "reduce the factory-order form" to hiding product lines completely until the Excel-sheet
+  successor becomes its own app - no adding, no seeing, delete nothing. Investigated first, as asked:
+  - **Factory Queue** (`/dashboard/production`) is built entirely from `db.listProductionQueue()`
+    (product rows across every job) and has its own independent Add/status-change UI - left fully
+    working and reachable (URL only - its nav link isn't in scope here).
+  - **Product Options** (`/dashboard/settings/product-options`) - dropdown values used when adding a
+    product line. Route, data, and the job page's link to it (already just a link, no longer relevant
+    once the job-page form is gone) all left as-is.
+  - `/dashboard/products/:id/status` (the per-product status-change POST) is still used by Factory
+    Queue's own status dropdown - left working.
+  - The assistant's `get_job_detail` tool returned a `products` array - removed from its response, and
+    its description updated to say so explicitly. `create_product` was already removed in Section B.
+  Removed: the entire "Factory order - products" panel (14-field add form + table) from the job page.
+  Untouched/not deleted: `products` table data, `/dashboard/jobs/:id/products` (POST, add - no UI path
+  to it anymore, but not disabled), `/dashboard/products/:id/status`, Factory Queue, Product Options.
+- **E6 — job creation path:** `/dashboard/jobs` gained "+ Add job" (`GET /dashboard/jobs/new`,
+  `POST /dashboard/jobs`, reusing the existing `db.createJob`, which already tolerated no `lead_id`)
+  and its "Open" link renamed to "Edit". New assistant tool `create_job` (confirm-gated, like
+  log_payment/log_expense).
+- **E7:** the customer page now lists every job, completed included (was filtered to `status !==
+  'Complete'`; that filter is still used, correctly, for the Overview's "Active jobs" stat count).
+- **E8 — Needs attention, real actions:** both the Overview list and the customer page's own
+  follow-up list now have Done / Dismiss / Snooze / "waiting on" controls directly on each item,
+  regardless of whether the due date was set manually, by the assistant, or by an automatic trigger.
+  New `followups.waiting_on` column (a note, not a new status - most of the app filters on
+  `status = 'open'`) and `POST /dashboard/followups/:id/snooze` / `/waiting` routes.
+- **E9 — Text/Email compose:** added a Subject field (email only, hidden for SMS), honored when set
+  (falls back to the old default). Clicking the Email quick-action link now actually selects Email in
+  the channel dropdown (previously only scrolled near the form, still defaulting to Text).
+- **E10 — tax field:** payments gained a `tax` column and a form field, shown alongside amount/method
+  in the job page's payment history.
+- **E11 — raw dates:** activity-log `old_value`/`new_value` text is now run through
+  `humanizeActivityValue()` (new, `util.js`), which rewrites any ISO timestamp embedded in it to a
+  readable US Eastern string - plain non-date text passes through unchanged.
+- **E12:** no action - ad funnel on the job page not found in code; the financial-data-mismatch report
+  needs a reproduction, not a guess.
+
 ## 1.6.0 (2026-09-18) — Email sending: Resend -> Gmail SMTP
 
 Resend is dropped entirely and replaced with Gmail SMTP, sending from an existing

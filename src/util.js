@@ -38,6 +38,29 @@ function fmtDateTime(iso) {
   return d.toLocaleString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
+// Activity log field/old_value/new_value are free-text - some carry a raw ISO
+// timestamp (e.g. a rescheduled scheduled_at) straight through. Rewrite any
+// such timestamp to a readable US Eastern string (spec E11) rather than
+// leaking "2026-09-20T18:00:00.000Z" into the dashboard. Text with no ISO
+// timestamp in it passes through unchanged.
+function humanizeActivityValue(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, (m) => {
+    const d = new Date(m);
+    if (isNaN(d.getTime())) return m;
+    return (
+      d.toLocaleString('en-US', {
+        timeZone: 'America/New_York',
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      }) + ' ET'
+    );
+  });
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -145,6 +168,7 @@ module.exports = {
   fmtMoney,
   fmtDate,
   fmtDateTime,
+  humanizeActivityValue,
   fmtRelativeDue,
   nowIso,
   normalizePhone,
