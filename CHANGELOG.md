@@ -5,6 +5,22 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.7.1 (2026-09-19) — Fix: mobile "More" menu didn't open
+
+`.nav-more-menu` switches from `position: absolute` (desktop) to `position: fixed` on mobile to
+escape `.topnav-links`' `overflow-x: auto` clipping - but the mobile media query never reset `top`,
+so it kept the desktop rule's `top: 100%`. For a `position: fixed` element that means 100% of the
+*viewport* height, not "just below the button" - on a 375x812 viewport the menu rendered at y=818,
+entirely below the fold. It genuinely opened (`<details open>`) every time; it just wasn't visible.
+Verified in a headless Chrome session at a 375x812 viewport via the DevTools protocol (no new
+dependency - a throwaway script, not part of the repo): before the fix, clicking the summary set
+`open` but the menu's bounding box had `y: 818` (out of the 812px-tall viewport); after, `y: 586`,
+fully on-screen, confirmed against a screenshot. Fix: anchor the mobile dropdown to the bottom of the
+viewport (`top: auto; bottom: 12px`) instead of trying to compute where a variable-height (two-row
+on mobile) topnav ends.
+
+No other changes.
+
 ## 1.7.0 (2026-09-18) — Sep 18 update batch (sections A-H)
 
 - **A — `[hidden]` vs `.btn`/`.aw-mic`:** added a global `[hidden] { display: none !important; }` rule

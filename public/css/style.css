@@ -425,7 +425,13 @@ body.dash { padding-bottom: 96px; } /* room so the assistant never covers conten
   .brand { font-size: 1rem; flex-basis: 100%; }
   .topnav-links { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
   .topnav-links a, .nav-more summary { white-space: nowrap; }
-  .nav-more-menu { position: fixed; left: 12px; right: 12px; }
+  /* position:fixed here (to escape .topnav-links' overflow-x:auto clipping)
+     inherits the desktop rule's `top: 100%` - but for a fixed element that
+     means 100% of the VIEWPORT height, not "just below .nav-more", so the
+     menu rendered entirely off-screen below the fold. Anchor to the bottom
+     of the viewport instead, which needs no knowledge of the (two-row on
+     mobile) topnav's actual height. */
+  .nav-more-menu { position: fixed; top: auto; bottom: 12px; left: 12px; right: 12px; max-height: 60vh; overflow-y: auto; }
 }
 
 .msg { margin-top: 0; margin-bottom: 18px; }
