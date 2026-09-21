@@ -120,7 +120,7 @@ function run() {
       stage: 'Contacted',
       notes: 'Consult 8/18. Andrew needs to review her drawing/contract - needs a price and direct contact ASAP.' },
     { name: 'Kelly Pierce', phone: '+13016134329', email: 'kellypierce813@gmail.com', address: '13309 Garland Lane, Midlothian, VA 24114',
-      stage: 'Lost',
+      stage: 'Contacted', // was 'Lost' - retired in 1.8.0 (db.createLead now rejects it). The live DB row is untouched.
       notes: 'Cancelled her only consult (booked 8/13, cancelled 8/11) with no further activity since. Andrew to decide: win-back call or leave as Lost.' },
     { name: 'Sarah Jordan', phone: '+18282602042', email: 'jordansr99@gmail.com', address: '10071 Berry Pond Lane, Mechanicsville, VA 23116',
       stage: 'Contacted',

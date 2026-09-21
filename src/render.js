@@ -12,20 +12,20 @@ const FAVICON_TAGS = `
 // PWA + iOS Home Screen metadata. manifest.json and the icons are served from
 // /static. status-bar-style "default" keeps text readable over the dark nav.
 const PWA_HEAD = `
-<meta name="theme-color" content="#1e3d22">
+<meta name="theme-color" content="#2A4D3A">
 <link rel="manifest" href="/static/manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="The BOS">
 <meta name="format-detection" content="telephone=no">`;
 
 // Shown instantly (inline, no network) so an iOS standalone launch never shows
 // a black screen while the page/CSS load. Removed as soon as the doc is ready.
 const BOOT_SPLASH = `
-<div id="boot-splash" style="position:fixed;inset:0;z-index:99999;background:#1e3d22;color:#e9dfc4;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:Georgia,serif">
+<div id="boot-splash" style="position:fixed;inset:0;z-index:99999;background:#2A4D3A;color:#e9dfc4;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:Georgia,serif">
   <div style="font-size:1.4rem;font-style:italic;font-weight:700">The BOS</div>
-  <div style="margin-top:10px;width:26px;height:26px;border:3px solid rgba(233,223,196,.3);border-top-color:#d9a628;border-radius:50%;animation:bootspin .8s linear infinite"></div>
+  <div style="margin-top:10px;width:26px;height:26px;border:3px solid rgba(233,223,196,.3);border-top-color:#C4A35A;border-radius:50%;animation:bootspin .8s linear infinite"></div>
 </div>
 <style>@keyframes bootspin{to{transform:rotate(360deg)}}</style>
 <script>
@@ -67,39 +67,132 @@ const DASH_SCROLL_BODY = `<script>
   });
 </script>`;
 
+// Never more than four always-visible destinations (spec 046): these three plus
+// Menu. Phone shows them in a fixed bottom bar; desktop shows them in the top bar.
 const PRIMARY_NAV = [
   ['/dashboard', 'Overview'],
-  ['/dashboard/customers', 'Customers'],
-  ['/dashboard/pipeline', 'Pipeline'],
-  ['/dashboard/kpi', 'KPI'],
   ['/dashboard/appointments', 'Appts'],
-  ['/dashboard/jobs', 'Jobs'],
-  ['/dashboard/finances', 'Bookkeeping'],
-  // Same page as the old buried "Booking Link / QR" More-menu entry - renamed
-  // and promoted to a primary tab (spec D3) because it wasn't findable there.
-  ['/dashboard/booking-link', 'Show Prep and Materials'],
-];
-const MORE_NAV = [
-  ['/dashboard/production', 'Production Queue'],
-  ['/dashboard/marketing', 'Marketing'],
-  ['/dashboard/messages', 'Messages'],
-  ['/dashboard/files', 'Files'],
-  ['/dashboard/files/deleted', 'Deleted Files'],
+  ['/dashboard/pipeline', 'Pipeline'],
 ];
 
+// Everything else lives in the Menu sheet. An item with no href renders grey
+// and is not a link (Training is not built yet - SALES_TRAINING_ENABLED is off).
+const MENU_GROUPS = [
+  { title: 'Training', items: [[null, 'Training']] },
+  {
+    title: 'Marketing',
+    items: [
+      ['/dashboard/marketing', 'Marketing'],
+      ['/dashboard/booking-link', 'Show Prep'],
+    ],
+  },
+  {
+    title: 'Financial',
+    items: [
+      ['/dashboard/finances', 'Bookkeeping'],
+      ['/dashboard/kpi', 'KPI'],
+    ],
+  },
+  {
+    title: 'Customer Relations',
+    items: [
+      ['/dashboard', 'Overview'],
+      ['/dashboard/customers', 'Customers'],
+      ['/dashboard/pipeline', 'Pipeline'],
+      ['/dashboard/appointments', 'Appointments'],
+      ['/dashboard/messages', 'Messages'],
+      ['/dashboard/files', 'Files'],
+      ['/dashboard/files/deleted', 'Deleted Files'],
+    ],
+  },
+  {
+    title: 'Production',
+    items: [
+      ['/dashboard/jobs', 'Jobs'],
+      ['/dashboard/production', 'Production Queue'],
+    ],
+  },
+];
+
+// A menu item is "current" on its own page and on sub-pages (e.g. Bookkeeping on
+// /dashboard/finances/expenses). "/dashboard" itself only matches exactly.
+function menuItemActive(active, href) {
+  if (!active || !href) return false;
+  return active === href || (href !== '/dashboard' && active.startsWith(href + '/'));
+}
+
+// Top bar: logo left. On desktop it also carries the four destinations; on phone
+// those move to the bottom bar (see bottomNavHtml) and the top bar is logo only.
 function navHtml(active) {
   const isActive = (href) => (active === href ? ' class="active"' : '');
   const primary = PRIMARY_NAV.map(([h, l]) => `<a href="${h}"${isActive(h)}>${l}</a>`).join('');
-  const more = MORE_NAV.map(([h, l]) => `<a href="${h}"${isActive(h)}>${l}</a>`).join('');
-  const moreActive = MORE_NAV.some(([h]) => h === active);
   return `
-    <nav class="topnav-links">
+    <nav class="topnav-links" aria-label="Main">
       ${primary}
-      <details class="nav-more"${moreActive ? ' open' : ''}>
-        <summary>More</summary>
-        <div class="nav-more-menu">${more}</div>
-      </details>
+      <button type="button" class="nav-menu-btn${menuIsActive(active) ? ' active' : ''}" data-menu-toggle aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">Menu</button>
     </nav>`;
+}
+
+function menuIsActive(active) {
+  return !!active && !PRIMARY_NAV.some(([h]) => h === active);
+}
+
+// Phone-only fixed bottom bar: the same three destinations plus Menu.
+function bottomNavHtml(active) {
+  const links = PRIMARY_NAV.map(
+    ([h, l]) => `<a href="${h}"${active === h ? ' class="active" aria-current="page"' : ''}>${l}</a>`
+  ).join('');
+  return `
+<nav class="bottomnav" aria-label="Main">
+  ${links}
+  <button type="button" class="${menuIsActive(active) ? 'active' : ''}" data-menu-toggle aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">Menu</button>
+</nav>`;
+}
+
+// One Menu sheet, shared by the desktop top-bar button and the phone bottom-bar
+// button. Bottom sheet on phone, dropdown panel on desktop (CSS decides).
+// Log out is last and is always a real link - never greyed.
+function menuSheetHtml(active) {
+  const groups = MENU_GROUPS.map(
+    (g) => `
+      <div class="menu-group">
+        <div class="menu-group-title">${g.title}</div>
+        ${g.items
+          .map(([h, l]) =>
+            h
+              ? `<a href="${h}"${menuItemActive(active, h) ? ' class="active"' : ''}>${l}</a>`
+              : `<span class="menu-disabled" aria-disabled="true">${l}</span>`
+          )
+          .join('')}
+      </div>`
+  ).join('');
+  return `
+<div class="menu-backdrop" data-menu-close hidden></div>
+<div id="menu-sheet" class="menu-sheet" role="dialog" aria-label="Menu" hidden>
+  ${groups}
+  <div class="menu-group menu-group-logout"><a class="menu-logout" href="/logout">Log out</a></div>
+</div>
+<script>
+  (function () {
+    // Delegated on document: this script sits above the phone bottom bar in the
+    // DOM, so a querySelectorAll here would miss that Menu button.
+    var sheet = document.getElementById('menu-sheet');
+    var backdrop = document.querySelector('.menu-backdrop');
+    if (!sheet) return;
+    function setOpen(open) {
+      sheet.hidden = !open;
+      backdrop.hidden = !open;
+      document.querySelectorAll('[data-menu-toggle]').forEach(function (t) { t.setAttribute('aria-expanded', open ? 'true' : 'false'); });
+      document.documentElement.classList.toggle('menu-open', open);
+    }
+    document.addEventListener('click', function (e) {
+      if (e.target.closest('[data-menu-toggle]')) return setOpen(sheet.hidden);
+      if (e.target.closest('[data-menu-close]')) return setOpen(false);
+      if (!sheet.hidden && sheet.contains(e.target) && e.target.closest('a')) setOpen(false);
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !sheet.hidden) setOpen(false); });
+  })();
+</script>`;
 }
 
 function dashboardLayout({ title, active, body, flash, context }) {
@@ -119,15 +212,16 @@ ${BOOT_SPLASH}
 ${DASH_SCROLL_BODY}
 <div class="topnav">
   <div class="wrap topnav-inner">
-    <a class="brand" href="/dashboard">${BUSINESS_NAME} — The BOS</a>
+    <a class="brand-logo" href="/dashboard"><img src="/static/img/logo.png" alt="${BUSINESS_NAME}"></a>
     ${navHtml(active)}
-    <a class="nav-logout" href="/logout">Log out</a>
   </div>
 </div>
+${menuSheetHtml(active)}
 <main class="wrap">
   ${flash ? `<div class="msg ${flash.type === 'err' ? 'err' : 'ok'}">${escapeHtml(flash.text)}</div>` : ''}
   ${body}
 </main>
+${bottomNavHtml(active)}
 ${assistantWidget(context)}
 ${voiceMode(context)}
 <script>
@@ -776,9 +870,20 @@ ${FAVICON_TAGS}
 <link rel="stylesheet" href="/static/css/style.css">
 <script>
   (function() {
-    var pos = localStorage.getItem('__bos_scroll');
-    if (pos !== null) {
-      localStorage.removeItem('__bos_scroll');
+    // A link that carries a #fragment (e.g. tapping a service card -> #step-contact)
+    // is asking to land on that section. The saved scroll position must never
+    // override it (spec 022) - drop it and land on the section, and re-land once
+    // the logo has loaded so late layout shift can't push the section off-screen.
+    var pos = null;
+    try { pos = localStorage.getItem('__bos_scroll'); } catch (e) {}
+    var hash = window.location.hash;
+    if (pos !== null) { try { localStorage.removeItem('__bos_scroll'); } catch (e) {} }
+    if (hash && hash.length > 1) {
+      window.addEventListener('load', function() {
+        var el = document.getElementById(decodeURIComponent(hash.slice(1)));
+        if (el) el.scrollIntoView({ block: 'start', behavior: 'instant' });
+      });
+    } else if (pos !== null) {
       document.addEventListener('DOMContentLoaded', function() { window.scrollTo(0, parseInt(pos, 10)); });
       window.addEventListener('load', function() { window.scrollTo(0, parseInt(pos, 10)); });
     }

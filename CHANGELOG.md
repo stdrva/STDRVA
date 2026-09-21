@@ -5,6 +5,65 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.8.0 (2026-09-20) — New chrome, Sale packet, and a round of fixes
+
+Sales training stays OFF (`SALES_TRAINING_ENABLED = false`); nothing from it is in this release.
+
+- **046 Chrome.** White top bar with the `logo.png` wordmark only (44px tall on phone, 56px on
+  desktop) - no drawer icon, no bell. Never more than four always-visible destinations:
+  **Overview, Appts, Pipeline, Menu**. On phone they live in a fixed bottom bar and the old top tab row
+  and More menu are gone; on desktop they sit in the top bar. One **Menu** sheet (bottom sheet on phone,
+  dropdown on desktop) with the exact groups: Training (grey, not a link), Marketing, Financial,
+  Customer Relations, Production, then **Log out** (never grey). The Menu toggle is a single delegated
+  click handler - the previous approach missed the bottom-bar button because the script runs above it
+  in the page. The assistant and Voice buttons are lifted above the bottom bar on phone. Palette moved to
+  Emerald `#2A4D3A` / Brass `#C4A35A` (CSS variables, manifest, theme-color, boot splash, offline page).
+- **028 Eastern time.** `fmtDateTime` is always America/New_York and ends with "ET", whatever zone the
+  server is in. Display only - stored timestamps are not touched.
+- **047 Assistant clock.** Every system prompt (text and Voice) now ends with
+  `Now: Sun 9/20 2:14p ET`, with an instruction to use it silently and never read it aloud.
+- **001 No more Lost.** Removed from `LEAD_STAGES`, the assistant's `create_lead` / `update_lead`
+  enums, the legacy funnel route's map, dead `.badge.lost` CSS, the README, and the seed script.
+  Now also enforced: `createLead` / `updateLeadStage` reject it, and the assistant tools return an error
+  if it is sent anyway. "There is NO Lost" stays in the assistant prompt as the guardrail. Old rows that
+  still say `Lost` are left exactly as they are (no history rewrite; local copy has one, Kelly Pierce);
+  they are simply never treated as an open lead - booking makes a fresh lead instead of reopening one.
+  The one-time `sales_stage` backfill still translates a legacy `Lost` row, because it reads old data.
+- **022 Booking service tap.** Tapping a service card now stays on "2. Your info & address". Cause: the
+  public layout saved the scroll position on every link click and restored it on load, overriding the
+  `#step-contact` anchor (the page snapped back to the service list). A `#fragment` now wins and the saved
+  position is dropped. The selected card is obvious even when it is also the featured one (`.selected`
+  now beats `.featured`; emerald fill, ring, and a "✓ Selected" chip).
+- **023 Needs Attention layout.** Same four rows on the Overview and the customer page (one shared
+  helper): who/what/due, Done | Dismiss, "Snooze to" + its date, "Waiting on" + its text. The old
+  "Edit" link (it went to the same page as the customer name) and the ambiguous "Set" button ("Save") are
+  gone. Also fixed: a "Snooze to" date was saved as midnight UTC, i.e. the evening before in Eastern,
+  so a snoozed follow-up could show a day early; it is now noon UTC (the same calendar day in ET).
+- **025 Files search is live.** Filters as you type (150ms debounce) through
+  `/dashboard/files/results`; an empty box shows the ~50 most recent files; Needs Review is unchanged.
+  Works without JavaScript too (`?q=` is rendered server-side).
+- **033 Estimated install date.** Optional `jobs.estimated_install_at` (additive migration, blank is
+  fine). Shown on the job page with a Change form (blank clears it); audited in the activity log. Never
+  auto-filled - not from measurements, not from status changes - and not shown on the customer's status page.
+- **034 Sale packet (start).** `Customer -> Sale packet`: tick the files that make up the sale, then
+  either **sign on this device** (signature pad + printed name + Eastern time, saved as a NEW image file
+  with the file list; originals untouched) or **email the selected files** as attachments - a confirm
+  screen first, and it is sent only on the confirmed POST. Either one runs the same completion: customer
+  Sold, a job exists (reuses the newest unfinished one, else creates one), job status Measuring Scheduled
+  (never moved backward), and one open "Schedule measure" follow-up. Completing sends **nothing** to the
+  customer: the "order confirmed" text/email (`onJobCreated`) goes out only if the box on the page is
+  ticked. If the email fails or email isn't configured, nothing is completed. Added a `Measure`
+  appointment type: hidden on `/book` (even by URL), not a design appointment (no stage bump, no KPI or
+  consultant-scoreboard credit). Not DocuSign. New env `SMTP_HOST` / `SMTP_PORT` (default Gmail) exist so
+  tests can use a local fake mail server.
+- **Tests.** New `tests/update-180.test.js` and `tests/update-180-packet.test.js`, plus
+  `tests/http-helper.js`, which starts the real server on a random port with every messaging credential
+  blanked. One test, `voiceBookingSlots: near an area with an existing appointment...`, was already
+  failing before this release and is untouched.
+
+Not built this round (per the handoff): 000/005, 002, 003, 006, 019, 020, 024, 026/045, 027, 029, 030,
+031, 032, 035-044, and the header bell.
+
 ## 1.7.2 (2026-09-19) — unassign_file tool, .xlsx uploads
 
 - **`unassign_file` tool:** new assistant tool that takes a file off whichever customer it's

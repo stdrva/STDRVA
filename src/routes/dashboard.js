@@ -7,6 +7,9 @@ const {
   fmtMoney,
   fmtDate,
   fmtDateTime,
+  dateInputToIso,
+  etDateString,
+  isValidEmail,
   fmtRelativeDue,
   normalizePhone,
   formatPhone,
@@ -51,6 +54,62 @@ function attentionForCustomer(c) {
     items.push({ text: `Stage flag: ${c.stage_substatus}`, overdue: false });
   }
   return items;
+}
+
+// Files page results (spec 025): the same fragment is used by the full page and by
+// the live-search endpoint. Empty query -> the ~50 most recent files; otherwise a
+// full-text search. Never empty-handed just because nothing has been typed.
+const FILES_SHOWN = 50;
+function filesResultsHtml(q) {
+  const term = (q || '').trim();
+  const rows = term ? db.searchFiles(term) : db.listRecentFiles(FILES_SHOWN);
+  const heading = term
+    ? `<p class="subtitle" style="margin:12px 0 0">${rows.length ? rows.length + ' match' + (rows.length === 1 ? '' : 'es') : 'No files matched'} for &ldquo;${escapeHtml(term)}&rdquo;${rows.length >= FILES_SHOWN ? ' (showing the first ' + FILES_SHOWN + ')' : ''}.</p>`
+    : `<p class="subtitle" style="margin:12px 0 0">Recent files (newest first). Type above to search all of them.</p>`;
+  if (!rows.length) return term ? heading : `${heading}<p class="subtitle">No files uploaded yet.</p>`;
+  return `${heading}<table style="margin-top:8px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${rows
+    .map(
+      (f) => `<tr>
+        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>` : escapeHtml(f.original_name)}</td>
+        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : '<a href="#needs-review">Needs review</a>'}</td>
+        <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
+        <td class="subtitle" style="margin:0">${escapeHtml(f.snippet || f.note || '')}</td>
+        <td>${fmtDate(f.created_at)}</td>
+      </tr>`
+    )
+    .join('')}</table>`;
+}
+
+// One Needs Attention follow-up, laid out the same on the Overview and on the
+// customer page (spec 023). Four rows, each control owned by its own label:
+//   1. who / what / due            (+ a quiet "waiting on" badge if one is set)
+//   2. Done | Dismiss
+//   3. Snooze to  [date]  [Snooze]  - the date belongs to Snooze
+//   4. Waiting on [text]  [Save]    - the text belongs to Waiting on
+// returnTo: send the user back here after any action (Overview passes /dashboard;
+// the customer page omits it and the routes fall back to the customer).
+function followupItemHtml(f, { returnTo, showCustomer } = {}) {
+  const ret = returnTo ? `<input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">` : '';
+  const overdue = f.due_at && new Date(f.due_at) < new Date();
+  const who = showCustomer ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name)}</a> — ` : '';
+  const due = f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : '';
+  const waiting = f.waiting_on ? ` <span class="badge">waiting on: ${escapeHtml(f.waiting_on)}</span>` : '';
+  const close = (status, label, cls) =>
+    `<form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="${status}">${ret}<button class="btn small${cls}" type="submit">${label}</button></form>`;
+  return `<div class="attn-item">
+    <div class="attn-what${overdue ? ' overdue' : ''}">${who}${escapeHtml(f.title)}${due}${waiting}</div>
+    <div class="attn-row attn-decide">${close('done', 'Done', '')}${close('dismissed', 'Dismiss', ' secondary')}</div>
+    <form class="attn-row attn-own" method="POST" action="/dashboard/followups/${f.id}/snooze">
+      ${ret}<label for="snz-${f.id}">Snooze to</label>
+      <input id="snz-${f.id}" type="date" name="due_at" required>
+      <button class="btn small secondary" type="submit">Snooze</button>
+    </form>
+    <form class="attn-row attn-own" method="POST" action="/dashboard/followups/${f.id}/waiting">
+      ${ret}<label for="wait-${f.id}">Waiting on</label>
+      <input id="wait-${f.id}" type="text" name="waiting_on" value="${escapeHtml(f.waiting_on || '')}" placeholder="who or what">
+      <button class="btn small secondary" type="submit">Save</button>
+    </form>
+  </div>`;
 }
 
 function attentionBanner(items) {
@@ -130,23 +189,7 @@ function register(router, requireAuth) {
     const attn = [
       ...openF.map((f) => ({
         overdue: f.due_at && new Date(f.due_at) < new Date(),
-        html: `<div><a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name)}</a> — ${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}
-          ${f.waiting_on ? `<span class="badge">waiting on: ${escapeHtml(f.waiting_on)}</span>` : ''}</div>
-          <div class="attn-actions" style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="done"><input type="hidden" name="return_to" value="/dashboard"><button class="btn small" type="submit">Done</button></form>
-            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="dismissed"><input type="hidden" name="return_to" value="/dashboard"><button class="btn small secondary" type="submit">Dismiss</button></form>
-            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/snooze" style="display:flex;gap:4px;align-items:center">
-              <input type="hidden" name="return_to" value="/dashboard">
-              <input type="date" name="due_at" style="width:auto;padding:4px" title="Snooze / reschedule to">
-              <button class="btn small secondary" type="submit">Snooze</button>
-            </form>
-            <form class="inline" method="POST" action="/dashboard/followups/${f.id}/waiting" style="display:flex;gap:4px;align-items:center">
-              <input type="hidden" name="return_to" value="/dashboard">
-              <input type="text" name="waiting_on" value="${escapeHtml(f.waiting_on || '')}" placeholder="Waiting on…" style="width:120px;padding:4px">
-              <button class="btn small secondary" type="submit">Set</button>
-            </form>
-            <a class="btn-link" href="/dashboard/customers/${f.customer_id}">Edit</a>
-          </div>`,
+        html: followupItemHtml(f, { returnTo: '/dashboard', showCustomer: true }),
       })),
       ...missed.map((a) => ({
         overdue: true,
@@ -168,9 +211,9 @@ function register(router, requireAuth) {
         <h2 style="margin-top:0">Needs attention ${attn.length ? `<span class="badge">${attn.length}</span>` : ''}</h2>
         ${
           attn.length
-            ? `<ul style="margin:0;padding-left:18px">${attn
+            ? `<ul class="attn-list">${attn
                 .slice(0, 25)
-                .map((i) => `<li class="${i.overdue ? 'overdue' : ''}" style="margin:4px 0">${i.html}</li>`)
+                .map((i) => `<li class="${i.overdue ? 'overdue' : ''}">${i.html}</li>`)
                 .join('')}</ul>`
             : '<p class="attention-none">Nothing needs action right now.</p>'
         }
@@ -328,7 +371,8 @@ function register(router, requireAuth) {
         <label class="check" style="display:flex;align-items:center;gap:8px;margin-top:10px">
           <input type="checkbox" name="dormant" value="1" style="width:auto" ${c.dormant ? 'checked' : ''}> Dormant / waiting indefinitely (still active, not lost)
         </label>
-        <div style="margin-top:10px"><button class="btn" type="submit">Update stage</button></div>
+        <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center"><button class="btn" type="submit">Update stage</button>
+          <a class="btn secondary" href="/dashboard/customers/${c.id}/sale-packet">Sale packet</a></div>
       </form>`;
 
     const nextActionForm = `
@@ -342,26 +386,7 @@ function register(router, requireAuth) {
       </form>`;
 
     const openFollowupList = openFollowups.length
-      ? `<ul style="margin:8px 0 0;padding-left:0;list-style:none">${openFollowups
-          .map(
-            (f) => `<li style="padding:6px 0;border-bottom:1px solid var(--line)">
-              <div class="${f.due_at && new Date(f.due_at) < new Date() ? 'overdue' : ''}">${escapeHtml(f.title)}${f.due_at ? ' · ' + escapeHtml(fmtRelativeDue(f.due_at)) : ''}
-                ${f.waiting_on ? `<span class="badge">waiting on: ${escapeHtml(f.waiting_on)}</span>` : ''}</div>
-              <div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="done"><button class="btn small" type="submit">Done</button></form>
-                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/close"><input type="hidden" name="status" value="dismissed"><button class="btn small secondary" type="submit">Dismiss</button></form>
-                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/snooze" style="display:flex;gap:4px;align-items:center">
-                  <input type="date" name="due_at" style="width:auto;padding:4px" title="Snooze / reschedule to">
-                  <button class="btn small secondary" type="submit">Snooze</button>
-                </form>
-                <form class="inline" method="POST" action="/dashboard/followups/${f.id}/waiting" style="display:flex;gap:4px;align-items:center">
-                  <input type="text" name="waiting_on" value="${escapeHtml(f.waiting_on || '')}" placeholder="Waiting on…" style="width:120px;padding:4px">
-                  <button class="btn small secondary" type="submit">Set</button>
-                </form>
-              </div>
-            </li>`
-          )
-          .join('')}</ul>`
+      ? `<ul class="attn-list">${openFollowups.map((f) => `<li>${followupItemHtml(f)}</li>`).join('')}</ul>`
       : '<p class="subtitle" style="margin:8px 0 0">No open follow-ups.</p>';
 
     const jobsBlock = jobs.length
@@ -662,7 +687,8 @@ function register(router, requireAuth) {
   router.post('/dashboard/followups/:id/snooze', requireAuth, (req, res) => {
     const f = db.getFollowup(req.params.id);
     if (!f) return res.status(404).send('Not found');
-    if (req.body.due_at) db.setFollowupDueDate(f.id, new Date(req.body.due_at).toISOString(), actorOf(req));
+    const dueIso = dateInputToIso(req.body.due_at);
+    if (dueIso) db.setFollowupDueDate(f.id, dueIso, actorOf(req));
     res.redirect(`${req.body.return_to || `/dashboard/customers/${f.customer_id}`}?ok=Follow-up rescheduled`);
   });
 
@@ -827,7 +853,7 @@ function register(router, requireAuth) {
           if (!drawing) return;
           e.preventDefault();
           var p = posFromEvent(e);
-          ctx.strokeStyle = '#1e3d22';
+          ctx.strokeStyle = '#2A4D3A';
           ctx.lineWidth = 2.5;
           ctx.lineCap = 'round';
           ctx.beginPath();
@@ -903,6 +929,333 @@ function register(router, requireAuth) {
       actor: actorOf(req),
     });
     res.json({ ok: true });
+  });
+
+  // ---------- Sale packet (spec 034) ----------
+  // A checklist of the customer's files, then EITHER
+  //   (a) sign on this device - pad + printed name + Eastern time, saved as a NEW
+  //       file (nothing is overwritten), OR
+  //   (b) email the selected files as attachments - only after a confirm screen.
+  // Either one completes the sale the same way (db.completeSalePacket): Sold, a
+  // job exists, job = Measuring Scheduled, follow-up "Schedule measure". Neither
+  // sends the customer anything by itself: the "order confirmed" text/email
+  // (automations.onJobCreated) only goes out if Andrew ticks the box. Not DocuSign
+  // and not a legal e-signature service - it is a signed record on file.
+  const MAX_PACKET_ATTACH_BYTES = 18 * 1024 * 1024; // Gmail's cap is 25MB; base64 adds ~37%
+  const asArray = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : [v]);
+  const isTicked = (v) => v === true || v === '1' || v === 'on' || v === 'true';
+  const fmtBytes = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB');
+  const packetUrl = (c) => `/dashboard/customers/${c.id}/sale-packet`;
+
+  // The ticked file ids -> this customer's live files (never another customer's, never deleted ones).
+  function packetFiles(customer, ids) {
+    const wanted = new Set(asArray(ids).map(String));
+    return db.listCustomerFiles(customer.id).filter((f) => wanted.has(f.id));
+  }
+
+  function packetSummary(r, notified) {
+    return [
+      r.stage_changed ? 'Customer marked Sold' : 'Customer was already Sold',
+      r.job_created ? 'job created' : 'job already existed',
+      r.job_status_changed ? 'job status Measuring Scheduled' : `job left at ${r.job.status}`,
+      r.followup_created ? '"Schedule measure" follow-up added' : '"Schedule measure" follow-up already open',
+      notified ? 'order-confirmed message sent to the customer' : 'no message sent to the customer',
+    ].join(' · ');
+  }
+
+  // Completes the sale; texts/emails the customer ONLY when notify is true.
+  async function finishSalePacket(c, { via, actor, notify }) {
+    const result = db.completeSalePacket(c.id, { actor, via });
+    let notified = false;
+    if (notify) {
+      try {
+        await automations.onJobCreated(result.job, db.getCustomer(c.id));
+        notified = true;
+      } catch (e) {
+        console.error('onJobCreated failed', e);
+      }
+    }
+    return { result, notified, summary: packetSummary(result, notified) };
+  }
+
+  router.get('/dashboard/customers/:id/sale-packet', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const files = db.listCustomerFiles(c.id);
+    const cfg = JSON.stringify({
+      serverNow: Date.now(),
+      customer: c.name,
+      business: require('../render').BUSINESS_NAME,
+      postUrl: `${packetUrl(c)}/sign`,
+    }).replace(/</g, '\\u003c');
+    const hasEmail = isValidEmail(c.email);
+
+    const body = `
+      ${backLink(`/dashboard/customers/${c.id}`, `Back to ${escapeHtml(c.name)}`)}
+      <h1>Sale packet — ${escapeHtml(c.name)}</h1>
+      <p class="subtitle">Stage: <strong>${escapeHtml(c.sales_stage || '—')}</strong>. Pick the files that make up this sale, then either sign on this device or email them. Either one completes the sale.</p>
+
+      <form id="packet-form" method="POST" action="${packetUrl(c)}/email/review">
+        <div class="panel">
+          <h2 style="margin-top:0">1. Files in this packet</h2>
+          ${
+            files.length
+              ? `<ul class="packet-files">${files
+                  .map(
+                    (f) => `<li>
+                      <label class="packet-file"><input type="checkbox" name="file_ids" value="${f.id}" data-name="${escapeHtml(f.original_name)}">
+                        <span><span class="pf-name">${escapeHtml(f.original_name)}</span>
+                        <span class="pf-meta">${fmtBytes(f.size || 0)} · ${escapeHtml(fmtDate(f.created_at))}${f.note ? ' · ' + escapeHtml(f.note) : ''}</span></span></label>
+                      <a class="btn-link" href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">Open</a>
+                    </li>`
+                  )
+                  .join('')}</ul>`
+              : `<p class="subtitle">No files yet. Upload the contract, drawings and estimate on <a href="/dashboard/customers/${c.id}">the customer page</a> first, then come back.</p>`
+          }
+        </div>
+
+        <div class="panel">
+          <h2 style="margin-top:0">2. After it's complete</h2>
+          <p class="subtitle" style="margin-top:0">Completing marks the customer <strong>Sold</strong>, makes sure a job exists with status <strong>Measuring Scheduled</strong>, and adds a <strong>"Schedule measure"</strong> follow-up. <strong>No text or email goes to the customer</strong> unless you tick this:</p>
+          <label style="display:flex;gap:8px;align-items:flex-start;margin:0"><input type="checkbox" name="notify_customer" value="1" style="width:auto;margin-top:4px"> <span>Also text/email the customer their "order confirmed" link</span></label>
+        </div>
+
+        <div class="panel">
+          <h2 style="margin-top:0">3a. Email the selected files</h2>
+          ${
+            hasEmail
+              ? `<p class="subtitle" style="margin-top:0">To <strong>${escapeHtml(c.email)}</strong>, with the ticked files attached. You'll see a confirm screen first - nothing is sent from this button.</p>
+                 <button class="btn" type="submit">Review email…</button>`
+              : `<p class="subtitle" style="margin:0">No valid email on file for this customer. Add one on <a href="/dashboard/customers/${c.id}">their page</a> to email the packet.</p>`
+          }
+        </div>
+      </form>
+
+      <div class="panel">
+        <h2 style="margin-top:0">3b. Sign on this device</h2>
+        <label for="pk-name">Printed name</label>
+        <input id="pk-name" type="text" value="${escapeHtml(c.name)}" maxlength="100" autocomplete="off">
+        <label style="margin-top:12px">Sign in the box (finger or mouse)</label>
+        <canvas id="pk-pad" width="800" height="240" style="width:100%;height:auto;aspect-ratio:10/3;border:1px solid var(--line);border-radius:8px;background:#fff;touch-action:none;cursor:crosshair;display:block"></canvas>
+        <p class="subtitle" style="margin:8px 0 0">Signing time: <strong id="pk-stamp"></strong></p>
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="button" id="pk-sign">Sign and complete sale</button>
+          <button class="btn secondary" type="button" id="pk-clear">Clear signature</button>
+        </div>
+        <p id="pk-status" class="subtitle" style="margin-top:8px" aria-live="polite"></p>
+        <p class="subtitle" style="margin:8px 0 0">Saves a NEW image file (signature, printed name, and the Eastern time, plus the list of files) on this customer. It is a signed record on file - not DocuSign.</p>
+      </div>
+
+      <script>
+      (function () {
+        var cfg = ${cfg};
+        var offset = cfg.serverNow - Date.now(); // trust the server clock over the device clock
+        var fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        function etNow() { return fmt.format(new Date(Date.now() + offset)) + ' ET'; }
+        var stampEl = document.getElementById('pk-stamp');
+        function tick() { stampEl.textContent = etNow(); }
+        tick(); setInterval(tick, 15000);
+
+        var pad = document.getElementById('pk-pad');
+        var ctx = pad.getContext('2d');
+        ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#1a1a1a';
+        var drawing = false, last = null, inked = false;
+        function pos(e) {
+          var r = pad.getBoundingClientRect();
+          return { x: (e.clientX - r.left) * (pad.width / r.width), y: (e.clientY - r.top) * (pad.height / r.height) };
+        }
+        pad.addEventListener('pointerdown', function (e) { e.preventDefault(); pad.setPointerCapture(e.pointerId); drawing = true; last = pos(e); ctx.beginPath(); ctx.arc(last.x, last.y, 1.5, 0, 6.3); ctx.fill(); inked = true; });
+        pad.addEventListener('pointermove', function (e) {
+          if (!drawing) return;
+          e.preventDefault();
+          var p = pos(e);
+          ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+          last = p; inked = true;
+        });
+        function up() { drawing = false; }
+        pad.addEventListener('pointerup', up); pad.addEventListener('pointercancel', up);
+        document.getElementById('pk-clear').addEventListener('click', function () { ctx.clearRect(0, 0, pad.width, pad.height); inked = false; });
+
+        function checked() { return Array.prototype.slice.call(document.querySelectorAll('#packet-form input[name="file_ids"]:checked')); }
+        function fit(x, text, max) { while (text.length > 4 && x.measureText(text).width > max) text = text.slice(0, -2); return text; }
+
+        // The saved record: files list + signature + printed name + Eastern time, on one image.
+        function compose(name, names, stamp) {
+          var W = 900, M = 40, LH = 26;
+          var H = 150 + names.length * LH + 40 + 250 + 120;
+          var c = document.createElement('canvas'); c.width = W; c.height = H;
+          var x = c.getContext('2d');
+          x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+          x.fillStyle = '#2A4D3A'; x.fillRect(0, 0, W, 8);
+          x.fillStyle = '#1a1a1a'; x.textBaseline = 'alphabetic';
+          x.font = 'bold 28px Georgia, serif'; x.fillText('Sale packet - ' + fit(x, cfg.customer, 560), M, 62);
+          x.font = '17px Georgia, serif'; x.fillStyle = '#666'; x.fillText(cfg.business, M, 92);
+          x.fillStyle = '#1a1a1a'; x.font = 'bold 18px Georgia, serif'; x.fillText('Files included', M, 138);
+          x.font = '17px Georgia, serif';
+          names.forEach(function (n, i) { x.fillText('• ' + fit(x, n, W - 2 * M - 20), M + 6, 138 + (i + 1) * LH); });
+          var top = 138 + names.length * LH + 40;
+          x.strokeStyle = '#999'; x.lineWidth = 1.5; x.strokeRect(M, top, W - 2 * M, 220);
+          x.drawImage(pad, M + 6, top + 6, W - 2 * M - 12, 208);
+          var y = top + 220 + 36;
+          x.fillStyle = '#1a1a1a'; x.font = 'bold 20px Georgia, serif'; x.fillText('Signed by: ' + fit(x, name, W - 2 * M - 130), M, y);
+          x.font = '19px Georgia, serif'; x.fillText('Signed: ' + stamp, M, y + 32);
+          return c.toDataURL('image/png');
+        }
+
+        var status = document.getElementById('pk-status');
+        var signBtn = document.getElementById('pk-sign');
+        signBtn.addEventListener('click', function () {
+          var name = document.getElementById('pk-name').value.trim();
+          var boxes = checked();
+          if (!boxes.length) { status.textContent = 'Tick at least one file in step 1 first.'; return; }
+          if (!name) { status.textContent = 'Type the printed name first.'; return; }
+          if (!inked) { status.textContent = 'Please sign in the box first.'; return; }
+          signBtn.disabled = true; status.textContent = 'Saving...';
+          var names = boxes.map(function (b) { return b.getAttribute('data-name'); });
+          fetch(cfg.postUrl, {
+            method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name,
+              file_ids: boxes.map(function (b) { return b.value; }),
+              notify_customer: !!document.querySelector('#packet-form input[name="notify_customer"]:checked'),
+              data_url: compose(name, names, etNow()),
+            }),
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d.ok) { window.location.href = d.redirect; }
+              else { status.textContent = d.error || 'Something went wrong saving.'; signBtn.disabled = false; }
+            })
+            .catch(function () { status.textContent = 'Something went wrong saving. Nothing was changed.'; signBtn.disabled = false; });
+        });
+      })();
+      </script>
+    `;
+    res.send(dashboardLayout({ title: 'Sale packet', active: '/dashboard/customers', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // (a) Sign on this device.
+  router.post('/dashboard/customers/:id/sale-packet/sign', requireAuth, async (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: 'Customer not found' });
+    const name = String(req.body.name || '').trim().slice(0, 100);
+    if (!name) return res.status(400).json({ ok: false, error: 'Type the printed name first.' });
+    const files = packetFiles(c, req.body.file_ids);
+    if (!files.length) return res.status(400).json({ ok: false, error: 'Tick at least one file first.' });
+    const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(req.body.data_url || '');
+    const buffer = m ? Buffer.from(m[1], 'base64') : null;
+    if (!buffer || buffer.length < 200 || buffer.length > 4 * 1024 * 1024 || buffer.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') {
+      return res.status(400).json({ ok: false, error: 'That signature image was not valid. Nothing was saved.' });
+    }
+    const actor = actorOf(req);
+    const stamp = fmtDateTime(new Date().toISOString()); // server clock, Eastern, ends with ET
+    const storedName = `${newId()}.png`;
+    const filePath = path.join(customerUploadsDir(c.id), storedName);
+    fs.writeFileSync(filePath, buffer);
+    let done;
+    try {
+      done = await finishSalePacket(c, { via: 'signed on device', actor, notify: isTicked(req.body.notify_customer) });
+    } catch (e) {
+      try { fs.unlinkSync(filePath); } catch {}
+      console.error('sale packet sign failed', e);
+      return res.status(500).json({ ok: false, error: 'Could not complete the sale. Nothing was saved.' });
+    }
+    const safeName = name.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'customer';
+    const fileId = db.createCustomerFile({
+      customer_id: c.id,
+      job_id: done.result.job.id,
+      stored_name: storedName,
+      original_name: `sale-packet-signed-${safeName}-${etDateString()}.png`,
+      mime_type: 'image/png',
+      size: buffer.length,
+      note: `Sale packet signed on this device by ${name}, ${stamp}. Files: ${files.map((f) => f.original_name).join(', ')}`,
+    });
+    db.logActivity({ entity_type: 'file', entity_id: fileId, customer_id: c.id, field: 'sale_packet_signed', new_value: `${name} · ${stamp}`, actor });
+    res.json({ ok: true, file_id: fileId, redirect: `/dashboard/customers/${c.id}?ok=${encodeURIComponent('Sale packet signed and saved. ' + done.summary)}` });
+  });
+
+  // (b) Email the selected files - step 1 of 2: a confirm screen. Sends nothing, changes nothing.
+  router.post('/dashboard/customers/:id/sale-packet/email/review', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const back = (msg) => res.redirect(`${packetUrl(c)}?err=${encodeURIComponent(msg)}`);
+    if (!isValidEmail(c.email)) return back('No valid email on file for this customer.');
+    const files = packetFiles(c, req.body.file_ids);
+    if (!files.length) return back('Tick at least one file to email.');
+    const total = files.reduce((s, f) => s + (f.size || 0), 0);
+    if (total > MAX_PACKET_ATTACH_BYTES) return back(`Those files total ${fmtBytes(total)} - too big to email (limit ${fmtBytes(MAX_PACKET_ATTACH_BYTES)}). Untick some.`);
+    const business = require('../render').BUSINESS_NAME;
+    const phoneNo = process.env.BUSINESS_PHONE || '(804) 839-7984';
+    const first = (c.name || '').split(' ')[0] || 'there';
+    const subject = `Your ${business} project documents`;
+    const message = `Hi ${first},\n\nAttached are the documents for your project with ${business}:\n${files.map((f) => '- ' + f.original_name).join('\n')}\n\nLet me know if you have any questions.\n\nAndrew\n${business} · ${phoneNo}`;
+    const body = `
+      ${backLink(packetUrl(c), 'Back - nothing has been sent')}
+      <h1>Confirm email to ${escapeHtml(c.name)}</h1>
+      <div class="attention"><h3>Nothing has been sent yet</h3><p style="margin:0">Read it over. The email goes out, and the sale is completed, only when you press <strong>Send email and complete sale</strong>.</p></div>
+      <div class="panel">
+        <form method="POST" action="${packetUrl(c)}/email/send">
+          <input type="hidden" name="confirmed" value="1">
+          ${files.map((f) => `<input type="hidden" name="file_ids" value="${f.id}">`).join('')}
+          <label>To</label>
+          <div><strong>${escapeHtml(c.email)}</strong></div>
+          <label for="pk-subject">Subject</label>
+          <input id="pk-subject" type="text" name="subject" value="${escapeHtml(subject)}" required>
+          <label for="pk-body">Message</label>
+          <textarea id="pk-body" name="body" rows="9" required>${escapeHtml(message)}</textarea>
+          <label>Attachments (${files.length}, ${fmtBytes(total)})</label>
+          <ul style="margin:0;padding-left:18px">${files.map((f) => `<li>${escapeHtml(f.original_name)} <span class="subtitle">(${fmtBytes(f.size || 0)})</span></li>`).join('')}</ul>
+          <label style="display:flex;gap:8px;align-items:flex-start;margin-top:14px"><input type="checkbox" name="notify_customer" value="1" style="width:auto;margin-top:4px"${isTicked(req.body.notify_customer) ? ' checked' : ''}> <span>Also text/email the customer their "order confirmed" link</span></label>
+          <p class="subtitle" style="margin:10px 0 0">Completing marks the customer Sold, makes sure a job exists at Measuring Scheduled, and adds a "Schedule measure" follow-up.</p>
+          <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn" type="submit">Send email and complete sale</button>
+            <a class="btn secondary" href="${packetUrl(c)}">Back, don't send</a>
+          </div>
+        </form>
+      </div>`;
+    res.send(dashboardLayout({ title: 'Confirm packet email', active: '/dashboard/customers', body }));
+  });
+
+  // (b) step 2 of 2: only a confirmed POST sends. If the send fails, nothing is completed.
+  router.post('/dashboard/customers/:id/sale-packet/email/send', requireAuth, async (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const back = (msg) => res.redirect(`${packetUrl(c)}?err=${encodeURIComponent(msg)}`);
+    if (String(req.body.confirmed) !== '1') return back('Not sent - review and confirm the email first.');
+    if (!isValidEmail(c.email)) return back('No valid email on file for this customer. Nothing was sent.');
+    const subject = String(req.body.subject || '').trim();
+    const text = String(req.body.body || '').trim();
+    if (!subject || !text) return back('The email needs a subject and a message. Nothing was sent.');
+    const files = packetFiles(c, req.body.file_ids);
+    if (!files.length) return back('Tick at least one file to email. Nothing was sent.');
+    if (files.reduce((s, f) => s + (f.size || 0), 0) > MAX_PACKET_ATTACH_BYTES) return back('Those files are too big to email. Nothing was sent.');
+    const attachments = [];
+    for (const f of files) {
+      const p = path.join(customerUploadsDir(c.id), f.stored_name);
+      if (!fs.existsSync(p)) return back(`"${f.original_name}" is missing from disk. Nothing was sent.`);
+      attachments.push({ filename: f.original_name, path: p });
+    }
+    const sent = await email.sendEmail({
+      to: c.email,
+      subject,
+      html: `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>`,
+      customer_id: c.id,
+      logMessage: db.logMessage,
+      attachments,
+    });
+    if (!sent.ok) {
+      const why = sent.reason === 'not_configured' ? "email isn't set up on this server" : sent.reason === 'no_email_address' ? 'no valid email address' : sent.error || 'send failed';
+      return back(`The email was NOT sent (${why}). Nothing was changed - the customer is not marked Sold.`);
+    }
+    let done;
+    try {
+      done = await finishSalePacket(c, { via: 'emailed', actor: actorOf(req), notify: isTicked(req.body.notify_customer) });
+    } catch (e) {
+      console.error('sale packet email completion failed', e);
+      return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent('The packet email WAS sent, but completing the sale failed - mark the customer Sold manually.')}`);
+    }
+    db.logActivity({ entity_type: 'customer', entity_id: c.id, customer_id: c.id, field: 'sale_packet_emailed', new_value: files.map((f) => f.original_name).join(', '), actor: actorOf(req) });
+    res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent('Packet emailed to ' + c.email + '. ' + done.summary)}`);
   });
 
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {
@@ -1318,13 +1671,13 @@ function register(router, requireAuth) {
     const lead = db.getLead(req.params.id);
     if (!lead) return res.status(404).send('Lead not found');
     const { stage } = req.body;
+    if (!db.LEAD_STAGES.includes(stage)) return res.redirect(`${req.body.return_to || '/dashboard/pipeline'}?err=Unknown stage`);
     db.updateLeadStage(lead.id, stage);
     const map = {
       'New Lead': 'Bona Fide Lead',
       Contacted: 'Bona Fide Lead',
       Quoted: 'Estimate Presented',
       Sold: 'Sold',
-      Lost: 'Closed / We Declined Customer',
     };
     if (map[stage]) {
       try {
@@ -1571,6 +1924,20 @@ function register(router, requireAuth) {
       <h1>Job for ${escapeHtml(customer.name)}</h1>
       <p class="subtitle">Customer link: <a href="${statusUrl}" target="_blank">${statusUrl}</a></p>
 
+      <div class="panel" id="estimated-install">
+        <strong>Estimated install:</strong> ${job.estimated_install_at ? escapeHtml(fmtDate(job.estimated_install_at)) : 'not set'}
+        <details class="inline-details" style="display:inline">
+          <summary class="btn-link" style="display:inline;cursor:pointer">Change</summary>
+          <form method="POST" action="/dashboard/jobs/${job.id}/estimated-install" style="margin-top:8px">
+            <div class="grid cols-2">
+              <div><label for="est-install-date">Estimated install date</label><input id="est-install-date" type="date" name="estimated_install_at" value="${job.estimated_install_at ? escapeHtml(job.estimated_install_at.slice(0, 10)) : ''}"></div>
+              <div style="align-self:end"><button class="btn small" type="submit">Save</button></div>
+            </div>
+            <p class="subtitle" style="margin:8px 0 0">Optional. Leave it blank and save to clear it. It is only an estimate - it doesn't change the job status or message the customer.</p>
+          </form>
+        </details>
+      </div>
+
       <div class="grid cols-2">
         <div class="panel">
           <h2 style="margin-top:0">Update status</h2>
@@ -1745,10 +2112,16 @@ function register(router, requireAuth) {
     res.send(dashboardLayout({ title: 'Message', active: '/dashboard/messages', body, flash: flashFromQuery(req.query) }));
   });
 
+  // Live-search fragment for the Files page (spec 025). Authenticated like every
+  // other dashboard route; returns just the results markup, never a full page.
+  router.get('/dashboard/files/results', requireAuth, (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(filesResultsHtml(req.query.q));
+  });
+
   // ---------- Files search (across all customers + jobs) ----------
   router.get('/dashboard/files', requireAuth, (req, res) => {
     const q = (req.query.q || '').trim();
-    const results = q ? db.searchFiles(q) : [];
     const needsReview = db.listFilesNeedingReview();
     const allCustomers = db.listCustomers();
     const customerOptions = (selectedId) =>
@@ -1787,32 +2160,41 @@ function register(router, requireAuth) {
             </div>`
           : ''
       }
-      <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents.</p>
+      <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents. Results update as you type.</p>
       <div class="panel">
-        <form method="GET" action="/dashboard/files">
-          <div class="grid cols-3">
-            <div style="grid-column: span 2"><label>Search</label><input type="text" name="q" value="${escapeHtml(q)}" placeholder="customer name, product, invoice number, amount..." autofocus></div>
-            <div style="align-self:end"><button class="btn" type="submit">Search</button></div>
-          </div>
+        <form method="GET" action="/dashboard/files" id="files-search-form">
+          <label for="files-q">Search</label>
+          <input type="search" id="files-q" name="q" value="${escapeHtml(q)}" placeholder="customer name, product, invoice number, amount..." autocomplete="off" autofocus>
+          <noscript><div style="margin-top:8px"><button class="btn" type="submit">Search</button></div></noscript>
         </form>
-        ${
-          !q
-            ? '<p class="subtitle">Type something above to search.</p>'
-            : results.length
-              ? `<table style="margin-top:14px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${results
-                  .map(
-                    (f) => `<tr>
-                      <td><a href="/dashboard/customers/${f.customer_id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a></td>
-                      <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : ''}</td>
-                      <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
-                      <td class="subtitle" style="margin:0">${escapeHtml(f.snippet || f.note || '')}</td>
-                      <td>${fmtDate(f.created_at)}</td>
-                    </tr>`
-                  )
-                  .join('')}</table>`
-              : '<p class="subtitle">No files matched.</p>'
-        }
+        <div id="file-results" aria-live="polite">${filesResultsHtml(q)}</div>
       </div>
+      <script>
+        (function () {
+          var input = document.getElementById('files-q');
+          var box = document.getElementById('file-results');
+          var form = document.getElementById('files-search-form');
+          var timer = null, seq = 0;
+          function run() {
+            var q = input.value.trim(), mine = ++seq;
+            fetch('/dashboard/files/results?q=' + encodeURIComponent(q), { credentials: 'same-origin' })
+              .then(function (r) {
+                if (r.redirected) { window.location.reload(); return null; } // session expired -> login
+                return r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status));
+              })
+              .then(function (html) {
+                if (html === null || mine !== seq) return; // a newer keystroke already won
+                box.innerHTML = html;
+                try { history.replaceState(null, '', q ? '?q=' + encodeURIComponent(q) : window.location.pathname); } catch (e) {}
+              })
+              .catch(function () {
+                if (mine === seq) box.innerHTML = '<p class="subtitle">Could not search just now - check your connection and keep typing to retry.</p>';
+              });
+          }
+          input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(run, 150); });
+          form.addEventListener('submit', function (e) { e.preventDefault(); clearTimeout(timer); run(); });
+        })();
+      </script>
     `;
     res.send(dashboardLayout({ title: 'Files', active: '/dashboard/files', body, flash: flashFromQuery(req.query) }));
   });
@@ -2000,6 +2382,17 @@ function register(router, requireAuth) {
       tax,
     });
     res.redirect(`/dashboard/jobs/${job.id}?ok=Payment recorded`);
+  });
+
+  router.post('/dashboard/jobs/:id/estimated-install', requireAuth, (req, res) => {
+    const job = db.getJob(req.params.id);
+    if (!job) return res.status(404).send('Job not found');
+    try {
+      db.updateJobEstimatedInstall(job.id, req.body.estimated_install_at, actorOf(req));
+    } catch (e) {
+      return res.redirect(`/dashboard/jobs/${job.id}?err=${encodeURIComponent(e.message)}`);
+    }
+    res.redirect(`/dashboard/jobs/${job.id}?ok=Estimated install date updated`);
   });
 
   router.post('/dashboard/jobs/:id/sold-amount', requireAuth, (req, res) => {

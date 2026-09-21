@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const { DatabaseSync } = require('node:sqlite');
-const { newId, newToken, nowIso } = require('./util');
+const { newId, newToken, nowIso, dateInputToIso, etDateString } = require('./util');
 
 // DB location is overridable via BOS_DB_PATH so the test suite can run against
 // a throwaway file instead of the live database. Production/dev leave it unset.
@@ -560,7 +560,17 @@ CREATE TABLE IF NOT EXISTS sales_consultants (
 // ---- Funnel / job stage config ----
 // LEGACY lead stages - kept so the old leads table + funnel keep working while
 // the customer-level sales model (SALES_STAGES below) becomes the source of truth.
-const LEAD_STAGES = ['New Lead', 'Contacted', 'Quoted', 'Sold', 'Lost'];
+// There is deliberately NO "Lost" (spec 001): not buying is not "lost", and
+// "Closed / We Declined Customer" means we walked away. Old lead rows that still
+// carry the retired value are left exactly as they are (no history rewrite);
+// they simply aren't a valid stage to set, and they never count as an open lead.
+const LEAD_STAGES = ['New Lead', 'Contacted', 'Quoted', 'Sold'];
+// A lead still in play = every legacy stage except Sold. A booking reuses one of
+// these; anything else (Sold, or a retired legacy value) gets a fresh lead.
+const OPEN_LEAD_STAGES = LEAD_STAGES.filter((s) => s !== 'Sold');
+function assertLeadStage(stage) {
+  if (!LEAD_STAGES.includes(stage)) throw new Error(`Unknown lead stage: ${stage}. Valid: ${LEAD_STAGES.join(', ')}`);
+}
 
 // ---- Sales model (Phase 2) -------------------------------------------------
 // The PRIMARY, measurable stage of the opportunity. There is deliberately no
@@ -609,6 +619,8 @@ const STAGE_SUBSTATUSES = {
 // appt > legacy lead stage). Only runs for customers whose sales_stage is
 // still NULL, so it never overwrites a stage that's been set intentionally. ----
 (function backfillSalesStage() {
+  // Legacy-row translation only: an old leads row that still says 'Lost' (retired,
+  // spec 001) maps to the customer-level closed stage. Nothing can SET Lost any more.
   const legacyMap = {
     'New Lead': 'Bona Fide Lead',
     Contacted: 'Bona Fide Lead',
@@ -660,12 +672,84 @@ const JOB_STAGES = [
   db.prepare(`UPDATE jobs SET status = 'Install Scheduled' WHERE status = 'Installing'`).run();
   db.prepare(`UPDATE job_status_history SET status = 'Install Scheduled' WHERE status = 'Installing'`).run();
 })();
-const APPT_TYPES = ['Short Design Consultation', 'Long Design Consultation', 'Design Review', 'Repair or Warranty', 'Install'];
+// ---- Migration (spec 033): optional estimated install date on a job. Additive,
+// nullable, never back-filled - it is only ever set by a person (or a later,
+// explicit feature), never derived from measurements. ----
+(function migrateJobsEstimatedInstall() {
+  const existing = new Set(db.prepare(`PRAGMA table_info(jobs)`).all().map((c) => c.name));
+  if (!existing.has('estimated_install_at')) db.exec(`ALTER TABLE jobs ADD COLUMN estimated_install_at TEXT`);
+})();
+const APPT_TYPES = ['Short Design Consultation', 'Long Design Consultation', 'Design Review', 'Repair or Warranty', 'Measure', 'Install'];
+// Internal-only types (spec 034): scheduled from the dashboard, never offered on
+// the public /book page, and never counted as a design appointment (the KPI
+// funnel reads customers.sales_stage; stage auto-advance only fires for
+// design/consultation types; consultant stats skip 'Measure').
+const INTERNAL_APPT_TYPES = ['Measure', 'Install'];
 
 // Per-product factory pipeline - separate from JOB_STAGES (the coarse,
 // customer-facing status). This is the internal, per-piece tracking that
 // feeds the Factory Queue.
 const PRODUCT_STAGES = ['Queued for Factory', 'Sent to Factory', 'In Production', 'Ready for Delivery', 'Delivered'];
+
+// ---- Sale packet completion (spec 034) -------------------------------------
+// Runs when a packet is signed on this device OR emailed (with confirmation).
+// Either way, exactly the same outcome:
+//   - customer sales_stage -> Sold (and their open legacy lead -> Sold)
+//   - a job exists (reuse the customer's newest unfinished job, else create one)
+//   - that job's status -> Measuring Scheduled (never moves a job BACKWARD)
+//   - one open follow-up "Schedule measure" (never a duplicate)
+// It deliberately sends NOTHING. The caller decides, on Andrew's explicit yes,
+// whether to also fire automations.onJobCreated (the customer text/email).
+// Safe to run twice: every step is a no-op if it's already true.
+const SALE_PACKET_FOLLOWUP_TITLE = 'Schedule measure';
+function completeSalePacket(customer_id, { actor, via } = {}) {
+  const c = getCustomer(customer_id);
+  if (!c) throw new Error('Customer not found');
+  const who = actor || 'user';
+  const note = `Sale packet ${via || 'completed'}`;
+  const out = { customer_id, stage_changed: false, job: null, job_created: false, job_status_changed: false, followup_created: false };
+  db.exec('BEGIN;');
+  try {
+    if (c.sales_stage !== 'Sold') {
+      setSalesStage(customer_id, 'Sold', { substatus: null, actor: who, note });
+      out.stage_changed = true;
+    }
+    const leads = listLeads().filter((l) => l.customer_id === customer_id);
+    const openLead = leads.find((l) => OPEN_LEAD_STAGES.includes(l.stage));
+    if (openLead) updateLeadStage(openLead.id, 'Sold');
+
+    let job = listJobs()
+      .filter((j) => j.customer_id === customer_id && j.status !== 'Complete')
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+    if (!job) {
+      const lead = openLead || leads.find((l) => l.stage === 'Sold') || null;
+      job = createJob({ lead_id: lead ? lead.id : null, customer_id, sold_amount: lead ? lead.estimate_value : null });
+      out.job_created = true;
+    }
+    if (JOB_STAGES.indexOf(job.status) < JOB_STAGES.indexOf('Measuring Scheduled')) {
+      job = updateJobStatus(job.id, 'Measuring Scheduled', note);
+      out.job_status_changed = true;
+    }
+    out.job = getJob(job.id);
+
+    if (!listFollowups(customer_id).some((f) => f.title === SALE_PACKET_FOLLOWUP_TITLE)) {
+      createFollowup({
+        customer_id,
+        kind: 'next_action',
+        title: SALE_PACKET_FOLLOWUP_TITLE,
+        due_at: dateInputToIso(etDateString()),
+        created_by: who,
+      });
+      out.followup_created = true;
+    }
+    logActivity({ entity_type: 'customer', entity_id: customer_id, customer_id, field: 'sale_packet_completed', new_value: via || 'completed', actor: who });
+    db.exec('COMMIT;');
+  } catch (e) {
+    db.exec('ROLLBACK;');
+    throw e;
+  }
+  return out;
+}
 
 // ---- Bookkeeping categories ----
 // Loosely mirrors Schedule C style line items, simplified for a small shop.
@@ -757,6 +841,7 @@ function updateCustomer(id, { name, phone, email, address, notes }, { actor } = 
 
 // ---- Leads ----
 function createLead({ customer_id, stage, source, estimate_value, notes, consultant_id }) {
+  if (stage) assertLeadStage(stage);
   const id = newId();
   const ts = nowIso();
   db.prepare(
@@ -777,6 +862,7 @@ function listLeads() {
     .all();
 }
 function updateLeadStage(id, stage) {
+  assertLeadStage(stage);
   db.prepare(`UPDATE leads SET stage=?, updated_at=? WHERE id=?`).run(stage, nowIso(), id);
   return getLead(id);
 }
@@ -862,6 +948,28 @@ function updateJobSoldAmount(id, sold_amount) {
     nowIso(),
     id
   );
+  return getJob(id);
+}
+// Set / change / clear (blank) the estimated install date. Stored the same way
+// as other due dates: an ISO timestamp at noon UTC, so it is the same calendar
+// day in Eastern time. Audited in the activity log.
+function updateJobEstimatedInstall(id, value, actor) {
+  const job = getJob(id);
+  if (!job) return null;
+  const raw = value === undefined || value === null ? '' : String(value).trim();
+  const iso = raw ? dateInputToIso(raw) : null;
+  if (raw && !iso) throw new Error('Not a valid date');
+  if ((job.estimated_install_at || null) === iso) return job;
+  db.prepare(`UPDATE jobs SET estimated_install_at = ?, updated_at = ? WHERE id = ?`).run(iso, nowIso(), id);
+  logActivity({
+    entity_type: 'job',
+    entity_id: id,
+    customer_id: job.customer_id,
+    field: 'estimated_install_at',
+    old_value: job.estimated_install_at || null,
+    new_value: iso,
+    actor: actor || 'user',
+  });
   return getJob(id);
 }
 function getJob(id) {
@@ -1179,6 +1287,22 @@ function searchFiles(query) {
        LIMIT 50`
     )
     .all(match);
+}
+// Newest files first, for the Files page when nothing has been typed yet (spec 025).
+// Same shape as searchFiles() rows so one renderer serves both; snippet is null.
+function listRecentFiles(limit = 50) {
+  const n = Math.max(1, Math.min(200, Number(limit) || 50));
+  return db
+    .prepare(
+      `SELECT customer_files.*, customers.name as customer_name, jobs.status as job_status, NULL as snippet
+       FROM customer_files
+       LEFT JOIN customers ON customers.id = customer_files.customer_id
+       LEFT JOIN jobs ON jobs.id = customer_files.job_id
+       WHERE customer_files.deleted_at IS NULL
+       ORDER BY customer_files.created_at DESC, customer_files.rowid DESC
+       LIMIT ?`
+    )
+    .all(n);
 }
 function deleteCustomerFile(id) {
   db.prepare(`DELETE FROM customer_files WHERE id = ?`).run(id);
@@ -1896,7 +2020,7 @@ function consultantScoreboard({ start, end } = {}) {
         .prepare(`SELECT COUNT(*) n FROM customers WHERE consultant_id = ?${inRange('COALESCE(first_contact_at, created_at)')}`)
         .get(con.id).n;
       const appts = db
-        .prepare(`SELECT status FROM appointments WHERE consultant_id = ?${inRange('created_at')}`)
+        .prepare(`SELECT status FROM appointments WHERE consultant_id = ? AND type != 'Measure'${inRange('created_at')}`)
         .all(con.id);
       const appointments_booked = appts.length;
       const appointments_completed = appts.filter((a) => a.status === 'completed').length;
@@ -2373,8 +2497,12 @@ module.exports = {
   db,
   DATA_DIR,
   LEAD_STAGES,
+  OPEN_LEAD_STAGES,
   JOB_STAGES,
   APPT_TYPES,
+  INTERNAL_APPT_TYPES,
+  SALE_PACKET_FOLLOWUP_TITLE,
+  completeSalePacket,
   PRODUCT_STAGES,
   INCOME_CATEGORIES,
   EXPENSE_CATEGORIES,
@@ -2460,6 +2588,7 @@ module.exports = {
   updateAppointmentStatus,
   createJob,
   updateJobSoldAmount,
+  updateJobEstimatedInstall,
   getJob,
   getJobByToken,
   listJobs,
@@ -2488,6 +2617,7 @@ module.exports = {
   attachFileToJob,
   setFileExtraction,
   searchFiles,
+  listRecentFiles,
   deleteCustomerFile,
   createSalesRep,
   listSalesReps,

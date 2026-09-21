@@ -307,7 +307,9 @@ const TYPE_DESCRIPTIONS = {
 };
 
 // Public-facing order: schedulable types (minus internal-only "Install"), then the two quick-request options.
-const PUBLIC_TYPE_ORDER = [...db.APPT_TYPES.filter((t) => t !== 'Install'), ...REQUEST_TYPES];
+const PUBLIC_TYPE_ORDER = [...db.APPT_TYPES.filter((t) => !db.INTERNAL_APPT_TYPES.includes(t)), ...REQUEST_TYPES];
+// A hand-typed ?type=Measure (or Install) must not open a public booking for an internal type.
+const publicType = (t) => (db.INTERNAL_APPT_TYPES.includes(t) ? PUBLIC_TYPE_ORDER[0] : t || PUBLIC_TYPE_ORDER[0]);
 
 // ---------- 5-question discovery wizard (asked on every booking / request form) ----------
 const ROOM_OPTIONS = ['Kitchen', 'Bathroom(s)', 'Garage', 'Shop', 'Studio', 'Commercial', 'Hidden kick-panel', 'Closet'];
@@ -586,7 +588,7 @@ async function createBooking({ name, phone, email, address, slotIso, type, consu
   }
 
   const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
-  let lead = existingLeads.find((l) => l.stage !== 'Sold' && l.stage !== 'Lost');
+  let lead = existingLeads.find((l) => db.OPEN_LEAD_STAGES.includes(l.stage));
   if (!lead) {
     lead = db.createLead({
       customer_id: customer.id,
@@ -705,7 +707,7 @@ function voiceBookingSlots({ address, near, type, count = 4, fromDate, toDate } 
 function register(router) {
   // ---------- Step 1-2: service + contact/address, then the 4 time options ----------
   router.get('/book', (req, res) => {
-    const type = req.query.type || PUBLIC_TYPE_ORDER[0];
+    const type = publicType(req.query.type);
     const isRequestType = REQUEST_TYPES.includes(type);
     const { name, phone, email, address, hasContact } = bookingContact(req.query);
     const duration = durationForType(type);
@@ -871,7 +873,7 @@ function register(router) {
 
   // ---------- Step 4: final confirmation (name, address, date, time) ----------
   router.get('/book/review', (req, res) => {
-    const type = req.query.type || PUBLIC_TYPE_ORDER[0];
+    const type = publicType(req.query.type);
     const { name, phone, email, address, hasContact } = bookingContact(req.query);
     const slotIso = req.query.slot || '';
     const when = slotIso ? new Date(slotIso) : null;
@@ -921,7 +923,7 @@ function register(router) {
   // ---------- The ONLY thing that creates the appointment ----------
   async function doConfirm(req, res) {
     const body = req.body || {};
-    const type = body.type || PUBLIC_TYPE_ORDER[0];
+    const type = publicType(body.type);
     // A form with the edit-details <details> open sends the field twice - the
     // last value wins in querystring.parse only when it's an array; take the
     // last non-empty in that case so an edit ("Donna" -> "Donna Test") sticks

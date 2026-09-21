@@ -40,7 +40,7 @@ self.addEventListener('fetch', (e) => {
     fetch(req).catch(() => {
       if (req.mode === 'navigate') {
         return new Response(
-          '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Georgia,serif;background:#1e3d22;color:#e9dfc4;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center;padding:24px"><div><h1 style="font-style:italic">The BOS</h1><p>You are offline. Reconnect to load live business data.</p><p><a href="/dashboard" style="color:#d9a628">Retry</a></p></div>',
+          '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Georgia,serif;background:#2A4D3A;color:#e9dfc4;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center;padding:24px"><div><h1 style="font-style:italic">The BOS</h1><p>You are offline. Reconnect to load live business data.</p><p><a href="/dashboard" style="color:#C4A35A">Retry</a></p></div>',
           { headers: { 'Content-Type': 'text/html' } }
         );
       }

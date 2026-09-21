@@ -31,11 +31,40 @@ function fmtDate(iso) {
   return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+// Always US Eastern, and says so ("Sep 20, 2026, 2:14 PM ET") - the server's own
+// zone must never leak into what Andrew reads. Display only: stored timestamps
+// are UTC ISO and are not rewritten (spec 028).
 function fmtDateTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
-  return d.toLocaleString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return (
+    d.toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }) + ' ET'
+  );
+}
+
+// Compact Eastern clock for the assistant's system prompt: "Sun 9/20 2:14p ET".
+// (spec 047) Pass a Date to get a fixed value in tests.
+function fmtNowET(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).formatToParts(date);
+  const p = (type) => (parts.find((x) => x.type === type) || {}).value || '';
+  const ap = p('dayPeriod').toUpperCase().startsWith('P') ? 'p' : 'a';
+  return `${p('weekday')} ${p('month')}/${p('day')} ${p('hour')}:${p('minute')}${ap} ET`;
 }
 
 // Activity log field/old_value/new_value are free-text - some carry a raw ISO
@@ -59,6 +88,23 @@ function humanizeActivityValue(value) {
       }) + ' ET'
     );
   });
+}
+
+// Today's calendar date in US Eastern as "YYYY-MM-DD" (en-CA formats that way).
+function etDateString(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+}
+
+// A calendar-date <input type="date"> value ("2026-09-25") -> a due timestamp.
+// new Date("2026-09-25") is midnight UTC, i.e. 8pm ET the evening BEFORE, so a
+// snoozed-to date would show a day early. Noon UTC is the same calendar day in
+// Eastern time all year (7am/8am ET). Anything else is parsed as-is; junk -> null.
+function dateInputToIso(value) {
+  const v = String(value || '').trim();
+  if (!v) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return `${v}T12:00:00.000Z`;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 function nowIso() {
@@ -168,6 +214,9 @@ module.exports = {
   fmtMoney,
   fmtDate,
   fmtDateTime,
+  fmtNowET,
+  dateInputToIso,
+  etDateString,
   humanizeActivityValue,
   fmtRelativeDue,
   nowIso,

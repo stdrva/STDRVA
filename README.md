@@ -34,7 +34,11 @@ That's it - no database setup, no build step. Data is stored in
 
 ## How the funnel works
 
-`New Lead → Contacted → Quoted → Sold → Lost`
+`New Lead → Contacted → Quoted → Sold`
+
+There is no "Lost" stage. A customer who simply hasn't bought is still active (or dormant) -
+"didn't buy" is not "lost". `Closed / We Declined Customer` (customer-level stage) is only for
+when *we* walked away.
 
 - Add a lead from the Funnel page (creates the customer too if new) or from
   an existing customer's page. A welcome text/email goes out automatically.

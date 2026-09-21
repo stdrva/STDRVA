@@ -11,7 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
-const { isValidEmail } = require('../util');
+const { isValidEmail, fmtNowET } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -114,7 +114,7 @@ const BASE_TOOLS = [
       type: 'object',
       properties: {
         customer_id: { type: 'string' },
-        stage: { type: 'string', enum: ['New Lead', 'Contacted', 'Quoted', 'Sold', 'Lost'] },
+        stage: { type: 'string', enum: ['New Lead', 'Contacted', 'Quoted', 'Sold'] },
         source: { type: 'string', description: 'How they found us, e.g. "Richmond Home Show", "Referral", "Phone call"' },
         estimate_value: { type: 'number' },
         notes: { type: 'string' },
@@ -129,7 +129,7 @@ const BASE_TOOLS = [
       type: 'object',
       properties: {
         lead_id: { type: 'string' },
-        stage: { type: 'string', enum: ['New Lead', 'Contacted', 'Quoted', 'Sold', 'Lost'] },
+        stage: { type: 'string', enum: ['New Lead', 'Contacted', 'Quoted', 'Sold'] },
         source: { type: 'string' },
         estimate_value: { type: 'number' },
         notes: { type: 'string' },
@@ -752,12 +752,14 @@ function runTool(name, input) {
       return { ok: true, customer };
     }
     case 'create_lead': {
+      if (input.stage && !db.LEAD_STAGES.includes(input.stage)) return { error: `Unknown lead stage. Valid: ${db.LEAD_STAGES.join(', ')}` };
       const lead = db.createLead(input);
       return { lead };
     }
     case 'update_lead': {
       const existing = db.getLead(input.lead_id);
       if (!existing) return { error: 'Lead not found' };
+      if (input.stage && !db.LEAD_STAGES.includes(input.stage)) return { error: `Unknown lead stage. Valid: ${db.LEAD_STAGES.join(', ')}` };
       if (input.stage && input.stage !== existing.stage) db.updateLeadStage(input.lead_id, input.stage);
       const lead = db.updateLead(input.lead_id, {
         source: input.source ?? existing.source,
@@ -1339,11 +1341,24 @@ pets, prior experience, what to show them) - the appointment comes first.
 Never reject a booking for being out of area; if the salesperson said book anyway, book
 anyway - the address is still recorded and Andrew is still notified.`;
 
+// Silent clock (spec 047). Added on every call - never cached - so "today" and
+// "tomorrow" resolve against the real Eastern time, not the model's guess.
+// opts.now is only for tests.
+function clockPrompt(now) {
+  return `
+
+CLOCK. Now: ${fmtNowET(now)}
+That is the current US Eastern date and time. Use it silently to work out "today", "tomorrow",
+"this Friday", "next week" and the year. Never read it aloud, repeat it, or mention that you
+checked it - in text or in Voice Mode. Only say the date or time if Andrew asks for it.`;
+}
+
 function systemPrompt(opts = {}) {
   return (
     SYSTEM_PROMPT +
     (opts.mode === 'voice' ? VOICE_PROMPT : '') +
-    (SALES_TRAINING_ENABLED ? SALES_TRAINING_PROMPT : '')
+    (SALES_TRAINING_ENABLED ? SALES_TRAINING_PROMPT : '') +
+    clockPrompt(opts.now)
   );
 }
 
@@ -1601,4 +1616,4 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
   }
 }
 
-module.exports = { handleMessage, assistantConfigured, resetConversation, getHistory, runTool, TOOLS };
+module.exports = { handleMessage, assistantConfigured, resetConversation, getHistory, runTool, systemPrompt, TOOLS };

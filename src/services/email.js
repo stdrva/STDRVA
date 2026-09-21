@@ -11,16 +11,19 @@ function emailConfigured() {
 }
 
 let cachedTransporter = null;
-let cachedForUser = null;
+let cachedForKey = null;
 
 // Rebuilds the transporter if GMAIL_USER changes (e.g. between tests) rather
 // than caching one forever across a process that never changes its own env.
 function transporter() {
-  if (cachedTransporter && cachedForUser === process.env.GMAIL_USER) return cachedTransporter;
-  cachedForUser = process.env.GMAIL_USER;
+  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
+  const port = Number(process.env.SMTP_PORT) || 587;
+  const key = `${process.env.GMAIL_USER}|${host}|${port}`;
+  if (cachedTransporter && cachedForKey === key) return cachedTransporter;
+  cachedForKey = key;
   cachedTransporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
+    host, // SMTP_HOST / SMTP_PORT exist only so tests can point at a local fake server
+    port,
     secure: false, // STARTTLS, not implicit TLS
     auth: {
       user: process.env.GMAIL_USER,
@@ -50,7 +53,7 @@ function htmlToText(html) {
     .trim();
 }
 
-async function sendRaw({ to, subject, html }) {
+async function sendRaw({ to, subject, html, attachments }) {
   try {
     const info = await transporter().sendMail({
       from: `${process.env.BUSINESS_NAME || 'Shelves to Drawers RVA'} <${process.env.GMAIL_USER}>`,
@@ -58,6 +61,7 @@ async function sendRaw({ to, subject, html }) {
       subject,
       html,
       text: htmlToText(html),
+      ...(attachments && attachments.length ? { attachments } : {}),
     });
     // info.response is Gmail's raw SMTP response line (e.g. "250 2.0.0 OK
     // 1700000000 abc123-xyz - gsmtp") - accepted-for-delivery, not proof of
@@ -69,24 +73,27 @@ async function sendRaw({ to, subject, html }) {
   }
 }
 
-async function sendEmail({ to, subject, html, customer_id, logMessage }) {
+// attachments: [{ filename, path }] (nodemailer format). The logged message body
+// notes their names, since the messages table has no attachment column.
+async function sendEmail({ to, subject, html, customer_id, logMessage, attachments }) {
+  const attachNote = attachments && attachments.length ? '\n[Attachments: ' + attachments.map((a) => a.filename).join(', ') + ']' : '';
   if (!isValidEmail(to)) {
-    if (logMessage) logMessage({ customer_id, direction: 'out', channel: 'email', subject, body: html, to_address: to, status: 'no_email_address' });
+    if (logMessage) logMessage({ customer_id, direction: 'out', channel: 'email', subject, body: html + attachNote, to_address: to, status: 'no_email_address' });
     return { ok: false, reason: 'no_email_address' };
   }
   if (!emailConfigured()) {
     console.log(`[Email - not configured] Would email ${to}: ${subject}`);
-    if (logMessage) logMessage({ customer_id, direction: 'out', channel: 'email', subject, body: html, to_address: to, status: 'not_configured (see console)' });
+    if (logMessage) logMessage({ customer_id, direction: 'out', channel: 'email', subject, body: html + attachNote, to_address: to, status: 'not_configured (see console)' });
     return { ok: false, reason: 'not_configured' };
   }
-  const result = await sendRaw({ to, subject, html });
+  const result = await sendRaw({ to, subject, html, attachments });
   if (logMessage) {
     logMessage({
       customer_id,
       direction: 'out',
       channel: 'email',
       subject,
-      body: html,
+      body: html + attachNote,
       to_address: to,
       status: result.ok ? 'sent' : `failed: ${result.error}`,
       provider_response: result.ok ? result.response : result.error,

@@ -16,11 +16,11 @@ html { scroll-behavior: smooth; }
   --ink: #1a1a1a;
   --muted: #666666;
   --line: #e0e0e0;
-  --brand: #1e3d22;
-  --brand-dark: #16301a;
+  --brand: #2A4D3A;
+  --brand-dark: #1F3A2C;
   --brand-ink: #ffffff;
-  --gold: #d9a628;
-  --gold-dark: #b9871a;
+  --gold: #C4A35A;
+  --gold-dark: #9C7F3C;
   --good: #3f7a4d;
   --warn: #b3541e;
   --bad: #a83232;
@@ -41,22 +41,10 @@ h1, h2, h3, .brand, .btn { font-family: var(--font-display); }
 .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
 .narrow { max-width: 640px; margin: 0 auto; padding: 0 20px; }
 
-/* Top nav */
-.topnav {
-  background: var(--brand);
-  color: var(--brand-ink);
-  border-bottom: 3px solid var(--gold);
-}
-.topnav .wrap { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; flex-wrap: wrap; gap: 8px; }
-.topnav .brand { font-weight: 700; font-style: italic; font-size: 1.1rem; color: #fff; text-decoration: none; }
-.topnav nav a {
-  color: #e9dfc4;
-  text-decoration: none;
-  margin-left: 18px;
-  font-size: 0.9rem;
-  font-family: var(--font-body);
-}
-.topnav nav a:hover, .topnav nav a.active { color: var(--gold); text-decoration: underline; }
+/* Top nav - white bar, wordmark logo (spec 046). Layout details are in the
+   046 section near the end of this file. */
+.topnav { background: #fff; color: var(--ink); border-bottom: 1px solid var(--line); }
+.topnav .wrap { display: flex; align-items: center; justify-content: space-between; padding: 8px 20px; gap: 8px; }
 
 main { padding: 24px 0 60px; }
 h1 { font-size: 1.6rem; margin: 0 0 6px; font-weight: 700; }
@@ -139,7 +127,6 @@ textarea { min-height: 70px; }
 .badge.contacted { background: #f5edd8; color: #8a6d1f; }
 .badge.quoted { background: #efe1f3; color: #6d3a80; }
 .badge.sold { background: #e1f0e3; color: var(--good); }
-.badge.lost { background: #f3e1e1; color: var(--bad); }
 
 .timeline { list-style: none; margin: 0; padding: 0; }
 .timeline li { padding: 10px 0 10px 26px; border-left: 2px solid var(--line); position: relative; margin-left: 6px; }
@@ -199,7 +186,7 @@ textarea { min-height: 70px; }
   border: 2px solid var(--line); background: #fff; border-radius: 10px; padding: 14px 14px;
   text-decoration: none; color: inherit; transition: all 0.15s ease;
 }
-.slot-card:hover { border-color: var(--gold); background: #fffbf0; box-shadow: 0 2px 8px rgba(217,166,40,0.15); }
+.slot-card:hover { border-color: var(--gold); background: #fffbf0; box-shadow: 0 2px 8px rgba(196,163,90,0.15); }
 .slot-card .slot-day { font-weight: 700; font-size: 0.92rem; }
 .slot-card .slot-time { font-size: 1.05rem; color: var(--brand); font-weight: 700; }
 
@@ -227,7 +214,7 @@ textarea { min-height: 70px; }
 .slot-btn:hover { 
   border-color: var(--gold); 
   background: #fffbf0;
-  box-shadow: 0 2px 6px rgba(217, 166, 40, 0.15);
+  box-shadow: 0 2px 6px rgba(196, 163, 90, 0.15);
 }
 .slot-btn.selected { 
   border-color: var(--brand); 
@@ -348,18 +335,28 @@ footer.public-footer .phone { color: var(--gold); font-weight: 700; }
 }
 .type-card:hover { 
   border-color: var(--gold);
-  box-shadow: 0 4px 12px rgba(217, 166, 40, 0.15);
+  box-shadow: 0 4px 12px rgba(196, 163, 90, 0.15);
   transform: translateY(-2px);
 }
-.type-card.selected { 
-  border-color: var(--brand); 
-  background: #f0f4f1;
-  box-shadow: 0 2px 8px rgba(30, 61, 34, 0.15);
-}
+.type-card { position: relative; }
 .type-card.featured { 
   border: 2px solid var(--gold); 
   background: #fdfbf5;
-  box-shadow: 0 4px 12px rgba(217, 166, 40, 0.2);
+  box-shadow: 0 4px 12px rgba(196, 163, 90, 0.2);
+}
+/* Selected must beat featured (spec 022): declared AFTER .featured, and the
+   compound selector keeps the emerald border/fill even on the featured card. */
+.type-card.selected,
+.type-card.featured.selected {
+  border-color: var(--brand);
+  background: #e8f0ea;
+  box-shadow: 0 0 0 3px rgba(42, 77, 58, 0.22);
+}
+.type-card.selected::after {
+  content: "\2713  Selected";
+  position: absolute; top: 12px; right: 14px;
+  background: var(--brand); color: #fff; border-radius: 999px;
+  padding: 2px 10px; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.02em;
 }
 .type-card .type-name { 
   font-family: var(--font-display); 
@@ -392,47 +389,6 @@ footer.public-footer .phone { color: var(--gold); font-weight: 700; }
    ============================================================ */
 
 body.dash { padding-bottom: 96px; } /* room so the assistant never covers content */
-
-/* --- Top nav rework --- */
-.topnav-inner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.topnav-links { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1; }
-.topnav-links a {
-  color: #e9dfc4; text-decoration: none; font-size: 0.92rem;
-  padding: 8px 10px; border-radius: 7px; font-family: var(--font-body);
-  min-height: 40px; display: inline-flex; align-items: center;
-}
-.topnav-links a:hover { background: rgba(255,255,255,0.08); text-decoration: none; }
-.topnav-links a.active { color: var(--gold); background: rgba(0,0,0,0.18); }
-.nav-more { position: relative; }
-.nav-more summary {
-  list-style: none; cursor: pointer; color: #e9dfc4; font-size: 0.92rem;
-  padding: 8px 10px; border-radius: 7px; min-height: 40px; display: inline-flex; align-items: center;
-}
-.nav-more summary::-webkit-details-marker { display: none; }
-.nav-more[open] summary { background: rgba(0,0,0,0.18); color: var(--gold); }
-.nav-more-menu {
-  position: absolute; right: 0; top: 100%; margin-top: 6px; z-index: 50;
-  background: var(--brand-dark); border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 10px; padding: 6px; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-  display: flex; flex-direction: column;
-}
-.nav-more-menu a { display: block; width: 100%; }
-.nav-logout { color: #b9a97e; text-decoration: none; font-size: 0.82rem; }
-.nav-logout:hover { color: var(--gold); }
-
-@media (max-width: 720px) {
-  .topnav-inner { gap: 6px; }
-  .brand { font-size: 1rem; flex-basis: 100%; }
-  .topnav-links { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
-  .topnav-links a, .nav-more summary { white-space: nowrap; }
-  /* position:fixed here (to escape .topnav-links' overflow-x:auto clipping)
-     inherits the desktop rule's `top: 100%` - but for a fixed element that
-     means 100% of the VIEWPORT height, not "just below .nav-more", so the
-     menu rendered entirely off-screen below the fold. Anchor to the bottom
-     of the viewport instead, which needs no knowledge of the (two-row on
-     mobile) topnav's actual height. */
-  .nav-more-menu { position: fixed; top: auto; bottom: 12px; left: 12px; right: 12px; max-height: 60vh; overflow-y: auto; }
-}
 
 .msg { margin-top: 0; margin-bottom: 18px; }
 
@@ -558,7 +514,7 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
 .aw-file-label { margin: 6px 0 0; font-size: 0.72rem; opacity: 0.75; }
 #assistant-launch {
   position: fixed; right: 14px; bottom: 14px; z-index: 900; width: 56px; height: 56px; border-radius: 50%;
-  border: 0; background: #1f2430; color: #d9a628; font-weight: 800; font-size: 1rem; letter-spacing: 0.02em;
+  border: 0; background: #1f2430; color: #C4A35A; font-weight: 800; font-size: 1rem; letter-spacing: 0.02em;
   box-shadow: 0 8px 24px rgba(0,0,0,0.35); cursor: pointer;
 }
 @media (max-width: 480px) {
@@ -572,7 +528,7 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
   position: fixed; left: 14px; bottom: 14px; z-index: 901;
   display: inline-flex; align-items: center; gap: 7px;
   padding: 12px 18px; border: 0; border-radius: 999px; cursor: pointer;
-  background: #1e3d22; color: #e9dfc4; font-weight: 800; font-size: 0.95rem;
+  background: #2A4D3A; color: #e9dfc4; font-weight: 800; font-size: 0.95rem;
   box-shadow: 0 8px 24px rgba(0,0,0,0.32);
 }
 #voice-launch span { letter-spacing: 0.02em; }
@@ -591,7 +547,7 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
 .vm-orb {
   width: 128px; height: 128px; border-radius: 50%; border: 0; cursor: pointer;
   background: radial-gradient(circle at 35% 30%, #2f5d3a, #1c3a25);
-  box-shadow: 0 0 0 0 rgba(217,166,40,0.5); color: #f0ead9; font-size: 2.4rem;
+  box-shadow: 0 0 0 0 rgba(196,163,90,0.5); color: #f0ead9; font-size: 2.4rem;
   display: flex; align-items: center; justify-content: center; transition: transform 0.15s ease;
 }
 .vm-orb:active { transform: scale(0.96); }
@@ -620,3 +576,110 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
 .kpi-step .k-num { font-size: 1.3rem; font-weight: 800; font-family: var(--font-display); }
 .kpi-rate { display: inline-block; padding: 2px 8px; background: #eef2ee; border-radius: 6px; font-size: 0.8rem; color: var(--brand); }
 .denominator-note { color: var(--muted); font-size: 0.8rem; }
+
+/* ============================================================
+   046 - Chrome: white top bar + logo, bottom bar on phone, Menu sheet.
+   Kept at the END of the file so the phone overrides below beat the earlier
+   assistant / voice button rules (equal specificity, later wins).
+   ============================================================ */
+:root { --bottomnav-h: 0px; }
+
+.topnav-inner { display: flex; align-items: center; gap: 12px; }
+.brand-logo { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.brand-logo img { display: block; height: 44px; width: auto; } /* phone: 44px tall */
+
+/* Desktop / tablet: the four destinations live in the top bar. */
+.topnav-links { display: none; align-items: center; justify-content: flex-end; gap: 4px; flex: 1; }
+.topnav-links a, .nav-menu-btn {
+  color: var(--ink); text-decoration: none; font-family: var(--font-body); font-size: 0.95rem;
+  padding: 8px 14px; border-radius: 7px; min-height: 40px; display: inline-flex; align-items: center;
+  background: none; border: 0; cursor: pointer;
+}
+.topnav-links a:hover, .nav-menu-btn:hover { background: #f0f2f0; text-decoration: none; }
+.topnav-links a.active, .nav-menu-btn.active { color: var(--brand); font-weight: 700; box-shadow: inset 0 -2px 0 var(--gold); }
+.nav-menu-btn[aria-expanded="true"] { background: #eef2ee; }
+@media (min-width: 721px) {
+  .brand-logo img { height: 56px; }
+  .topnav-links { display: flex; }
+}
+
+/* Phone: fixed bottom bar, four items. */
+.bottomnav { display: none; }
+@media (max-width: 720px) {
+  :root { --bottomnav-h: calc(56px + env(safe-area-inset-bottom, 0px)); }
+  .bottomnav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 930; display: flex;
+    background: #fff; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .bottomnav a, .bottomnav button {
+    flex: 1 1 0; min-height: 56px; display: flex; align-items: center; justify-content: center;
+    background: none; border: 0; cursor: pointer; text-decoration: none;
+    color: var(--muted); font-family: var(--font-body); font-size: 0.88rem;
+  }
+  .bottomnav a.active, .bottomnav button.active { color: var(--brand); font-weight: 700; box-shadow: inset 0 3px 0 var(--gold); }
+  .bottomnav button[aria-expanded="true"] { background: #eef2ee; }
+  /* room so neither the bar nor the assistant ever covers content */
+  body.dash { padding-bottom: calc(96px + var(--bottomnav-h)); }
+  /* lift the floating buttons / panel above the bar */
+  #assistant-launch { bottom: calc(14px + var(--bottomnav-h)); }
+  #assistant-widget { bottom: var(--bottomnav-h); }
+  #assistant-widget.minimized { bottom: calc(10px + var(--bottomnav-h)); }
+  #voice-launch { bottom: calc(10px + var(--bottomnav-h)); }
+  html.menu-open body { overflow: hidden; }
+}
+
+/* Menu sheet: bottom sheet on phone, dropdown panel on desktop. */
+.menu-backdrop { position: fixed; inset: 0; z-index: 940; background: rgba(0,0,0,0.28); }
+.menu-sheet {
+  position: fixed; z-index: 950; background: #fff; border: 1px solid var(--line);
+  box-shadow: 0 12px 36px rgba(0,0,0,0.25); overflow-y: auto; overscroll-behavior: contain;
+  left: 0; right: 0; bottom: var(--bottomnav-h); max-height: min(78vh, calc(100dvh - var(--bottomnav-h) - 48px));
+  border-radius: 16px 16px 0 0; padding: 8px 8px 12px;
+}
+@media (min-width: 721px) {
+  .menu-backdrop { background: transparent; }
+  .menu-sheet { left: auto; right: 20px; bottom: auto; top: 76px; width: 300px; max-height: calc(100vh - 96px); border-radius: 12px; }
+}
+.menu-group { padding: 6px 0; }
+.menu-group + .menu-group { border-top: 1px solid var(--line); }
+.menu-group-title { padding: 6px 12px 2px; color: var(--muted); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.menu-group a, .menu-group .menu-disabled {
+  display: flex; align-items: center; min-height: 44px; padding: 8px 12px; border-radius: 8px;
+  font-family: var(--font-body); font-size: 1rem; text-decoration: none; color: var(--ink);
+}
+.menu-group a:hover { background: #f0f2f0; }
+.menu-group a.active { color: var(--brand); font-weight: 700; background: #eef2ee; }
+.menu-group .menu-disabled { color: #9a9a9a; cursor: default; } /* Training: grey, not a link */
+.menu-group-logout .menu-logout { font-weight: 700; color: var(--ink); } /* Log out: never grey */
+
+/* Landing on a booking step via #step-... (022): keep a little air above it. */
+#step-contact, #step-times { scroll-margin-top: 12px; }
+
+/* ============================================================
+   023 - Needs Attention: one layout for Overview + customer page.
+   Row 1 who/what/due, row 2 Done | Dismiss, row 3 "Snooze to" (date owned by
+   Snooze), row 4 "Waiting on" (text owned by Waiting on).
+   ============================================================ */
+.attn-list { list-style: none; margin: 0; padding: 0; }
+.attn-list > li { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.attn-list > li:first-child { padding-top: 4px; }
+.attn-list > li:last-child { border-bottom: 0; padding-bottom: 4px; }
+.attn-what { font-size: 0.98rem; line-height: 1.4; }
+.attn-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; }
+.attn-decide { gap: 10px; }
+.attn-decide form.inline { display: block; flex: 1 1 0; max-width: 150px; }
+.attn-decide .btn { width: 100%; }
+.attn-own label { flex: 0 0 5.6rem; margin: 0; font-size: 0.85rem; color: var(--muted); }
+.attn-own input { flex: 1 1 auto; min-width: 0; width: auto; padding: 7px 9px; }
+.attn-own .btn { flex: 0 0 auto; min-width: 84px; }
+.attn-own input[type=date] { flex: 0 1 200px; }
+.attn-own input[type=text] { flex: 0 1 360px; }
+
+/* --- 034 Sale packet --- */
+.packet-files { list-style: none; margin: 8px 0 0; padding: 0; }
+.packet-files li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.packet-files li:last-child { border-bottom: 0; }
+.packet-file { display: flex; align-items: flex-start; gap: 10px; margin: 0; flex: 1 1 auto; min-width: 0; font-size: 1rem; color: var(--ink); cursor: pointer; }
+.packet-file input { width: auto; margin-top: 5px; flex: 0 0 auto; }
+.packet-file .pf-name { display: block; word-break: break-word; }
+.packet-file .pf-meta { display: block; font-size: 0.82rem; color: var(--muted); }
