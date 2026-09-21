@@ -683,3 +683,6 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
 .packet-file input { width: auto; margin-top: 5px; flex: 0 0 auto; }
 .packet-file .pf-name { display: block; word-break: break-word; }
 .packet-file .pf-meta { display: block; font-size: 0.82rem; color: var(--muted); }
+
+/* 048 - version line in the Menu, just above Log out */
+.menu-version { padding: 2px 12px 4px; color: var(--muted); font-size: 0.8rem; letter-spacing: 0.02em; }

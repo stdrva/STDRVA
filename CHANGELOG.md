@@ -56,7 +56,18 @@ Sales training stays OFF (`SALES_TRAINING_ENABLED = false`); nothing from it is 
   appointment type: hidden on `/book` (even by URL), not a design appointment (no stage bump, no KPI or
   consultant-scoreboard credit). Not DocuSign. New env `SMTP_HOST` / `SMTP_PORT` (default Gmail) exist so
   tests can use a local fake mail server.
-- **Tests.** New `tests/update-180.test.js` and `tests/update-180-packet.test.js`, plus
+- **048 Version in the Menu** (added the same night, before any deploy). The Menu shows
+  `BOS <version>` directly above Log out. It is read from `package.json` at startup - never typed
+  anywhere - so a version bump there is the only edit a release needs.
+- **033 addendum: the assistant can set the install date.** `update_job` takes an optional
+  `estimated_install_at` (`YYYY-MM-DD`, empty string clears, omitted/null leaves it alone). It stays
+  confirm-before-write (`confirmed: true` only after Andrew says yes), audited as `assistant`, and never
+  changes status or messages the customer. A bad date is refused *before* anything else in the same call
+  is applied. `get_job_detail` already returned it. The install date is now strictly a real `YYYY-MM-DD`
+  everywhere (dashboard and assistant): the check rejects `2026-02-31` and loose text like
+  `10/06/2026 maybe`, which JavaScript's date parser would otherwise have accepted.
+- **Tests.** New `tests/update-180.test.js`, `tests/update-180-packet.test.js` and
+  `tests/update-180-followup.test.js`, plus
   `tests/http-helper.js`, which starts the real server on a random port with every messaging credential
   blanked. One test, `voiceBookingSlots: near an area with an existing appointment...`, was already
   failing before this release and is untouched.

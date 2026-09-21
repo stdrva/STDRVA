@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const { DatabaseSync } = require('node:sqlite');
-const { newId, newToken, nowIso, dateInputToIso, etDateString } = require('./util');
+const { newId, newToken, nowIso, dateInputToIso, etDateString, isCalendarDate } = require('./util');
 
 // DB location is overridable via BOS_DB_PATH so the test suite can run against
 // a throwaway file instead of the live database. Production/dev leave it unset.
@@ -957,8 +957,8 @@ function updateJobEstimatedInstall(id, value, actor) {
   const job = getJob(id);
   if (!job) return null;
   const raw = value === undefined || value === null ? '' : String(value).trim();
+  if (raw && !isCalendarDate(raw)) throw new Error('Not a valid date');
   const iso = raw ? dateInputToIso(raw) : null;
-  if (raw && !iso) throw new Error('Not a valid date');
   if ((job.estimated_install_at || null) === iso) return job;
   db.prepare(`UPDATE jobs SET estimated_install_at = ?, updated_at = ? WHERE id = ?`).run(iso, nowIso(), id);
   logActivity({

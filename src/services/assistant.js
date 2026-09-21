@@ -11,7 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
-const { isValidEmail, fmtNowET } = require('../util');
+const { isValidEmail, fmtNowET, isCalendarDate } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -387,7 +387,7 @@ const BASE_TOOLS = [
   {
     name: 'update_job',
     description:
-      "Update a job's sold amount and/or its customer-facing status. This writes real data: state the change back to Andrew and wait for his explicit confirmation, then call with confirmed:true. Changing status to a value that notifies the customer is not done here - that stays a manual dashboard action.",
+      "Update a job's sold amount, its customer-facing status, and/or its ESTIMATED INSTALL DATE. This writes real data: state the change back to Andrew (for a date, say it in plain form, e.g. \"Tue, Oct 6\") and wait for his explicit confirmation, then call with confirmed:true. Changing status to a value that notifies the customer is not done here - that stays a manual dashboard action. The estimated install date is only an estimate: setting it does not change the job status and never messages the customer, and it is never derived from measurements - only set it when Andrew gives or confirms a date. Pass it as YYYY-MM-DD (US Eastern calendar day, worked out from the CLOCK); pass an empty string to clear it.",
     input_schema: {
       type: 'object',
       properties: {
@@ -398,6 +398,10 @@ const BASE_TOOLS = [
           description: 'One of the job stages, e.g. "Order Confirmed", "Measured", "In Production", "Install Scheduled", "Complete".',
         },
         note: { type: 'string' },
+        estimated_install_at: {
+          type: 'string',
+          description: 'Estimated install date as YYYY-MM-DD (Eastern calendar day). Empty string clears it. Omit to leave it unchanged.',
+        },
         confirmed: { type: 'boolean', description: 'Only true once Andrew has explicitly confirmed this exact change.' },
       },
       required: ['job_id', 'confirmed'],
@@ -1096,13 +1100,20 @@ function runTool(name, input) {
     }
     case 'update_job': {
       if (input.confirmed !== true) {
-        return { error: 'Not changed - restate the exact change (sold amount and/or status) and wait for Andrew to confirm before calling this again.' };
+        return { error: 'Not changed - restate the exact change (sold amount, status and/or estimated install date) and wait for Andrew to confirm before calling this again.' };
       }
       const job = db.getJob(input.job_id);
       if (!job) return { error: 'Job not found' };
+      // Only a string counts (omitted / null = leave it alone; '' = clear). Validate BEFORE
+      // writing anything, so a bad date can't leave the sold amount or status half-changed.
+      const wantsInstall = typeof input.estimated_install_at === 'string';
+      if (wantsInstall && input.estimated_install_at.trim() && !isCalendarDate(input.estimated_install_at)) {
+        return { error: 'Not changed - that is not a valid date. Use YYYY-MM-DD.' };
+      }
       if (input.sold_amount !== undefined && input.sold_amount !== null) {
         db.updateJobSoldAmount(input.job_id, input.sold_amount);
       }
+      if (wantsInstall) db.updateJobEstimatedInstall(input.job_id, input.estimated_install_at, 'assistant');
       if (input.status && input.status !== job.status) {
         db.updateJobStatus(input.job_id, input.status, input.note || 'Updated via assistant');
       }

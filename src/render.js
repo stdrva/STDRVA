@@ -2,6 +2,9 @@ const { escapeHtml, formatPhone, telHref } = require('./util');
 
 const BUSINESS_NAME = process.env.BUSINESS_NAME || 'Shelves to Drawers RVA';
 const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
+// Shown in the Menu above Log out (spec 048). Read from package.json - never typed
+// here - so bumping the version there is the only edit a release needs.
+const BOS_VERSION = require('../package.json').version;
 
 const FAVICON_TAGS = `
 <link rel="icon" type="image/x-icon" href="/static/img/favicon.ico">
@@ -170,7 +173,7 @@ function menuSheetHtml(active) {
 <div class="menu-backdrop" data-menu-close hidden></div>
 <div id="menu-sheet" class="menu-sheet" role="dialog" aria-label="Menu" hidden>
   ${groups}
-  <div class="menu-group menu-group-logout"><a class="menu-logout" href="/logout">Log out</a></div>
+  <div class="menu-group menu-group-logout"><div class="menu-version">BOS ${escapeHtml(BOS_VERSION)}</div><a class="menu-logout" href="/logout">Log out</a></div>
 </div>
 <script>
   (function () {

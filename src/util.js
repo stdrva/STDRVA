@@ -102,9 +102,21 @@ function etDateString(date = new Date()) {
 function dateInputToIso(value) {
   const v = String(value || '').trim();
   if (!v) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return `${v}T12:00:00.000Z`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    // Well-formed is not the same as real: 2026-02-31 must be rejected, not rolled into March.
+    const iso = `${v}T12:00:00.000Z`;
+    const d = new Date(iso);
+    return !isNaN(d.getTime()) && d.toISOString() === iso ? iso : null;
+  }
   const d = new Date(v);
   return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+// Strict "YYYY-MM-DD" AND a real calendar day (no "10/06/2026 maybe", no Feb 31).
+// Used where a date is a single calendar day and loose parsing would be a bug.
+function isCalendarDate(value) {
+  const v = String(value == null ? '' : value).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) && dateInputToIso(v) !== null;
 }
 
 function nowIso() {
@@ -216,6 +228,7 @@ module.exports = {
   fmtDateTime,
   fmtNowET,
   dateInputToIso,
+  isCalendarDate,
   etDateString,
   humanizeActivityValue,
   fmtRelativeDue,
