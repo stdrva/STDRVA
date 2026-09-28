@@ -5,6 +5,73 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## 1.8.1 (2026-09-27) — Files that open, phone fixes, list_jobs / create_campaign, and the Desk
+
+Sales training stays OFF; no training content, web search, Places, chat memory, Twilio or Voice
+changes are in this release. Tests: `tests/update-181.test.js`, `tests/update-181-packet.test.js`.
+
+- **BF-2639-064 Files open after upload.** Cause: assistant uploads were written to
+  `uploads/_unassigned/`, then naming the customer set `customer_id` without moving the bytes, so the
+  viewer looked in `uploads/<customer_id>/` and said "File not found on disk". One folder rule now lives
+  in `db.js` (`fileBytesPath` / `locateFileBytes`); `setFileAssignment` moves the bytes with the row, and
+  rows already stranded in `_unassigned/` are found and moved on first open. An upload whose bytes don't
+  land fails and keeps no row. Bytes stay on the configured local disk under `DATA_DIR`, so running more
+  than one Render instance would need shared storage (the app runs as one instance).
+- **BF-2639-065 Files tables on a phone.** Every files table sits in a `.table-scroll` wrapper
+  (`overflow-x: auto`), so the date and action buttons are reachable at 390px.
+- **BF-2639-069 Viewer can be closed.** Files open in an in-app viewer page (same tab, no more
+  `target=_blank`) with a sticky ✕ Close that returns to that customer's Files list at the same row;
+  Escape, the browser Back button and the phone back gesture also leave it.
+- **FF-3926-014 Previous / Next.** The viewer walks only that customer's files, in Files-list order,
+  stops at both ends (no wrap), skips files whose bytes are missing, and replaces the history entry so one
+  Back still leaves the viewer.
+- **BF-2639-066 Assistant text after rotate.** Added `text-size-adjust: 100%` (iOS was boosting text
+  when the phone went to landscape and not undoing it); the thread re-pins to the newest message after a
+  rotate.
+- **BF-2639-049 Appointments page.** Two sections: Upcoming (not ended yet, including one in progress;
+  closest first) and Past (newest first), with "None upcoming" / "No past appointments". Overview strip and
+  customer page unchanged.
+- **BF-2639-050 Callback / More Info scroll.** The "2. What do you want to know?" panel has
+  `id="step-contact"`; the design types keep it on "Your info & address".
+- **BF-2639-051 Five discovery questions.** Callback by Owner and More Info by Email show the wizard (it
+  no longer auto-saves on those forms, so nothing is filed until Send). After a booking the wizard is
+  hidden only when that appointment already has answers, not because of an older customer note.
+- **FF-3926-004 Assistant `list_jobs`.** Jobs that are not Complete: customer, status, sold amount,
+  `estimated_install_at` (YYYY-MM-DD). "All jobs" / "active jobs" go to it, never to
+  `list_production_queue`; `navigate_to_record` accepts `jobs` → `/dashboard/jobs`.
+- **BF-2639-053 Unassigned files are links.** The filename (and "Needs review") opens a review page
+  that shows the file and lets Andrew confirm or assign it. The assistant's "Correct…" link opens it too.
+- **BF-2639-054 Files Refresh.** A ↻ Refresh control reloads the Files page and keeps the current `q`.
+- **BF-2639-055 Hamburger.** Both Menu toggles show three lines; `aria-label="Menu"` and
+  `data-menu-toggle` are unchanged.
+- **BF-2639-056 Menu order.** Customer Relations, Financial, Production, Marketing, Training (grey), then
+  Desk, the BOS version line and Log out. Hrefs unchanged.
+- **BF-2639-058 Dormant controls.** Removed the Dormant checkbox and pill from the customer page; the
+  `dormant` column and existing values are untouched (saving a stage no longer clears it).
+- **BF-2639-060 Sale packet status.** Completing the packet still marks Sold, ensures a job and adds
+  "Schedule measure", but leaves the job at Order Confirmed. Booking a Measure appointment moves the
+  customer's newest unfinished job to Measuring Scheduled (appointments have no `job_id`, so that is the
+  job the packet uses); neither ever moves a job backward.
+- **BF-2639-067 Install reminder.** The appointment type picks the body: Install gets the
+  empty-and-wipe-the-cabinets text, the three design types keep "do not empty your cabinets", other types
+  keep their old body. All use ET and the existing `BUSINESS_PHONE`; send window unchanged.
+- **BF-2639-068 Public page.** Not already satisfied, so built: the appointment page the reminder links to
+  has Call / Text Andrew links and "Request a new time", which files a follow-up for Andrew (and notifies
+  him) without changing the appointment. It replaces the old "Change" link, which started a second booking.
+- **FF-3926-003 Assistant `create_campaign`.** Same write as the Marketing form; reads the values back and
+  writes only with `confirmed:true`; never invents spend or dates; a missing source creates nothing and
+  the assistant asks Andrew.
+- **FF-3926-012 Record store.** New `tenants` (one row for the company), `users`, `records`,
+  `record_categories`, `record_category_map`, `record_tags`, `record_shares` and `record_files` tables;
+  `customers`, `jobs`, `customer_files` and `users` carry `tenant_id` (backfilled). The one existing login
+  maps to a `users` row; more logins are a later release. New **Desk** menu group and page: Mine / Business
+  / Personal / category filters, search, create, open, attach files (text is read from text-based PDFs).
+  Nothing is seeded; a fresh database has zero records.
+- **FF-3926-013 Record access + assistant.** A user sees only records in their tenant that they own or
+  that were shared with them; shares can't cross tenants; shared records are read-only. New tools
+  `search_records`, `get_record`, `list_records_by_category`, `create_record`, `update_record` (the last
+  two confirm before writing). Search answers only from notes and extracted PDF text, never from a photo.
+
 ## 1.8.0 (2026-09-20) — New chrome, Sale packet, and a round of fixes
 
 Sales training stays OFF (`SALES_TRAINING_ENABLED = false`); nothing from it is in this release.

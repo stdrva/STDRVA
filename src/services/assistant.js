@@ -11,7 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
-const { isValidEmail, fmtNowET, isCalendarDate } = require('../util');
+const { isValidEmail, fmtNowET, isCalendarDate, normalizePhone } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -272,6 +272,13 @@ const BASE_TOOLS = [
       properties: { job_id: { type: 'string' } },
       required: ['job_id'],
     },
+  },
+  // FF-3926-004: the jobs themselves - NOT the product lines.
+  {
+    name: 'list_jobs',
+    description:
+      "List jobs that are not Complete: customer, status, sold amount and estimated install date (estimated_install_at, YYYY-MM-DD or null), newest activity first. Use this for 'show me all jobs', 'active jobs', 'what jobs do I have'. It is not the production queue.",
+    input_schema: { type: 'object', properties: {} },
   },
   {
     name: 'list_production_queue',
@@ -540,6 +547,28 @@ const BASE_TOOLS = [
     description: 'List marketing sources and campaigns (id, name, tracking phone, spend).',
     input_schema: { type: 'object', properties: {} },
   },
+  // FF-3926-003
+  {
+    name: 'create_campaign',
+    description:
+      "Create a marketing campaign - the same write as the Marketing page form. Fill only what Andrew actually said: never make up a spend amount, start date or end date. The source must already exist: pass its source_id (from list_marketing) or its exact source_name; if it isn't found this tool creates nothing, and you ask Andrew whether he wants that source created (it is added on the Marketing page). Call once WITHOUT confirmed to get a plain-language read-back, say it to Andrew, and only after he says yes call again with the same values and confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        source_id: { type: 'string' },
+        source_name: { type: 'string', description: 'exact name of an existing source, if the id is not known' },
+        name: { type: 'string', description: 'campaign name' },
+        tracking_phone: { type: 'string' },
+        start_date: { type: 'string', description: 'YYYY-MM-DD, only if Andrew gave one' },
+        end_date: { type: 'string', description: 'YYYY-MM-DD, only if Andrew gave one' },
+        spend: { type: 'number', description: 'total spend in dollars, only if Andrew gave it' },
+        status: { type: 'string', enum: ['planned', 'active', 'ended'] },
+        notes: { type: 'string' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['name'],
+    },
+  },
   {
     name: 'set_customer_attribution',
     description:
@@ -619,16 +648,87 @@ const BASE_TOOLS = [
     description: 'List the Home Show / event sales consultants on file (name + id).',
     input_schema: { type: 'object', properties: {} },
   },
+  // ---- Desk record store (FF-3926-013). These only ever see records the current
+  // user owns or that were shared with them - never customers, never anyone else's.
+  {
+    name: 'search_records',
+    description:
+      "Search Andrew's Desk records (people who are not sales leads, and things like cars) by words in the name, contact info, notes, categories, tags, and text extracted from uploaded PDFs. Every word must match. Each hit lists matched_in (record, or file: <name>) and files_without_text. Use it for questions like 'which cars have FSD'. Only claim a fact if it appears in matched text - a photo or scan with no extracted text tells you nothing, so never infer a feature from it.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        kind: { type: 'string', enum: ['person', 'thing'] },
+        category: { type: 'string' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'get_record',
+    description: 'One Desk record in full: contact info, notes, categories, tags, and its files (with whether text was found in each).',
+    input_schema: { type: 'object', properties: { record_id: { type: 'string' } }, required: ['record_id'] },
+  },
+  {
+    name: 'list_records_by_category',
+    description: "Count and list Desk records in one category, e.g. 'how many electricians do I have' -> category 'Electrician'. Returns count and records.",
+    input_schema: { type: 'object', properties: { category: { type: 'string' } }, required: ['category'] },
+  },
+  {
+    name: 'create_record',
+    description:
+      "Create a Desk record: kind 'person' (a human who is not a sales lead) or 'thing' (a car or any other object). Business and personal can both be true. Categories are free names like Electrician, Accountant, Cars. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['person', 'thing'] },
+        name: { type: 'string' },
+        is_business: { type: 'boolean' },
+        is_personal: { type: 'boolean' },
+        phone: { type: 'string' },
+        email: { type: 'string' },
+        address: { type: 'string' },
+        notes: { type: 'string' },
+        categories: { type: 'array', items: { type: 'string' } },
+        tags: { type: 'array', items: { type: 'string' } },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['kind', 'name'],
+    },
+  },
+  {
+    name: 'update_record',
+    description:
+      "Change a Desk record Andrew owns. Pass only the fields that change (categories / tags replace the whole list). Same confirm-before-write rule as create_record: read back first, confirmed:true only after his yes.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        record_id: { type: 'string' },
+        kind: { type: 'string', enum: ['person', 'thing'] },
+        name: { type: 'string' },
+        is_business: { type: 'boolean' },
+        is_personal: { type: 'boolean' },
+        phone: { type: 'string' },
+        email: { type: 'string' },
+        address: { type: 'string' },
+        notes: { type: 'string' },
+        categories: { type: 'array', items: { type: 'string' } },
+        tags: { type: 'array', items: { type: 'string' } },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['record_id'],
+    },
+  },
   {
     name: 'navigate_to_record',
     description:
-      "Open a screen inside the BOS for Andrew - this moves the dashboard page he is looking at. Use it when he says 'open Leora Copeland's record', 'show me her job', 'open her appointment', 'pull up production', etc. This is BOS navigation only, not device control. For a person, resolve the customer first with find_customers and pass their customer_id. Types: 'customer' (their record - also where their sales stage / estimate status lives), 'job' (needs the job id), 'appointment' (needs the appointment id - opens its edit screen), 'files' (a customer's files if customer_id given, else the global file list), 'production', 'pipeline', 'kpi', 'appointments' (the calendar/list), 'overview'. After navigating, the conversation and the active customer are preserved.",
+      "Open a screen inside the BOS for Andrew - this moves the dashboard page he is looking at. Use it when he says 'open Leora Copeland's record', 'show me her job', 'open her appointment', 'pull up production', etc. This is BOS navigation only, not device control. For a person, resolve the customer first with find_customers and pass their customer_id. Types: 'customer' (their record - also where their sales stage / estimate status lives), 'job' (needs the job id), 'appointment' (needs the appointment id - opens its edit screen), 'files' (a customer's files if customer_id given, else the global file list), 'jobs' (the Jobs list), 'production', 'pipeline', 'kpi', 'appointments' (the calendar/list), 'overview'. After navigating, the conversation and the active customer are preserved.",
     input_schema: {
       type: 'object',
       properties: {
         type: {
           type: 'string',
-          enum: ['customer', 'job', 'appointment', 'files', 'production', 'pipeline', 'kpi', 'appointments', 'overview'],
+          enum: ['customer', 'job', 'appointment', 'files', 'jobs', 'production', 'pipeline', 'kpi', 'appointments', 'overview'],
         },
         customer_id: { type: 'string' },
         job_id: { type: 'string' },
@@ -703,6 +803,7 @@ const READ_ONLY_TOOLS = new Set([
   'list_payments',
   'list_expenses',
   'get_job_detail',
+  'list_jobs',
   'list_production_queue',
   'get_upcoming_appointment_briefing',
   'search_files',
@@ -716,10 +817,91 @@ const READ_ONLY_TOOLS = new Set([
   'get_kpi_summary',
   'list_sales_reps',
   'get_training_history',
+  'search_records',
+  'get_record',
+  'list_records_by_category',
 ]);
 
 // ---------- Tool execution - thin wrappers around db.js ----------
-function runTool(name, input) {
+// FF-3926-013: the Desk tools. `user` is always the person asking; db.js only
+// returns records in their tenant that they own or were shared.
+function recordSummary(r) {
+  return {
+    record_id: r.id,
+    kind: r.kind,
+    name: r.name,
+    business: !!r.is_business,
+    personal: !!r.is_personal,
+    phone: r.phone,
+    email: r.email,
+    address: r.address,
+    notes: r.notes,
+    categories: r.categories,
+    tags: r.tags,
+    shared_with_me: !r.mine,
+    ...(r.matched_in ? { matched_in: r.matched_in, files_without_text: r.files_without_text } : {}),
+  };
+}
+function recordReadback(f) {
+  return [
+    f.kind ? `${f.kind === 'thing' ? 'Thing' : 'Person'}` : null,
+    f.name ? `"${f.name}"` : null,
+    f.is_business !== undefined ? `business ${f.is_business ? 'yes' : 'no'}` : null,
+    f.is_personal !== undefined ? `personal ${f.is_personal ? 'yes' : 'no'}` : null,
+    f.phone ? `phone ${f.phone}` : null,
+    f.email ? `email ${f.email}` : null,
+    f.address ? `address ${f.address}` : null,
+    f.categories ? `categories: ${[].concat(f.categories).join(', ') || 'none'}` : null,
+    f.tags ? `tags: ${[].concat(f.tags).join(', ') || 'none'}` : null,
+    f.notes ? `notes: ${f.notes}` : null,
+  ]
+    .filter(Boolean)
+    .join('; ');
+}
+function runRecordTool(name, input, user) {
+  const fieldKeys = ['kind', 'name', 'is_business', 'is_personal', 'phone', 'email', 'address', 'notes', 'categories', 'tags'];
+  const fields = {};
+  for (const k of fieldKeys) if (input[k] !== undefined) fields[k] = input[k];
+  switch (name) {
+    case 'search_records': {
+      const rows = db.listRecordsFor(user, { q: input.query, kind: input.kind, category: input.category });
+      return { count: rows.length, records: rows.map(recordSummary) };
+    }
+    case 'get_record': {
+      const r = db.getRecordFor(user, input.record_id);
+      if (!r) return { error: 'Record not found' };
+      const files = db.listRecordFiles(r.id).map((f) => ({ file_id: f.id, name: f.original_name, mime_type: f.mime_type, has_text: !!f.extracted_text, text: f.extracted_text ? f.extracted_text.slice(0, 4000) : null }));
+      return { record: recordSummary(r), files };
+    }
+    case 'list_records_by_category': {
+      const rows = db.listRecordsFor(user, { category: input.category });
+      return { category: input.category, count: rows.length, records: rows.map(recordSummary) };
+    }
+    case 'create_record': {
+      if (!['person', 'thing'].includes(input.kind) || !String(input.name || '').trim()) {
+        return { error: "Not created - a record needs kind 'person' or 'thing' and a name." };
+      }
+      const readback = recordReadback(fields);
+      if (input.confirmed !== true) return { error: 'Not created yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      const r = db.createRecord(user, fields);
+      return { ok: true, record: recordSummary(r), readback };
+    }
+    case 'update_record': {
+      const existing = db.getRecordFor(user, input.record_id);
+      if (!existing) return { error: 'Record not found' };
+      if (!existing.mine) return { error: 'Not changed - that record was shared with Andrew; only its owner can edit it.' };
+      const readback = `${existing.name}: ${recordReadback(fields) || 'no changes given'}`;
+      if (input.confirmed !== true) return { error: 'Not changed yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      const r = db.updateRecord(user, existing.id, fields);
+      return { ok: true, record: recordSummary(r), readback };
+    }
+  }
+  return { error: `Unknown tool: ${name}` };
+}
+
+// ctx.username: who is asking (the signed-in login) - scopes the Desk record
+// tools (FF-3926-013). Absent -> the single env login.
+function runTool(name, input, ctx = {}) {
   switch (name) {
     case 'find_customers': {
       const q = String(input.query || '').toLowerCase();
@@ -820,6 +1002,22 @@ function runTool(name, input) {
       const payments = db.listPayments({}).filter((p) => p.job_id === input.job_id);
       const balance_due = db.getJobBalance(input.job_id);
       return { job, payments, balance_due };
+    }
+    case 'list_jobs': {
+      // FF-3926-004
+      const jobs = db
+        .listJobs()
+        .filter((j) => j.status !== 'Complete')
+        .map((j) => ({
+          job_id: j.id,
+          customer_id: j.customer_id,
+          customer: j.customer_name,
+          status: j.status,
+          sold_amount: j.sold_amount,
+          // stored as the calendar date at noon UTC (dateInputToIso) - hand back YYYY-MM-DD
+          estimated_install_at: j.estimated_install_at ? String(j.estimated_install_at).slice(0, 10) : null,
+        }));
+      return { count: jobs.length, jobs };
     }
     case 'list_production_queue': {
       return { queue: db.listProductionQueue({ includeDelivered: input.includeDelivered }) };
@@ -932,6 +1130,55 @@ function runTool(name, input) {
     case 'list_marketing': {
       return { sources: db.listSources(), campaigns: db.listCampaigns() };
     }
+    case 'create_campaign': {
+      // FF-3926-003: same write path as POST /dashboard/marketing/campaigns.
+      const name = String(input.name || '').trim();
+      if (!name) return { error: 'Not created - a campaign needs a name. Ask Andrew what to call it.' };
+      const sources = db.listSources({ includeInactive: true });
+      const wantName = String(input.source_name || '').trim().toLowerCase();
+      const source = input.source_id
+        ? sources.find((s) => s.id === input.source_id)
+        : wantName
+          ? sources.find((s) => String(s.name).trim().toLowerCase() === wantName)
+          : null;
+      if (!source) {
+        return {
+          error: `Not created - there is no marketing source ${input.source_name ? `named "${input.source_name}"` : 'with that id'}${input.source_id || input.source_name ? '' : ' (none was given)'}. Nothing was added. Ask Andrew whether he wants that source created (on the Marketing page) - do not create or guess one.`,
+          existing_sources: sources.map((s) => s.name),
+        };
+      }
+      const dateOk = (d) => d === undefined || d === null || d === '' || isCalendarDate(d);
+      if (!dateOk(input.start_date) || !dateOk(input.end_date)) return { error: 'Not created - dates must be YYYY-MM-DD.' };
+      if (input.status && !['planned', 'active', 'ended'].includes(input.status)) return { error: 'Not created - status must be planned, active or ended.' };
+      const hasSpend = input.spend !== undefined && input.spend !== null && input.spend !== '';
+      if (hasSpend && !Number.isFinite(Number(input.spend))) return { error: 'Not created - spend must be a number.' };
+      const fields = {
+        source_id: source.id,
+        name,
+        tracking_phone: input.tracking_phone ? normalizePhone(input.tracking_phone) : null,
+        start_date: input.start_date || null,
+        end_date: input.end_date || null,
+        cost: hasSpend ? Number(input.spend) : undefined,
+        status: input.status || 'active',
+        notes: input.notes || null,
+      };
+      const readback = [
+        `Campaign "${name}" under ${source.name}`,
+        `status ${fields.status}`,
+        fields.tracking_phone ? `tracking phone ${input.tracking_phone}` : 'no tracking phone',
+        fields.start_date ? `starts ${fields.start_date}` : 'no start date',
+        fields.end_date ? `ends ${fields.end_date}` : 'no end date',
+        hasSpend ? `spend $${Number(input.spend).toFixed(2)}` : 'no spend entered',
+        fields.notes ? `notes: ${fields.notes}` : null,
+      ]
+        .filter(Boolean)
+        .join('; ');
+      if (input.confirmed !== true) {
+        return { error: 'Not created yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      }
+      const campaign = db.createCampaign(fields);
+      return { ok: true, campaign, readback };
+    }
     case 'set_customer_attribution': {
       const c = db.getCustomer(input.customer_id);
       if (!c) return { error: 'Customer not found' };
@@ -1024,6 +1271,8 @@ function runTool(name, input) {
         } else {
           pathTo = '/dashboard/files';
         }
+      } else if (t === 'jobs') {
+        pathTo = '/dashboard/jobs'; // FF-3926-004
       } else if (t === 'production') {
         pathTo = '/dashboard/production';
       } else if (t === 'pipeline') {
@@ -1142,6 +1391,13 @@ function runTool(name, input) {
       const session_id = db.createTrainingSession(input);
       return { session_id, ...input };
     }
+    // ---- Desk record store (FF-3926-013) ----
+    case 'search_records':
+    case 'get_record':
+    case 'list_records_by_category':
+    case 'create_record':
+    case 'update_record':
+      return runRecordTool(name, input, db.ensureUser(ctx.username || db.defaultUsername()));
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -1256,13 +1512,35 @@ Financial reasoning rules - these matter more than being fast:
   that a job's remaining balance is due the day of its Install appointment. A job with no
   Install scheduled yet has no known due date - report that plainly ("no install scheduled,
   timing unknown") instead of estimating one.
-- log_payment, log_expense, create_job, and update_job are real writes. Before calling
+- log_payment, log_expense, create_job, update_job and create_campaign are real writes. Before calling
   any of them, state the exact entry (amount, category/vendor, method, date; or the product
   line; or the job change) back to Andrew in plain text and wait for him to confirm in a
   later message - then, and only then, call the tool with confirmed:true. Never set
   confirmed:true on your own inference that he agreed; it needs an actual yes from him in
   this conversation. This applies even if he was the one who told you the numbers in the
   first place - stating a number isn't the same as confirming the entry.
+
+Jobs vs production (FF-3926-004): "all jobs", "active jobs", "my jobs", "what jobs do I have"
+mean the jobs themselves - call list_jobs (customer, status, sold amount, estimated install
+date). Never answer those with list_production_queue. list_production_queue is only for
+production questions: "what's in production", "what do I need to make", "what's at the
+factory". To open the Jobs screen, navigate_to_record with type 'jobs'.
+
+Marketing campaigns (FF-3926-003): create_campaign fills only the fields Andrew actually
+gave - never make up a spend, a start date or an end date. The source must already exist
+(check list_marketing). If it doesn't, ask Andrew whether he wants that source created; do
+not create or pick a different one yourself.
+
+Desk records (FF-3926-013): the Desk holds people who are not sales leads (an electrician,
+an accountant) and things (cars and other objects). They are NOT customers - use
+search_records / get_record / list_records_by_category for them, never find_customers. You
+only ever see Andrew's own records plus ones shared with him. "How many electricians do I
+have" -> list_records_by_category and answer with the count and the names. "Which cars have
+FSD" -> search_records and answer only from matched notes or extracted PDF text; if a car's
+only upload is a photo with no text, say you can't tell from it - never guess. create_record
+and update_record are real writes: read back, wait for his yes, then confirmed:true. There
+is no tool to text or email a Desk record, and you never contact one without his explicit
+confirmation.
 
 Files: when Andrew uploads a file it has already been saved and its id is given to you in
 the message. Read it, then call save_file_extraction with a compact JSON of the key fields
@@ -1470,7 +1748,7 @@ async function handleMessage(userMessage, context = {}, opts = {}) {
       if (block.type !== 'tool_use') continue;
       let result;
       try {
-        result = runTool(block.name, block.input || {});
+        result = runTool(block.name, block.input || {}, { username: context.username });
       } catch (err) {
         result = { error: String(err.message || err) };
       }

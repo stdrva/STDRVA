@@ -1,6 +1,8 @@
 const db = require('../db');
 const { publicLayout, BUSINESS_NAME } = require('../render');
-const { escapeHtml, fmtDate, fmtDateTime, normalizePhone, isValidEmail } = require('../util');
+const { escapeHtml, fmtDate, fmtDateTime, normalizePhone, isValidEmail, telHref, etDateString, dateInputToIso } = require('../util');
+// The existing business phone setting (same fallback as render.js / automations.js).
+const BUSINESS_PHONE = process.env.BUSINESS_PHONE || '(804) 839-7984';
 const automations = require('../services/automations');
 
 const HOURS_START = Number(process.env.BUSINESS_HOURS_START || 9); // 24h, local server time
@@ -430,7 +432,9 @@ function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
         function saveProgress() {
           // Save-on-Next (spec C6) - partial answers are expected and fine.
           // The server overwrites its own previous save rather than appending.
-          if (!formEl) return;
+          // Only forms that opt in (data-autosave) - on the Callback / More Info
+          // request form a background POST would file the request early.
+          if (!formEl || !formEl.hasAttribute('data-autosave')) return;
           var fd = new FormData(formEl);
           fetch(formEl.action, { method: 'POST', headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }, body: fd }).catch(function(){});
         }
@@ -737,15 +741,19 @@ function register(router) {
           <h3 style="margin-top:0">1. What do you need?</h3>
           ${typeOptions}
         </div>
-        <div class="panel">
+        <div class="panel" id="step-contact">
+          <!-- BF-2639-050: the service cards link to #step-contact, so the request
+               panel carries that id and a tap lands here, like the design types. -->
           <h3 style="margin-top:0">2. What do you want to know?</h3>
           <form method="POST" action="/book/request" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
             <input type="hidden" name="type" value="${escapeHtml(type)}">
-            <textarea name="notes" placeholder="Tell us what you're looking for..." rows="4"></textarea>
+            <textarea name="question" placeholder="Tell us what you're looking for..." rows="4"></textarea>
             <label>Name *</label><input type="text" name="name" autocomplete="name" required>
             <label>Phone *</label><input type="tel" name="phone" autocomplete="tel" inputmode="tel" required placeholder="(804) 555-0100">
             <label>Email</label><input type="email" name="email" autocomplete="email" inputmode="email">
-            <div style="margin-top:14px"><button class="btn" type="submit">${type === 'Callback by Owner' ? 'Request a callback' : 'Submit request'}</button></div>
+            <!-- BF-2639-051: request types get the same five questions. -->
+            <h3>A few quick details (optional)</h3>
+            ${discoveryWizard('', 'Skip these and send my request', type === 'Callback by Owner' ? 'Request a callback' : 'Submit request')}
           </form>
         </div>
       `;
@@ -991,7 +999,9 @@ function register(router) {
     const customer = db.getCustomer(appt.customer_id);
     const when = new Date(appt.scheduled_at);
     const addr = parseAddress(customer && customer.address);
-    const discoveryDone = /Rooms:|Interested in:|Pets:/.test((appt.notes || '') + (customer && customer.notes ? customer.notes : ''));
+    // BF-2639-051: hide the questions only when THIS appointment already has
+    // answers - never because an older note on the customer mentions pets/rooms.
+    const discoveryDone = (appt.notes || '').includes(DISCOVERY_MARKER) || /Rooms:|Interested in:|Pets:/.test(appt.notes || '');
 
     const body = `
       <div class="public-hero">
@@ -1011,7 +1021,7 @@ function register(router) {
           : `<div class="panel">
         <h3 style="margin-top:0">A few quick details (optional)</h3>
         <p class="subtitle" style="margin-top:0">This helps Andrew bring the right samples. You can skip it — your appointment is already set.</p>
-        <form method="POST" action="/book/discovery">
+        <form method="POST" action="/book/discovery" data-autosave>
           <input type="hidden" name="appt" value="${escapeHtml(appt.id)}">
           ${discoveryWizard('', "Skip — I'm all set", 'Finished')}
         </form>
@@ -1065,7 +1075,10 @@ function register(router) {
     const phoneNorm = normalizePhone(phone);
     const emailVal = isValidEmail(email) ? email : null;
     const { notesWithDiscovery } = discoveryFromBody(req.body);
-    const combinedNotes = [`[${type}]`, notesWithDiscovery].filter(Boolean).join(' ').trim();
+    // BF-2639-051: the "what do you want to know" box is `question` now (the
+    // wizard's own question 5 is `notes`); older cached forms still send notes only.
+    const question = String(req.body.question || '').trim();
+    const combinedNotes = [`[${type}]`, question, notesWithDiscovery].filter(Boolean).join(' ').trim();
 
     let customer = db.findCustomerByPhoneOrEmail(phoneNorm, emailVal);
     if (!customer) {
@@ -1094,7 +1107,7 @@ function register(router) {
         <p class="subtitle">${escapeHtml(type)}</p>
       </div>
       <div class="panel">
-        <p>${type === 'Callback by Owner' ? "Andrew will call you back directly." : "We'll send details to your email."} We received: ${escapeHtml(notesWithDiscovery || '(no additional notes)')}</p>
+        <p>${type === 'Callback by Owner' ? "Andrew will call you back directly." : "We'll send details to your email."} We received: ${escapeHtml([question, notesWithDiscovery].filter(Boolean).join(' | ') || '(no additional notes)')}</p>
       </div>
     `;
     res.send(publicLayout({ title: 'Request received', body }));
@@ -1142,6 +1155,18 @@ function register(router) {
   // POST (never fires from a bare GET, which an email client's own link
   // scanner could otherwise trigger) and frees the slot via the existing
   // 'canceled' status - no new status value.
+  // BF-2639-068: reach Andrew without logging in - call or text.
+  function contactAndrewPanel() {
+    const tel = telHref(BUSINESS_PHONE);
+    return `<div class="panel" id="contact-andrew">
+        <h3 style="margin-top:0">Contact Andrew</h3>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <a class="btn secondary" href="tel:${escapeHtml(tel)}" data-contact-andrew>Call ${escapeHtml(BUSINESS_PHONE)}</a>
+          <a class="btn secondary" href="sms:${escapeHtml(tel)}" data-contact-andrew>Text Andrew</a>
+        </div>
+      </div>`;
+  }
+
   function notFoundAppointment(res) {
     return res.status(404).send(publicLayout({ title: 'Not found', body: `<div class="panel"><p>We couldn't find that appointment. Double check the link, or contact us.</p></div>` }));
   }
@@ -1161,17 +1186,77 @@ function register(router) {
         <div class="review-row"><span>When</span><strong>${escapeHtml(when)}</strong></div>
         <div class="review-row"><span>Status</span><strong>${escapeHtml(appt.status)}${appt.confirmed ? ' · confirmed' : ''}</strong></div>
       </div>
+      ${req.query.requested ? `<div class="msg ok">Got it - Andrew has your request for a new time and will reach out to confirm. Your appointment stays as it is until he does.</div>` : ''}
       ${
         canAct
           ? `<div class="panel" style="display:flex;gap:10px;flex-wrap:wrap">
               <form method="POST" action="/appointment/${appt.public_token}/confirm"><button class="btn" type="submit">${appt.confirmed ? 'Confirmed ✓' : 'Confirm'}</button></form>
-              <a class="btn secondary" href="/appointment/${appt.public_token}/change">Change</a>
+              <a class="btn secondary" href="/appointment/${appt.public_token}/change" data-request-new-time>Request a new time</a>
               <a class="btn secondary" href="/appointment/${appt.public_token}/cancel">Cancel</a>
             </div>`
           : `<div class="panel"><p class="subtitle" style="margin:0">This appointment is ${escapeHtml(appt.status)} - contact us if that's not right.</p></div>`
       }
+      ${contactAndrewPanel()}
     `;
     res.send(publicLayout({ title: 'Your appointment', body }));
+  });
+
+  // BF-2639-068: a request for a different time. It only files a follow-up for
+  // Andrew (and gives him a heads-up) - the stored appointment time is NOT
+  // changed. Andrew confirms before anything moves.
+  router.get('/appointment/:token/change', (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    if (appt.status !== 'scheduled') return res.redirect(`/appointment/${appt.public_token}`);
+    const when = fmtSlotLong(new Date(appt.scheduled_at));
+    const body = `
+      <div class="public-hero"><h1>Request a new time</h1></div>
+      <div class="panel review-card">
+        <div class="review-row"><span>Service</span><strong>${escapeHtml(appt.type)}</strong></div>
+        <div class="review-row"><span>Currently</span><strong>${escapeHtml(when)}</strong></div>
+      </div>
+      <div class="panel">
+        <form method="POST" action="/appointment/${appt.public_token}/change" onsubmit="if(this.dataset.sent)return false;this.dataset.sent='1';">
+          <label for="preferred">What days or times work better?</label>
+          <textarea id="preferred" name="preferred" rows="3" required placeholder="e.g. any weekday after 2pm, or the week of the 20th"></textarea>
+          <p class="subtitle">Your current appointment stays booked until Andrew confirms a new time with you.</p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn" type="submit">Send request</button>
+            <a class="btn secondary" href="/appointment/${appt.public_token}">Never mind</a>
+          </div>
+        </form>
+      </div>
+      ${contactAndrewPanel()}
+    `;
+    res.send(publicLayout({ title: 'Request a new time', body }));
+  });
+
+  router.post('/appointment/:token/change', async (req, res) => {
+    const appt = db.getAppointmentByToken(req.params.token);
+    if (!appt) return notFoundAppointment(res);
+    const preferred = String(req.body.preferred || '').trim().slice(0, 500);
+    if (appt.status === 'scheduled') {
+      const customer = db.getCustomer(appt.customer_id);
+      const was = fmtSlotLong(new Date(appt.scheduled_at));
+      const title = `Reschedule request: ${appt.type} (now ${was})${preferred ? ' - customer asks: ' + preferred : ''}`;
+      db.createFollowup({
+        customer_id: appt.customer_id,
+        kind: 'next_action',
+        title,
+        due_at: dateInputToIso(etDateString()),
+        created_by: 'public',
+      });
+      try {
+        await automations.notifyOwner({
+          smsBody: `${customer ? customer.name : 'A customer'} asked to move their ${appt.type} (${was}). ${preferred ? 'They said: ' + preferred : ''}`.trim(),
+          emailSubject: `Reschedule request: ${customer ? customer.name : 'customer'}`,
+          emailHtml: `<p>${escapeHtml(customer ? customer.name : 'A customer')} asked to move their <strong>${escapeHtml(appt.type)}</strong> (${escapeHtml(was)}).</p>${preferred ? `<p>They said: ${escapeHtml(preferred)}</p>` : ''}<p>The appointment has not been changed.</p>`,
+        });
+      } catch (e) {
+        console.error('reschedule request notifyOwner failed', e);
+      }
+    }
+    res.redirect(`/appointment/${appt.public_token}?requested=1`);
   });
 
   router.post('/appointment/:token/confirm', (req, res) => {
@@ -1179,14 +1264,6 @@ function register(router) {
     if (!appt) return notFoundAppointment(res);
     if (appt.status === 'scheduled') db.confirmAppointment(appt.id);
     res.redirect(`/appointment/${appt.public_token}`);
-  });
-
-  router.get('/appointment/:token/change', (req, res) => {
-    const appt = db.getAppointmentByToken(req.params.token);
-    if (!appt) return notFoundAppointment(res);
-    const customer = db.getCustomer(appt.customer_id);
-    const qs = contactQS({ type: appt.type, name: customer.name, phone: customer.phone, email: customer.email, address: customer.address });
-    res.redirect(`/book?${qs}`);
   });
 
   router.get('/appointment/:token/cancel', (req, res) => {

@@ -56,6 +56,59 @@ function attentionForCustomer(c) {
   return items;
 }
 
+// In-app file viewer (BF-2639-069, FF-3926-014). Replaces opening the raw bytes
+// with target=_blank, which in the Home Screen app became a page with no way out.
+// This is an ordinary page in the same tab: the Close control, Escape, the
+// browser Back button and the phone back gesture all leave it. Previous / Next
+// REPLACE the history entry, so one Back still leaves the viewer rather than
+// stepping back through every file looked at. At the first / last file the
+// control is inert (no href) - the walk never wraps around.
+function fileViewerBody({ f, rawUrl, closeUrl, prevUrl, nextUrl, missing, extraHtml }) {
+  const mime = f.mime_type || '';
+  const isImg = mime.startsWith('image/');
+  const isPdf = mime === 'application/pdf' || /\.pdf$/i.test(f.original_name || '');
+  const step = (href, label, rel) =>
+    href
+      ? `<a class="btn secondary" href="${escapeHtml(href)}" data-viewer-${rel}>${label}</a>`
+      : `<span class="btn secondary disabled" aria-disabled="true" data-viewer-${rel}>${label}</span>`;
+  const stage = missing
+    ? `<p class="msg err" style="margin:0">This file's contents are missing from storage, so it can't be shown. Close this and re-upload it if you still have it.</p>`
+    : isImg
+      ? `<img class="viewer-img" src="${escapeHtml(rawUrl)}" alt="${escapeHtml(f.original_name || '')}">`
+      : isPdf
+        ? `<iframe class="viewer-pdf" src="${escapeHtml(rawUrl)}" title="${escapeHtml(f.original_name || '')}"></iframe>`
+        : `<p class="subtitle" style="margin:0">No preview for this kind of file.</p>`;
+  return `
+    <div class="viewer-bar">
+      ${prevUrl === undefined ? '' : step(prevUrl, '&lsaquo; Previous', 'prev')}
+      ${nextUrl === undefined ? '' : step(nextUrl, 'Next &rsaquo;', 'next')}
+      <a class="btn viewer-close" href="${escapeHtml(closeUrl)}" data-viewer-close aria-label="Close">&#x2715; Close</a>
+    </div>
+    <h1 class="viewer-title">${escapeHtml(f.original_name || '')}</h1>
+    <div class="panel viewer-stage">${stage}
+      ${missing ? '' : `<p class="subtitle" style="margin:10px 0 0"><a href="${escapeHtml(rawUrl)}" download>Download original</a></p>`}
+    </div>
+    ${extraHtml || ''}
+    <script>
+      (function () {
+        document.querySelectorAll('a[data-viewer-prev], a[data-viewer-next]').forEach(function (a) {
+          a.addEventListener('click', function (e) { e.preventDefault(); window.location.replace(a.href); });
+        });
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') window.location.href = ${JSON.stringify(closeUrl)};
+          if (e.key === 'ArrowLeft') { var p = document.querySelector('a[data-viewer-prev]'); if (p) p.click(); }
+          if (e.key === 'ArrowRight') { var n = document.querySelector('a[data-viewer-next]'); if (n) n.click(); }
+        });
+      })();
+    </script>`;
+}
+
+// Only ever send Close back to a dashboard page (never an off-site URL).
+function safeReturnTo(v, fallback) {
+  const s = String(v || '');
+  return s.startsWith('/dashboard') && !s.startsWith('//') ? s : fallback;
+}
+
 // Files page results (spec 025): the same fragment is used by the full page and by
 // the live-search endpoint. Empty query -> the ~50 most recent files; otherwise a
 // full-text search. Never empty-handed just because nothing has been typed.
@@ -67,17 +120,25 @@ function filesResultsHtml(q) {
     ? `<p class="subtitle" style="margin:12px 0 0">${rows.length ? rows.length + ' match' + (rows.length === 1 ? '' : 'es') : 'No files matched'} for &ldquo;${escapeHtml(term)}&rdquo;${rows.length >= FILES_SHOWN ? ' (showing the first ' + FILES_SHOWN + ')' : ''}.</p>`
     : `<p class="subtitle" style="margin:12px 0 0">Recent files (newest first). Type above to search all of them.</p>`;
   if (!rows.length) return term ? heading : `${heading}<p class="subtitle">No files uploaded yet.</p>`;
-  return `${heading}<table style="margin-top:8px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${rows
+  // BF-2639-053: the filename is always a link - a filed file opens its viewer
+  // (Close comes back to this search), an unfiled one opens its review page.
+  const back = `/dashboard/files${term ? '?q=' + encodeURIComponent(term) : ''}`;
+  const openHref = (f) =>
+    f.customer_id
+      ? `/dashboard/customers/${f.customer_id}/files/${f.id}/view?return_to=${encodeURIComponent(back)}`
+      : `/dashboard/files/${f.id}/review`;
+  // BF-2639-065: .table-scroll lets the date column scroll into reach on a phone.
+  return `${heading}<div class="table-scroll"><table class="files-table" style="margin-top:8px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${rows
     .map(
       (f) => `<tr>
-        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>` : escapeHtml(f.original_name)}</td>
-        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : '<a href="#needs-review">Needs review</a>'}</td>
+        <td><a href="${escapeHtml(openHref(f))}">${escapeHtml(f.original_name)}</a></td>
+        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : `<a href="/dashboard/files/${f.id}/review">Needs review</a>`}</td>
         <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
         <td class="subtitle" style="margin:0">${escapeHtml(f.snippet || f.note || '')}</td>
         <td>${fmtDate(f.created_at)}</td>
       </tr>`
     )
-    .join('')}</table>`;
+    .join('')}</table></div>`;
 }
 
 // One Needs Attention follow-up, laid out the same on the Overview and on the
@@ -123,10 +184,11 @@ function attentionBanner(items) {
 // Uploaded customer files (photos, measurement docs, contracts) live on the
 // persistent disk under data/uploads/<customer_id>/<generated-name> - never
 // under a web-servable static path, since these are private records only
-// reachable through the authenticated download route below.
-const UPLOADS_DIR = path.join(db.DATA_DIR, 'uploads');
+// reachable through the authenticated download route below. The folder rule
+// itself lives in db.js (uploadsDirFor / fileBytesPath) so the writer and the
+// reader can never disagree again (BF-2639-064).
 function customerUploadsDir(customerId) {
-  const dir = path.join(UPLOADS_DIR, customerId || '_unassigned');
+  const dir = db.uploadsDirFor(customerId);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -136,21 +198,33 @@ function customerUploadsDir(customerId) {
 // records it in customer_files, optionally tagged to a job. Returns the new
 // file id. Shared by the customer Files panel, the job Files panel, and the
 // Assistant chat upload.
+// BF-2639-064: throws if the bytes did not land on disk, and never keeps a row
+// whose bytes are missing - a file that would 404 is never shown as filed.
 function saveUpload({ customer_id, job_id, upload, note, assignment_status, suggested_customer_id }) {
   const ext = path.extname(upload.filename || '') || '';
   const storedName = `${newId()}${ext}`;
-  fs.writeFileSync(path.join(customerUploadsDir(customer_id), storedName), upload.data);
-  return db.createCustomerFile({
-    customer_id,
-    job_id: job_id || null,
-    stored_name: storedName,
-    original_name: upload.filename || storedName,
-    mime_type: upload.mimeType || null,
-    size: upload.data.length,
-    note: note || null,
-    assignment_status,
-    suggested_customer_id,
-  });
+  const filePath = path.join(customerUploadsDir(customer_id), storedName);
+  fs.writeFileSync(filePath, upload.data);
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).size !== upload.data.length) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw new Error('Upload bytes were not written to disk');
+  }
+  try {
+    return db.createCustomerFile({
+      customer_id,
+      job_id: job_id || null,
+      stored_name: storedName,
+      original_name: upload.filename || storedName,
+      mime_type: upload.mimeType || null,
+      size: upload.data.length,
+      note: note || null,
+      assignment_status,
+      suggested_customer_id,
+    });
+  } catch (e) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw e;
+  }
 }
 
 
@@ -368,9 +442,6 @@ function register(router, requireAuth) {
             </select>
           </div>
         </div>
-        <label class="check" style="display:flex;align-items:center;gap:8px;margin-top:10px">
-          <input type="checkbox" name="dormant" value="1" style="width:auto" ${c.dormant ? 'checked' : ''}> Dormant / waiting indefinitely (still active, not lost)
-        </label>
         <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center"><button class="btn" type="submit">Update stage</button>
           <a class="btn secondary" href="/dashboard/customers/${c.id}/sale-packet">Sale packet</a></div>
       </form>`;
@@ -416,7 +487,6 @@ function register(router, requireAuth) {
         <div class="stage-line">
           <span class="stage-pill">${escapeHtml(stage)}</span>
           ${c.stage_substatus ? `<span class="substatus-pill">${escapeHtml(c.stage_substatus)}</span>` : ''}
-          ${c.dormant ? `<span class="substatus-pill" style="background:#eee;color:#555">Dormant</span>` : ''}
         </div>
         ${quickActions(c)}
       </div>
@@ -529,10 +599,10 @@ function register(router, requireAuth) {
          </form>
          ${
            files.length
-             ? `<table style="margin-top:12px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
+             ? `<div class="table-scroll"><table class="files-table" style="margin-top:12px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
                  .map(
-                   (f) => `<tr>
-                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
+                   (f) => `<tr id="file-${f.id}">
+                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
                      <td>${escapeHtml(f.note || '')}</td>
                      <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
                      <td>${fmtDate(f.created_at)}</td>
@@ -542,11 +612,11 @@ function register(router, requireAuth) {
                      </td>
                    </tr>`
                  )
-                 .join('')}</table>
+                 .join('')}</table></div>
                  <p class="subtitle" style="margin-top:8px">Deleting is recoverable — find it under <a href="/dashboard/files/deleted">Deleted Files</a>.</p>`
              : '<p class="subtitle">No files yet.</p>'
          }`,
-        { count: files.length }
+        { count: files.length, open: req.query.open === 'files' }
       )}
 
       ${section(
@@ -652,7 +722,10 @@ function register(router, requireAuth) {
     const { sales_stage, stage_substatus, dormant } = req.body;
     try {
       db.setSalesStage(c.id, sales_stage, { substatus: stage_substatus || null, actor: actorOf(req) });
-      db.setCustomerDormant(c.id, !!dormant, { actor: actorOf(req) });
+      // BF-2639-058: the customer page no longer has a Dormant checkbox. Only touch
+      // the flag when a form actually sends it (the Pipeline board still does), so
+      // saving a stage here never silently clears an existing dormant row.
+      if (Object.prototype.hasOwnProperty.call(req.body, 'dormant')) db.setCustomerDormant(c.id, !!dormant, { actor: actorOf(req) });
     } catch (e) {
       return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent(e.message)}`);
     }
@@ -727,20 +800,106 @@ function register(router, requireAuth) {
       const job = db.getJob(jobId);
       if (!job || job.customer_id !== c.id) jobId = null;
     }
-    saveUpload({ customer_id: c.id, job_id: jobId, upload, note: req.body.note || null });
+    try {
+      saveUpload({ customer_id: c.id, job_id: jobId, upload, note: req.body.note || null });
+    } catch (e) {
+      console.error('[files] customer upload failed:', e);
+      return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
+    }
     res.redirect(`/dashboard/customers/${c.id}?ok=File uploaded`);
   });
 
   router.get('/dashboard/customers/:id/files/:fileId', requireAuth, (req, res) => {
     const f = db.getCustomerFile(req.params.fileId);
     if (!f || f.customer_id !== req.params.id) return res.status(404).send('File not found');
-    const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
-    if (!fs.existsSync(filePath)) return res.status(404).send('File not found on disk');
+    const filePath = db.locateFileBytes(f);
+    if (!filePath) return res.status(404).send('File not found on disk');
     res.writeHead(200, {
       'Content-Type': f.mime_type || 'application/octet-stream',
       'Content-Disposition': `inline; filename="${f.original_name.replace(/"/g, '')}"`,
     });
     fs.createReadStream(filePath).pipe(res);
+  });
+
+  // BF-2639-069 / FF-3926-014: the viewer. Previous / Next walk only this
+  // customer's live files, in the Files-panel order (db.listCustomerFiles), and
+  // skip any neighbour whose bytes are missing so the walk never lands on a
+  // "File not found on disk".
+  router.get('/dashboard/customers/:id/files/:fileId/view', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    const f = db.getCustomerFile(req.params.fileId);
+    const fallbackClose = `/dashboard/customers/${req.params.id}?open=files#file-${req.params.fileId}`;
+    if (!c || !f || f.customer_id !== c.id || f.deleted_at) {
+      const body = `<div class="viewer-bar"><a class="btn viewer-close" href="${escapeHtml(c ? fallbackClose : '/dashboard/files')}" data-viewer-close aria-label="Close">&#x2715; Close</a></div>
+        <h1>File not found</h1><p class="subtitle">That file isn't on this customer's record (it may have been deleted or moved).</p>`;
+      return res.status(404).send(dashboardLayout({ title: 'File not found', active: '/dashboard/customers', body }));
+    }
+    const closeUrl = safeReturnTo(req.query.return_to, `/dashboard/customers/${c.id}?open=files#file-${f.id}`);
+    const rt = req.query.return_to ? `?return_to=${encodeURIComponent(closeUrl)}` : '';
+    const viewUrl = (id) => `/dashboard/customers/${c.id}/files/${id}/view${rt}`;
+    const all = db.listCustomerFiles(c.id);
+    const idx = all.findIndex((x) => x.id === f.id);
+    const openable = (x) => !!db.locateFileBytes(x);
+    const prev = all.slice(0, idx).reverse().find(openable);
+    const next = all.slice(idx + 1).find(openable);
+    const missing = !db.locateFileBytes(f);
+    const body = fileViewerBody({
+      f,
+      rawUrl: `/dashboard/customers/${c.id}/files/${f.id}`,
+      closeUrl,
+      prevUrl: prev ? viewUrl(prev.id) : null,
+      nextUrl: next ? viewUrl(next.id) : null,
+      missing,
+      extraHtml: `<p class="subtitle">${escapeHtml(c.name)} · file ${idx + 1} of ${all.length}${f.note ? ' · ' + escapeHtml(f.note) : ''}</p>`,
+    });
+    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/customers', body }));
+  });
+
+  // Bytes for any live file by id - used where there is no customer yet (the
+  // Needs-review page, BF-2639-053).
+  router.get('/dashboard/files/:fileId/raw', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (!f || f.deleted_at) return res.status(404).send('File not found');
+    const filePath = db.locateFileBytes(f);
+    if (!filePath) return res.status(404).send('File not found on disk');
+    res.writeHead(200, {
+      'Content-Type': f.mime_type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${(f.original_name || 'file').replace(/"/g, '')}"`,
+    });
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  // BF-2639-053: a file with no customer opens here - see it, then assign it
+  // (or confirm the suggested customer). Filed files go to their normal viewer.
+  router.get('/dashboard/files/:fileId/review', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    if (f && f.customer_id && !f.deleted_at) return res.redirect(`/dashboard/customers/${f.customer_id}/files/${f.id}/view`);
+    if (!f || f.deleted_at) {
+      const body = `<div class="viewer-bar"><a class="btn viewer-close" href="/dashboard/files" data-viewer-close aria-label="Close">&#x2715; Close</a></div><h1>File not found</h1>`;
+      return res.status(404).send(dashboardLayout({ title: 'File not found', active: '/dashboard/files', body }));
+    }
+    const suggested = f.suggested_customer_id ? db.getCustomer(f.suggested_customer_id) : null;
+    const assign = `
+      <div class="panel">
+        <h2 style="margin-top:0">Needs review</h2>
+        <p class="subtitle" style="margin-top:0">${suggested ? `Suggested: <strong>${escapeHtml(suggested.name)}</strong> (unconfirmed).` : 'Not attached to any customer yet.'}</p>
+        ${
+          suggested
+            ? `<form class="inline" method="POST" action="/dashboard/customer-files/${f.id}/assign"><input type="hidden" name="customer_id" value="${suggested.id}"><button class="btn" type="submit">Confirm ${escapeHtml(suggested.name)}</button></form>`
+            : ''
+        }
+        <form method="POST" action="/dashboard/customer-files/${f.id}/assign" style="margin-top:10px">
+          <label for="assign-${f.id}">Assign to</label>
+          <select id="assign-${f.id}" name="customer_id" required><option value="">Pick a customer…</option>${db
+            .listCustomers()
+            .map((c) => `<option value="${c.id}" ${suggested && c.id === suggested.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`)
+            .join('')}</select>
+          <div style="margin-top:8px"><button class="btn secondary" type="submit">Assign</button></div>
+        </form>
+      </div>`;
+    const missing = !db.locateFileBytes(f);
+    const body = fileViewerBody({ f, rawUrl: `/dashboard/files/${f.id}/raw`, closeUrl: '/dashboard/files', missing, extraHtml: assign });
+    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/files', body }));
   });
 
   // SOFT delete - the bytes stay on disk and the row is retained; the file is
@@ -791,8 +950,8 @@ function register(router, requireAuth) {
   router.post('/dashboard/files/:fileId/purge', requireAuth, (req, res) => {
     const f = db.getCustomerFile(req.params.fileId);
     if (f && f.deleted_at) {
-      const filePath = path.join(customerUploadsDir(f.customer_id), f.stored_name);
-      fs.existsSync(filePath) && fs.unlinkSync(filePath);
+      const filePath = db.locateFileBytes(f);
+      if (filePath) fs.unlinkSync(filePath);
       db.deleteCustomerFile(f.id);
       db.logActivity({ entity_type: 'file', entity_id: f.id, customer_id: f.customer_id, field: 'purged', new_value: f.original_name, actor: actorOf(req) });
     }
@@ -937,7 +1096,7 @@ function register(router, requireAuth) {
   //       file (nothing is overwritten), OR
   //   (b) email the selected files as attachments - only after a confirm screen.
   // Either one completes the sale the same way (db.completeSalePacket): Sold, a
-  // job exists, job = Measuring Scheduled, follow-up "Schedule measure". Neither
+  // job exists (status left alone - BF-2639-060), follow-up "Schedule measure". Neither
   // sends the customer anything by itself: the "order confirmed" text/email
   // (automations.onJobCreated) only goes out if Andrew ticks the box. Not DocuSign
   // and not a legal e-signature service - it is a signed record on file.
@@ -957,7 +1116,7 @@ function register(router, requireAuth) {
     return [
       r.stage_changed ? 'Customer marked Sold' : 'Customer was already Sold',
       r.job_created ? 'job created' : 'job already existed',
-      r.job_status_changed ? 'job status Measuring Scheduled' : `job left at ${r.job.status}`,
+      r.job_created ? 'job at Order Confirmed' : `job left at ${r.job.status}`, // BF-2639-060: the packet never moves the job
       r.followup_created ? '"Schedule measure" follow-up added' : '"Schedule measure" follow-up already open',
       notified ? 'order-confirmed message sent to the customer' : 'no message sent to the customer',
     ].join(' · ');
@@ -1016,7 +1175,7 @@ function register(router, requireAuth) {
 
         <div class="panel">
           <h2 style="margin-top:0">2. After it's complete</h2>
-          <p class="subtitle" style="margin-top:0">Completing marks the customer <strong>Sold</strong>, makes sure a job exists with status <strong>Measuring Scheduled</strong>, and adds a <strong>"Schedule measure"</strong> follow-up. <strong>No text or email goes to the customer</strong> unless you tick this:</p>
+          <p class="subtitle" style="margin-top:0">Completing marks the customer <strong>Sold</strong>, makes sure a job exists (it stays at <strong>Order Confirmed</strong> until a Measure is booked), and adds a <strong>"Schedule measure"</strong> follow-up. <strong>No text or email goes to the customer</strong> unless you tick this:</p>
           <label style="display:flex;gap:8px;align-items:flex-start;margin:0"><input type="checkbox" name="notify_customer" value="1" style="width:auto;margin-top:4px"> <span>Also text/email the customer their "order confirmed" link</span></label>
         </div>
 
@@ -1206,7 +1365,7 @@ function register(router, requireAuth) {
           <label>Attachments (${files.length}, ${fmtBytes(total)})</label>
           <ul style="margin:0;padding-left:18px">${files.map((f) => `<li>${escapeHtml(f.original_name)} <span class="subtitle">(${fmtBytes(f.size || 0)})</span></li>`).join('')}</ul>
           <label style="display:flex;gap:8px;align-items:flex-start;margin-top:14px"><input type="checkbox" name="notify_customer" value="1" style="width:auto;margin-top:4px"${isTicked(req.body.notify_customer) ? ' checked' : ''}> <span>Also text/email the customer their "order confirmed" link</span></label>
-          <p class="subtitle" style="margin:10px 0 0">Completing marks the customer Sold, makes sure a job exists at Measuring Scheduled, and adds a "Schedule measure" follow-up.</p>
+          <p class="subtitle" style="margin:10px 0 0">Completing marks the customer Sold, makes sure a job exists (left at Order Confirmed until a Measure is booked), and adds a "Schedule measure" follow-up.</p>
           <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
             <button class="btn" type="submit">Send email and complete sale</button>
             <a class="btn secondary" href="${packetUrl(c)}">Back, don't send</a>
@@ -1231,8 +1390,8 @@ function register(router, requireAuth) {
     if (files.reduce((s, f) => s + (f.size || 0), 0) > MAX_PACKET_ATTACH_BYTES) return back('Those files are too big to email. Nothing was sent.');
     const attachments = [];
     for (const f of files) {
-      const p = path.join(customerUploadsDir(c.id), f.stored_name);
-      if (!fs.existsSync(p)) return back(`"${f.original_name}" is missing from disk. Nothing was sent.`);
+      const p = db.locateFileBytes(f);
+      if (!p) return back(`"${f.original_name}" is missing from disk. Nothing was sent.`);
       attachments.push({ filename: f.original_name, path: p });
     }
     const sent = await email.sendEmail({
@@ -1700,7 +1859,42 @@ function register(router, requireAuth) {
 
   // ---------- Appointments ----------
   router.get('/dashboard/appointments', requireAuth, (req, res) => {
+    // BF-2639-049: two lists. Upcoming = not started yet, or now is still inside
+    // its slot (start + duration); closest first. Past = the slot has ended;
+    // newest first. Times are stored as UTC instants and shown in ET
+    // (fmtDateTime), so comparing instants is the same as comparing in ET.
+    const now = Date.now();
+    const endsAt = (a) => new Date(a.scheduled_at).getTime() + (Number(a.duration_min) || 60) * 60000;
     const appts = db.listAppointments();
+    const upcoming = appts.filter((a) => endsAt(a) > now); // listAppointments is already ASC
+    const past = appts.filter((a) => endsAt(a) <= now).reverse();
+    const apptTable = (rows, emptyText) =>
+      rows.length
+        ? `<div style="overflow-x:auto"><table>
+          <tr><th>When</th><th>Customer</th><th>Type</th><th>Status</th><th></th></tr>
+          ${rows
+            .map((a) => {
+              const missed = a.status === 'scheduled' && new Date(a.scheduled_at) < new Date();
+              return `
+            <tr data-appt="${a.id}">
+              <td class="${missed ? 'overdue' : ''}">${fmtDateTime(a.scheduled_at)}${missed ? ' (missed)' : ''}</td>
+              <td><a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a>${a.customer_phone ? `<div class="subtitle" style="margin:0">${phone(a.customer_phone)}</div>` : ''}</td>
+              <td>${escapeHtml(a.type)}</td>
+              <td>${escapeHtml(a.status)}</td>
+              <td style="white-space:nowrap">
+                ${
+                  a.status === 'scheduled'
+                    ? `<a class="btn small secondary" href="/dashboard/appointments/${a.id}/edit?return_to=${encodeURIComponent('/dashboard/appointments')}">Edit</a>
+                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small" type="submit">Complete</button></form>
+                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small danger" type="submit">Cancel</button></form>`
+                    : ''
+                }
+              </td>
+            </tr>`;
+            })
+            .join('')}
+        </table></div>`
+        : `<p class="subtitle">${emptyText}</p>`;
     const customers = db.listCustomers();
     const preselect = req.query.customer_id || '';
     const body = `
@@ -1727,32 +1921,13 @@ function register(router, requireAuth) {
           <div style="margin-top:12px"><button class="btn" type="submit">Schedule</button></div>
         </form>
       </div>
-      <div class="panel">
-        <div style="overflow-x:auto"><table>
-          <tr><th>When</th><th>Customer</th><th>Type</th><th>Status</th><th></th></tr>
-          ${appts
-            .map((a) => {
-              const missed = a.status === 'scheduled' && new Date(a.scheduled_at) < new Date();
-              return `
-            <tr>
-              <td class="${missed ? 'overdue' : ''}">${fmtDateTime(a.scheduled_at)}${missed ? ' (missed)' : ''}</td>
-              <td><a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a>${a.customer_phone ? `<div class="subtitle" style="margin:0">${phone(a.customer_phone)}</div>` : ''}</td>
-              <td>${escapeHtml(a.type)}</td>
-              <td>${escapeHtml(a.status)}</td>
-              <td style="white-space:nowrap">
-                ${
-                  a.status === 'scheduled'
-                    ? `<a class="btn small secondary" href="/dashboard/appointments/${a.id}/edit?return_to=${encodeURIComponent('/dashboard/appointments')}">Edit</a>
-                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="completed"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small" type="submit">Complete</button></form>
-                       <form class="inline" method="POST" action="/dashboard/appointments/${a.id}/status"><input type="hidden" name="status" value="canceled"><input type="hidden" name="return_to" value="/dashboard/appointments"><button class="btn small danger" type="submit">Cancel</button></form>`
-                    : ''
-                }
-              </td>
-            </tr>`;
-            })
-            .join('')}
-        </table></div>
-        ${appts.length === 0 ? '<p class="subtitle">No appointments yet.</p>' : ''}
+      <div class="panel" id="appts-upcoming">
+        <h2 style="margin-top:0">Upcoming appointments</h2>
+        ${apptTable(upcoming, 'None upcoming')}
+      </div>
+      <div class="panel" id="appts-past">
+        <h2 style="margin-top:0">Past appointments</h2>
+        ${apptTable(past, 'No past appointments')}
       </div>
     `;
     res.send(dashboardLayout({ title: 'Appointments', active: '/dashboard/appointments', body, flash: flashFromQuery(req.query) }));
@@ -2004,10 +2179,10 @@ function register(router, requireAuth) {
         </form>
         ${
           jobFiles.length
-            ? `<table style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Uploaded</th><th></th></tr>${jobFiles
+            ? `<div class="table-scroll"><table class="files-table" style="margin-top:14px"><tr><th>File</th><th>Note</th><th>Uploaded</th><th></th></tr>${jobFiles
                 .map(
                   (f) => `<tr>
-                    <td><a href="/dashboard/customers/${customer.id}/files/${f.id}" target="_blank">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
+                    <td><a href="/dashboard/customers/${customer.id}/files/${f.id}/view?return_to=${encodeURIComponent(`/dashboard/jobs/${job.id}`)}">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
                     <td>${escapeHtml(f.note || '')}</td>
                     <td>${fmtDateTime(f.created_at)}</td>
                     <td style="white-space:nowrap">
@@ -2015,7 +2190,7 @@ function register(router, requireAuth) {
                     </td>
                   </tr>`
                 )
-                .join('')}</table>`
+                .join('')}</table></div>`
             : `<p class="subtitle">No files on this job yet.</p>`
         }
       </div>
@@ -2028,7 +2203,12 @@ function register(router, requireAuth) {
     if (!job) return res.status(404).send('Job not found');
     const upload = (req.files || []).find((f) => f.fieldname === 'file');
     if (!upload || !upload.filename) return res.redirect(`/dashboard/jobs/${job.id}?err=Choose a file first`);
-    saveUpload({ customer_id: job.customer_id, job_id: job.id, upload, note: req.body.note || null });
+    try {
+      saveUpload({ customer_id: job.customer_id, job_id: job.id, upload, note: req.body.note || null });
+    } catch (e) {
+      console.error('[files] job upload failed:', e);
+      return res.redirect(`/dashboard/jobs/${job.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
+    }
     res.redirect(`/dashboard/jobs/${job.id}?ok=File uploaded`);
   });
 
@@ -2135,10 +2315,10 @@ function register(router, requireAuth) {
           ? `<div class="panel" id="needs-review">
               <h2 style="margin-top:0">Needs review (${needsReview.length})</h2>
               <p class="subtitle">Uploaded through the AI Assistant with no confident customer match. Nothing here is attached to any customer's record yet.</p>
-              <table><tr><th>File</th><th>Uploaded</th><th>Suggested</th><th>Assign to</th><th></th></tr>${needsReview
+              <div class="table-scroll"><table class="files-table"><tr><th>File</th><th>Uploaded</th><th>Suggested</th><th>Assign to</th><th></th></tr>${needsReview
                 .map(
                   (f) => `<tr>
-                    <td>${escapeHtml(f.original_name)}</td>
+                    <td><a href="/dashboard/files/${f.id}/review">${escapeHtml(f.original_name)}</a></td>
                     <td>${fmtDate(f.created_at)}</td>
                     <td>${f.assignment_status === 'unconfirmed' ? escapeHtml(f.suggested_customer_name || '') + ' (unconfirmed)' : 'Needs Review - no suggestion'}</td>
                     <td>
@@ -2156,12 +2336,14 @@ function register(router, requireAuth) {
                     </td>
                   </tr>`
                 )
-                .join('')}</table>
+                .join('')}</table></div>
             </div>`
           : ''
       }
       <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents. Results update as you type.</p>
       <div class="panel">
+        <!-- BF-2639-054: a full reload of this page, keeping the current search. -->
+        <div style="display:flex;justify-content:flex-end"><a class="btn small secondary" id="files-refresh" data-files-refresh href="/dashboard/files${q ? '?q=' + encodeURIComponent(q) : ''}">&#x21bb; Refresh</a></div>
         <form method="GET" action="/dashboard/files" id="files-search-form">
           <label for="files-q">Search</label>
           <input type="search" id="files-q" name="q" value="${escapeHtml(q)}" placeholder="customer name, product, invoice number, amount..." autocomplete="off" autofocus>
@@ -2186,6 +2368,8 @@ function register(router, requireAuth) {
                 if (html === null || mine !== seq) return; // a newer keystroke already won
                 box.innerHTML = html;
                 try { history.replaceState(null, '', q ? '?q=' + encodeURIComponent(q) : window.location.pathname); } catch (e) {}
+                var refresh = document.getElementById('files-refresh');
+                if (refresh) refresh.setAttribute('href', '/dashboard/files' + (q ? '?q=' + encodeURIComponent(q) : ''));
               })
               .catch(function () {
                 if (mine === seq) box.innerHTML = '<p class="subtitle">Could not search just now - check your connection and keep typing to retry.</p>';
@@ -2920,7 +3104,7 @@ function register(router, requireAuth) {
     const redirectTo = req.body.redirect_to || '/dashboard';
     if (!message) return res.redirect(`${redirectTo}?err=Type something for the assistant first`);
 
-    const result = await assistant.handleMessage(message);
+    const result = await assistant.handleMessage(message, { username: req.authUser });
     const target =
       result.navigateTo ||
       (result.changedCustomerId ? `/dashboard/customers/${result.changedCustomerId}` : redirectTo);
@@ -2934,6 +3118,237 @@ function register(router, requireAuth) {
     res.redirect(`${redirectTo}?ok=Assistant conversation cleared`);
   });
 
+  // ---------- Desk: the thin record store (FF-3926-012, FF-3926-013) ----------
+  // People who aren't sales leads and things such as cars. Every read goes
+  // through db.getRecordFor / db.listRecordsFor, which only return what the
+  // signed-in user owns or was shared - a record anyone else can't see is a 404.
+  const deskUser = (req) => db.ensureUser(req.authUser || db.defaultUsername());
+  const recordNotFound = (res) =>
+    res.status(404).send(dashboardLayout({ title: 'Not found', active: '/dashboard/desk', body: `${backLink('/dashboard/desk', 'Back to Desk')}<h1>Record not found</h1>` }));
+  const recordForm = (r) => `
+    <div class="grid cols-2">
+      <div><label>Kind</label><select name="kind">
+        <option value="person" ${!r || r.kind === 'person' ? 'selected' : ''}>Person</option>
+        <option value="thing" ${r && r.kind === 'thing' ? 'selected' : ''}>Thing (car, equipment…)</option>
+      </select></div>
+      <div><label>Name *</label><input type="text" name="name" value="${escapeHtml((r && r.name) || '')}" required></div>
+      <div><label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_business" value="1" style="width:auto" ${r && r.is_business ? 'checked' : ''}> Business</label></div>
+      <div><label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_personal" value="1" style="width:auto" ${r && r.is_personal ? 'checked' : ''}> Personal</label></div>
+      <div><label>Phone</label><input type="tel" name="phone" value="${escapeHtml((r && r.phone) || '')}"></div>
+      <div><label>Email</label><input type="email" name="email" value="${escapeHtml((r && r.email) || '')}"></div>
+      <div style="grid-column: span 2"><label>Address</label><input type="text" name="address" value="${escapeHtml((r && r.address) || '')}"></div>
+      <div><label>Categories (comma-separated)</label><input type="text" name="categories" value="${escapeHtml(r ? r.categories.join(', ') : '')}" placeholder="Electrician, Accountant, Cars…"></div>
+      <div><label>Tags (comma-separated)</label><input type="text" name="tags" value="${escapeHtml(r ? r.tags.join(', ') : '')}"></div>
+      <div style="grid-column: span 2"><label>Notes</label><textarea name="notes" rows="4">${escapeHtml((r && r.notes) || '')}</textarea></div>
+    </div>`;
+  const recordFields = (b) => ({
+    kind: b.kind,
+    name: b.name,
+    is_business: b.is_business === '1',
+    is_personal: b.is_personal === '1',
+    phone: b.phone ? normalizePhone(b.phone) || b.phone : '',
+    email: b.email || '',
+    address: b.address || '',
+    notes: b.notes || '',
+    categories: b.categories || '',
+    tags: b.tags || '',
+  });
+
+  router.get('/dashboard/desk', requireAuth, (req, res) => {
+    const user = deskUser(req);
+    const filter = ['mine', 'business', 'personal'].includes(req.query.f) ? req.query.f : '';
+    const cat = String(req.query.cat || '').trim();
+    const q = String(req.query.q || '').trim();
+    const rows = db.listRecordsFor(user, { filter, category: cat, q });
+    const cats = db.listRecordCategoriesFor(user);
+    const link = (over) => {
+      const p = new URLSearchParams();
+      const v = { f: filter, cat, q, ...over };
+      for (const k of ['f', 'cat', 'q']) if (v[k]) p.set(k, v[k]);
+      const s = p.toString();
+      return `/dashboard/desk${s ? '?' + s : ''}`;
+    };
+    const chip = (f, label) => `<a class="btn small ${filter === f ? '' : 'secondary'}" href="${escapeHtml(link({ f }))}" data-desk-filter="${f || 'all'}">${label}</a>`;
+    const body = `
+      <h1>Desk</h1>
+      <p class="subtitle">People who aren't sales leads, and things like cars. Only you see your records, plus any shared with you.</p>
+      <div class="panel">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+          ${chip('', 'All')}${chip('mine', 'Mine')}${chip('business', 'Business')}${chip('personal', 'Personal')}
+        </div>
+        <form method="GET" action="/dashboard/desk" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+          ${filter ? `<input type="hidden" name="f" value="${escapeHtml(filter)}">` : ''}
+          <div style="flex:1 1 180px"><label for="desk-q">Search</label><input type="search" id="desk-q" name="q" value="${escapeHtml(q)}" placeholder="name, notes, text in PDFs…"></div>
+          <div><label for="desk-cat">Category</label><select id="desk-cat" name="cat"><option value="">All categories</option>${cats
+            .map((c) => `<option value="${escapeHtml(c)}" ${c.toLowerCase() === cat.toLowerCase() ? 'selected' : ''}>${escapeHtml(c)}</option>`)
+            .join('')}</select></div>
+          <button class="btn secondary" type="submit">Go</button>
+        </form>
+        ${
+          rows.length
+            ? `<div class="table-scroll"><table class="files-table" style="margin-top:12px"><tr><th>Name</th><th>Kind</th><th>Type</th><th>Categories</th><th>Phone</th></tr>${rows
+                .map(
+                  (r) => `<tr data-record="${r.id}">
+                    <td><a href="/dashboard/desk/${r.id}">${escapeHtml(r.name)}</a>${r.mine ? '' : ' <span class="badge">shared</span>'}</td>
+                    <td>${r.kind === 'thing' ? 'Thing' : 'Person'}</td>
+                    <td>${[r.is_business ? 'Business' : '', r.is_personal ? 'Personal' : ''].filter(Boolean).join(' · ')}</td>
+                    <td>${escapeHtml(r.categories.join(', '))}</td>
+                    <td>${r.phone ? phone(r.phone) : ''}</td>
+                  </tr>`
+                )
+                .join('')}</table></div>`
+            : `<p class="subtitle" style="margin-top:12px">${filter || cat || q ? 'No records match.' : 'No records yet.'}</p>`
+        }
+      </div>
+      <details class="section" id="desk-new"${rows.length ? '' : ' open'}>
+        <summary>New record</summary>
+        <div class="section-body">
+          <form method="POST" action="/dashboard/desk">
+            ${recordForm(null)}
+            <div style="margin-top:10px"><button class="btn" type="submit">Create record</button></div>
+          </form>
+        </div>
+      </details>
+    `;
+    res.send(dashboardLayout({ title: 'Desk', active: '/dashboard/desk', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/desk', requireAuth, (req, res) => {
+    try {
+      const r = db.createRecord(deskUser(req), recordFields(req.body));
+      res.redirect(`/dashboard/desk/${r.id}?ok=Record created`);
+    } catch (e) {
+      res.redirect(`/dashboard/desk?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+
+  router.get('/dashboard/desk/:id', requireAuth, (req, res) => {
+    const user = deskUser(req);
+    const r = db.getRecordFor(user, req.params.id);
+    if (!r) return recordNotFound(res);
+    const files = db.listRecordFiles(r.id);
+    const others = r.mine ? db.listUsers(user.tenant_id).filter((u) => u.id !== user.id) : [];
+    const body = `
+      ${backLink('/dashboard/desk', 'Back to Desk')}
+      <h1>${escapeHtml(r.name)}</h1>
+      <p class="subtitle">${r.kind === 'thing' ? 'Thing' : 'Person'}${r.is_business ? ' · Business' : ''}${r.is_personal ? ' · Personal' : ''}${r.categories.length ? ' · ' + escapeHtml(r.categories.join(', ')) : ''}${r.tags.length ? ' · tags: ' + escapeHtml(r.tags.join(', ')) : ''}${r.mine ? '' : ' · shared with you'}</p>
+      <div class="panel">
+        ${r.phone ? `📞 <a href="tel:${escapeHtml(telHref(r.phone))}">${phone(r.phone)}</a><br>` : ''}
+        ${r.email ? `✉️ <a href="mailto:${escapeHtml(r.email)}">${escapeHtml(r.email)}</a><br>` : ''}
+        ${r.address ? `📍 ${escapeHtml(r.address)}<br>` : ''}
+        ${r.notes ? `<p style="white-space:pre-wrap">${escapeHtml(r.notes)}</p>` : '<p class="subtitle">No notes.</p>'}
+      </div>
+      <div class="panel" id="record-files">
+        <h2 style="margin-top:0">Files</h2>
+        ${
+          files.length
+            ? `<div class="table-scroll"><table class="files-table"><tr><th>File</th><th>Text found</th><th>Uploaded</th></tr>${files
+                .map(
+                  (f) => `<tr id="file-${f.id}"><td><a href="/dashboard/desk/${r.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a></td><td>${f.extracted_text ? 'yes' : 'no'}</td><td>${fmtDate(f.created_at)}</td></tr>`
+                )
+                .join('')}</table></div>`
+            : '<p class="subtitle">No files yet.</p>'
+        }
+        ${
+          r.mine
+            ? `<form method="POST" action="/dashboard/desk/${r.id}/files" enctype="multipart/form-data" style="margin-top:10px">
+                <label>Attach a file</label><input type="file" name="file" required>
+                <div style="margin-top:8px"><button class="btn secondary" type="submit">Upload</button></div>
+              </form>`
+            : ''
+        }
+      </div>
+      ${
+        r.mine
+          ? `<details class="section" id="record-edit"><summary>Edit</summary><div class="section-body">
+              <form method="POST" action="/dashboard/desk/${r.id}">
+                ${recordForm(r)}
+                <div style="margin-top:10px"><button class="btn" type="submit">Save</button></div>
+              </form>
+            </div></details>
+            ${
+              others.length
+                ? `<details class="section" id="record-share"><summary>Share</summary><div class="section-body">
+                    <form method="POST" action="/dashboard/desk/${r.id}/share">
+                      <select name="user_id">${others.map((u) => `<option value="${u.id}">${escapeHtml(u.display_name || u.username)}${r.shared_with.includes(u.id) ? ' (shared)' : ''}</option>`).join('')}</select>
+                      <button class="btn small secondary" type="submit">Share</button>
+                    </form>
+                  </div></details>`
+                : ''
+            }`
+          : ''
+      }
+    `;
+    res.send(dashboardLayout({ title: r.name, active: '/dashboard/desk', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/desk/:id', requireAuth, (req, res) => {
+    try {
+      const r = db.updateRecord(deskUser(req), req.params.id, recordFields(req.body));
+      if (!r) return recordNotFound(res);
+      res.redirect(`/dashboard/desk/${r.id}?ok=Saved`);
+    } catch (e) {
+      res.redirect(`/dashboard/desk/${req.params.id}?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+
+  router.post('/dashboard/desk/:id/share', requireAuth, (req, res) => {
+    const out = db.shareRecord(deskUser(req), req.params.id, req.body.user_id);
+    if (out.error === 'Not found') return recordNotFound(res);
+    res.redirect(`/dashboard/desk/${req.params.id}?${out.ok ? 'ok=Shared' : 'err=' + encodeURIComponent(out.error)}`);
+  });
+
+  // Files on a record reuse the customer-file machinery: the multipart parser,
+  // write-then-row upload (BF-2639-064) and the same viewer (BF-2639-069).
+  router.post('/dashboard/desk/:id/files', requireAuth, (req, res) => {
+    const user = deskUser(req);
+    const r = db.getRecordFor(user, req.params.id);
+    if (!r || !r.mine) return recordNotFound(res);
+    const upload = (req.files || []).find((f) => f.fieldname === 'file');
+    if (!upload || !upload.filename) return res.redirect(`/dashboard/desk/${r.id}?err=Choose a file first`);
+    try {
+      db.addRecordFile(user, r.id, { filename: upload.filename, mimeType: upload.mimeType, data: upload.data });
+    } catch (e) {
+      console.error('[desk] upload failed:', e);
+      return res.redirect(`/dashboard/desk/${r.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
+    }
+    res.redirect(`/dashboard/desk/${r.id}?ok=File uploaded#record-files`);
+  });
+
+  router.get('/dashboard/desk/:id/files/:fileId', requireAuth, (req, res) => {
+    const f = db.getRecordFileFor(deskUser(req), req.params.id, req.params.fileId);
+    if (!f) return res.status(404).send('File not found');
+    const p = db.recordFilePath(f);
+    if (!fs.existsSync(p)) return res.status(404).send('File not found on disk');
+    res.writeHead(200, {
+      'Content-Type': f.mime_type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${(f.original_name || 'file').replace(/"/g, '')}"`,
+    });
+    fs.createReadStream(p).pipe(res);
+  });
+
+  router.get('/dashboard/desk/:id/files/:fileId/view', requireAuth, (req, res) => {
+    const user = deskUser(req);
+    const f = db.getRecordFileFor(user, req.params.id, req.params.fileId);
+    if (!f) return recordNotFound(res);
+    const all = db.listRecordFiles(f.record_id);
+    const idx = all.findIndex((x) => x.id === f.id);
+    const openable = (x) => fs.existsSync(db.recordFilePath(x));
+    const prev = all.slice(0, idx).reverse().find(openable);
+    const next = all.slice(idx + 1).find(openable);
+    const url = (id) => `/dashboard/desk/${f.record_id}/files/${id}/view`;
+    const missing = !openable(f);
+    const body = fileViewerBody({
+      f,
+      rawUrl: `/dashboard/desk/${f.record_id}/files/${f.id}`,
+      closeUrl: `/dashboard/desk/${f.record_id}#file-${f.id}`,
+      prevUrl: prev ? url(prev.id) : null,
+      nextUrl: next ? url(next.id) : null,
+      missing,
+    });
+    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/desk', body }));
+  });
+
   // JSON versions of the two routes above, used by the in-widget chat log so
   // it can show the reply without leaving/reloading the page. The form-post
   // routes above stay as a fallback for anyone with JS off.
@@ -2944,10 +3359,8 @@ function register(router, requireAuth) {
   // Reads the stored bytes for a customer_files row back off disk, so a file
   // uploaded on an earlier request can still be handed to the model.
   function readStoredFile(fileRow) {
-    if (!fileRow || !fileRow.stored_name) return null;
-    const p = path.join(UPLOADS_DIR, fileRow.customer_id || '_unassigned', fileRow.stored_name);
-    if (!fs.existsSync(p)) return null;
-    return fs.readFileSync(p);
+    const p = db.locateFileBytes(fileRow);
+    return p ? fs.readFileSync(p) : null;
   }
 
   // Attachment upload is now a SEPARATE, fast request from sending a chat
@@ -2997,6 +3410,7 @@ function register(router, requireAuth) {
       const message = (req.body.message || '').trim();
       const ctxCustomer = req.body.context_customer_id ? db.getCustomer(req.body.context_customer_id) : null;
       const context = ctxCustomer ? { customerId: ctxCustomer.id } : {};
+      context.username = req.authUser; // FF-3926-013: Desk tools see only this user's records
       if (req.body.mode === 'voice') context.mode = 'voice';
 
       // Attachment arrives one of two ways:

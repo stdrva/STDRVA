@@ -696,7 +696,11 @@ const PRODUCT_STAGES = ['Queued for Factory', 'Sent to Factory', 'In Production'
 // Either way, exactly the same outcome:
 //   - customer sales_stage -> Sold (and their open legacy lead -> Sold)
 //   - a job exists (reuse the customer's newest unfinished job, else create one)
-//   - that job's status -> Measuring Scheduled (never moves a job BACKWARD)
+//   - the job's status is NOT touched: a new job starts at Order Confirmed and an
+//     existing job keeps whatever it has (BF-2639-060 - it used to jump to
+//     Measuring Scheduled here, before any measure was booked). The job moves to
+//     Measuring Scheduled only when a Measure appointment is booked
+//     (see advanceJobForMeasure / createAppointment).
 //   - one open follow-up "Schedule measure" (never a duplicate)
 // It deliberately sends NOTHING. The caller decides, on Andrew's explicit yes,
 // whether to also fire automations.onJobCreated (the customer text/email).
@@ -725,10 +729,6 @@ function completeSalePacket(customer_id, { actor, via } = {}) {
       const lead = openLead || leads.find((l) => l.stage === 'Sold') || null;
       job = createJob({ lead_id: lead ? lead.id : null, customer_id, sold_amount: lead ? lead.estimate_value : null });
       out.job_created = true;
-    }
-    if (JOB_STAGES.indexOf(job.status) < JOB_STAGES.indexOf('Measuring Scheduled')) {
-      job = updateJobStatus(job.id, 'Measuring Scheduled', note);
-      out.job_status_changed = true;
     }
     out.job = getJob(job.id);
 
@@ -878,6 +878,20 @@ function updateLead(id, { estimate_value, notes, source }) {
 }
 
 // ---- Appointments ----
+// BF-2639-060: booking a Measure is what moves a job to Measuring Scheduled.
+// Appointments carry no job_id, so "that job" is the customer's newest
+// unfinished job - the same one the sale packet reuses. Only ever moves a job
+// FORWARD (Order Confirmed -> Measuring Scheduled), never backward.
+function advanceJobForMeasure(customer_id, actor) {
+  const job = listJobs()
+    .filter((j) => j.customer_id === customer_id && j.status !== 'Complete')
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+  if (!job) return null;
+  if (JOB_STAGES.indexOf(job.status) < JOB_STAGES.indexOf('Measuring Scheduled')) {
+    return updateJobStatus(job.id, 'Measuring Scheduled', `Measure appointment booked${actor ? ' by ' + actor : ''}`);
+  }
+  return null;
+}
 function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_min, notes, created_by, consultant_id }) {
   const id = newId();
   const ts = nowIso();
@@ -894,6 +908,7 @@ function createAppointment({ customer_id, lead_id, type, scheduled_at, duration_
     new_value: `${type || 'Consultation'} @ ${scheduled_at}`,
     actor: created_by || 'user',
   });
+  if (type === 'Measure') advanceJobForMeasure(customer_id, created_by); // BF-2639-060
   return getAppointment(id);
 }
 function getAppointment(id) {
@@ -1183,18 +1198,64 @@ function createCustomerFile({ customer_id, job_id, stored_name, original_name, m
   syncFileSearch(id);
   return id;
 }
+// BF-2639-064: ONE place decides where a file's bytes live, and every writer and
+// reader goes through it. The folder is keyed on the row's CURRENT customer_id,
+// so anything that changes customer_id must move the bytes too (see
+// setFileAssignment) - otherwise the upload writes to _unassigned/ and the viewer
+// looks in <customer_id>/ and says "File not found on disk".
+// Limitation: this is the local disk under DATA_DIR. With more than one Render
+// instance each would have its own disk; the app runs as a single instance.
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+function uploadsDirFor(customer_id) {
+  return path.join(UPLOADS_DIR, customer_id || '_unassigned');
+}
+function fileBytesPath(fileRow) {
+  return path.join(uploadsDirFor(fileRow.customer_id), fileRow.stored_name);
+}
+// Returns the path the bytes can actually be read from, or null. Rows filed
+// before 1.8.1 can have their bytes stranded in _unassigned/ (or under the
+// customer they were first suggested for); those are moved to the right folder
+// on first open so the next read is a plain hit.
+function locateFileBytes(fileRow) {
+  if (!fileRow || !fileRow.stored_name) return null;
+  const want = fileBytesPath(fileRow);
+  if (fs.existsSync(want)) return want;
+  const candidates = [uploadsDirFor(null), fileRow.suggested_customer_id && uploadsDirFor(fileRow.suggested_customer_id)]
+    .filter(Boolean)
+    .map((d) => path.join(d, fileRow.stored_name));
+  const found = candidates.find((p) => p !== want && fs.existsSync(p));
+  if (!found) return null;
+  try {
+    fs.mkdirSync(path.dirname(want), { recursive: true });
+    fs.renameSync(found, want);
+    return want;
+  } catch (e) {
+    return found;
+  }
+}
 // Resolves (or corrects) which customer an assistant-uploaded file belongs
 // to. Passing customer_id clears suggested_customer_id and marks 'confirmed'
 // unless a different status is given explicitly (used to move a file back to
 // 'needs_review' on Undo).
 function setFileAssignment(id, { customer_id, assignment_status, suggested_customer_id }) {
+  const before = getCustomerFile(id);
+  const from = before ? locateFileBytes(before) : null;
   db.prepare(`UPDATE customer_files SET customer_id = ?, assignment_status = ?, suggested_customer_id = ? WHERE id = ?`).run(
     customer_id || null,
     assignment_status || null,
     suggested_customer_id || null,
     id
   );
-  return getCustomerFile(id);
+  const after = getCustomerFile(id);
+  // BF-2639-064: the bytes follow the row to its new customer's folder.
+  if (from && after) {
+    const to = fileBytesPath(after);
+    if (to !== from) {
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+    }
+  }
+  return after;
 }
 function listFilesNeedingReview() {
   return db
@@ -2493,6 +2554,373 @@ function kpiByCampaign({ start, end } = {}) {
   }));
 }
 
+// ---- Thin multi-user record store (FF-3926-012, FF-3926-013) ---------------
+// People who are not sales leads, and things such as cars. One store, not a
+// second app: no budgets, no reminder engine, no pipeline - notes, categories,
+// tags and files only.
+//
+// Tenancy: a single tenant row for the live company is created on first boot;
+// customers / jobs / customer_files / users carry tenant_id (backfilled to it).
+// Billing, signup and custom domains are out of scope.
+//
+// Users: the BOS still has ONE login (DASHBOARD_USER / DASHBOARD_PASSWORD). That
+// login maps to a users row, created on first use. More logins are a later
+// release; the access rules below already key on users.id so they hold then.
+//
+// Access rule (the only one): a user sees a record when it is in their tenant,
+// not deleted, and they own it OR it was shared with them. Business or personal,
+// the rule is the same - a personal record is invisible to anyone it isn't
+// shared with. Nothing here is ever seeded: a fresh database has zero records.
+const DEFAULT_TENANT_ID = 'tenant-1';
+db.exec(`
+CREATE TABLE IF NOT EXISTS tenants (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  username TEXT NOT NULL,
+  display_name TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (tenant_id, username)
+);
+CREATE TABLE IF NOT EXISTS records (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL CHECK (kind IN ('person', 'thing')),
+  name TEXT NOT NULL,
+  is_business INTEGER NOT NULL DEFAULT 0,
+  is_personal INTEGER NOT NULL DEFAULT 0,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_records_owner ON records(tenant_id, owner_user_id);
+CREATE TABLE IF NOT EXISTS record_categories (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (tenant_id, owner_user_id, name COLLATE NOCASE)
+);
+CREATE TABLE IF NOT EXISTS record_category_map (
+  record_id TEXT NOT NULL REFERENCES records(id),
+  category_id TEXT NOT NULL REFERENCES record_categories(id),
+  PRIMARY KEY (record_id, category_id)
+);
+CREATE TABLE IF NOT EXISTS record_tags (
+  record_id TEXT NOT NULL REFERENCES records(id),
+  tag TEXT NOT NULL COLLATE NOCASE,
+  PRIMARY KEY (record_id, tag)
+);
+CREATE TABLE IF NOT EXISTS record_shares (
+  id TEXT PRIMARY KEY,
+  record_id TEXT NOT NULL REFERENCES records(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  created_at TEXT NOT NULL,
+  UNIQUE (record_id, user_id)
+);
+-- Files on a record. Kept apart from customer_files so a personal record's
+-- files never show up on the Files page, in file search, or in Needs Review.
+CREATE TABLE IF NOT EXISTS record_files (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  record_id TEXT NOT NULL REFERENCES records(id),
+  stored_name TEXT NOT NULL,
+  original_name TEXT NOT NULL,
+  mime_type TEXT,
+  size INTEGER NOT NULL DEFAULT 0,
+  extracted_text TEXT,
+  created_at TEXT NOT NULL,
+  deleted_at TEXT
+);
+`);
+(function migrateTenancy() {
+  if (!db.prepare(`SELECT id FROM tenants WHERE id = ?`).get(DEFAULT_TENANT_ID)) {
+    db.prepare(`INSERT INTO tenants (id, name, created_at) VALUES (?,?,?)`).run(
+      DEFAULT_TENANT_ID,
+      process.env.BUSINESS_NAME || 'Shelves to Drawers RVA',
+      nowIso()
+    );
+  }
+  // A constant DEFAULT backfills every existing row and covers future inserts
+  // without touching the INSERT statements. (No REFERENCES on an added column:
+  // SQLite refuses a non-NULL default there while foreign keys are on.)
+  for (const table of ['customers', 'jobs', 'customer_files', 'users']) {
+    const cols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    if (!cols.has('tenant_id')) db.exec(`ALTER TABLE ${table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}'`);
+  }
+})();
+
+// The username the single env login authenticates as (see src/auth.js).
+function defaultUsername() {
+  return process.env.DASHBOARD_PASSWORD ? process.env.DASHBOARD_USER || 'admin' : 'dev';
+}
+function getUser(id) {
+  return db.prepare(`SELECT * FROM users WHERE id = ?`).get(id) || null;
+}
+function ensureUser(username, { tenant_id = DEFAULT_TENANT_ID, display_name } = {}) {
+  const u = String(username || defaultUsername()).trim() || defaultUsername();
+  const existing = db.prepare(`SELECT * FROM users WHERE tenant_id = ? AND username = ?`).get(tenant_id, u);
+  if (existing) return existing;
+  const id = newId();
+  db.prepare(`INSERT INTO users (id, tenant_id, username, display_name, created_at) VALUES (?,?,?,?,?)`).run(id, tenant_id, u, display_name || null, nowIso());
+  return getUser(id);
+}
+function listUsers(tenant_id = DEFAULT_TENANT_ID) {
+  return db.prepare(`SELECT * FROM users WHERE tenant_id = ? ORDER BY username`).all(tenant_id);
+}
+
+const truthy = (v) => v === true || v === 1 || v === '1' || v === 'on' || v === 'true';
+const cleanList = (v) =>
+  [...new Set((Array.isArray(v) ? v : String(v || '').split(','))
+    .map((s) => String(s).trim())
+    .filter(Boolean))];
+
+function recordVisibleTo(record, user) {
+  if (!record || !user || record.deleted_at || record.tenant_id !== user.tenant_id) return false;
+  if (record.owner_user_id === user.id) return true;
+  return !!db.prepare(`SELECT 1 FROM record_shares WHERE record_id = ? AND user_id = ? AND tenant_id = ?`).get(record.id, user.id, user.tenant_id);
+}
+// Every read goes through here: the record, or null when this user can't see it.
+function getRecordFor(user, id) {
+  const r = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id) || null;
+  return recordVisibleTo(r, user) ? hydrateRecord(r, user) : null;
+}
+function hydrateRecord(r, user) {
+  const categories = db
+    .prepare(`SELECT rc.name FROM record_category_map m JOIN record_categories rc ON rc.id = m.category_id WHERE m.record_id = ? ORDER BY rc.name`)
+    .all(r.id)
+    .map((x) => x.name);
+  const tags = db.prepare(`SELECT tag FROM record_tags WHERE record_id = ? ORDER BY tag`).all(r.id).map((x) => x.tag);
+  const shared_with = db.prepare(`SELECT user_id FROM record_shares WHERE record_id = ?`).all(r.id).map((x) => x.user_id);
+  return { ...r, categories, tags, mine: !!user && r.owner_user_id === user.id, shared_with };
+}
+function visibleRecordRows(user) {
+  if (!user) return [];
+  return db
+    .prepare(
+      `SELECT DISTINCT records.* FROM records
+       LEFT JOIN record_shares s ON s.record_id = records.id AND s.user_id = ? AND s.tenant_id = records.tenant_id
+       WHERE records.tenant_id = ? AND records.deleted_at IS NULL
+         AND (records.owner_user_id = ? OR s.user_id IS NOT NULL)
+       ORDER BY records.name COLLATE NOCASE`
+    )
+    .all(user.id, user.tenant_id, user.id);
+}
+function setRecordCategories(record, names) {
+  db.prepare(`DELETE FROM record_category_map WHERE record_id = ?`).run(record.id);
+  for (const name of cleanList(names)) {
+    let cat = db
+      .prepare(`SELECT * FROM record_categories WHERE tenant_id = ? AND owner_user_id = ? AND name = ? COLLATE NOCASE`)
+      .get(record.tenant_id, record.owner_user_id, name);
+    if (!cat) {
+      const cid = newId();
+      db.prepare(`INSERT INTO record_categories (id, tenant_id, owner_user_id, name, created_at) VALUES (?,?,?,?,?)`).run(cid, record.tenant_id, record.owner_user_id, name, nowIso());
+      cat = { id: cid };
+    }
+    db.prepare(`INSERT OR IGNORE INTO record_category_map (record_id, category_id) VALUES (?,?)`).run(record.id, cat.id);
+  }
+}
+function setRecordTags(record, tags) {
+  db.prepare(`DELETE FROM record_tags WHERE record_id = ?`).run(record.id);
+  for (const t of cleanList(tags)) db.prepare(`INSERT OR IGNORE INTO record_tags (record_id, tag) VALUES (?,?)`).run(record.id, t);
+}
+function createRecord(user, { kind, name, is_business, is_personal, phone, email, address, notes, categories, tags }) {
+  if (!user) throw new Error('No user');
+  if (!['person', 'thing'].includes(kind)) throw new Error('kind must be person or thing');
+  const nm = String(name || '').trim();
+  if (!nm) throw new Error('A record needs a name');
+  const id = newId();
+  const ts = nowIso();
+  db.prepare(
+    `INSERT INTO records (id, tenant_id, owner_user_id, kind, name, is_business, is_personal, phone, email, address, notes, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(id, user.tenant_id, user.id, kind, nm, truthy(is_business) ? 1 : 0, truthy(is_personal) ? 1 : 0, phone || null, email || null, address || null, notes || null, ts, ts);
+  const row = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id);
+  setRecordCategories(row, categories);
+  setRecordTags(row, tags);
+  return getRecordFor(user, id);
+}
+// Owner-only: a record shared with you is readable, not editable.
+function updateRecord(user, id, fields) {
+  const r = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id);
+  if (!r || r.deleted_at || !user || r.owner_user_id !== user.id || r.tenant_id !== user.tenant_id) return null;
+  const pick = (k) => (fields[k] === undefined ? r[k] : fields[k] === '' ? null : fields[k]);
+  const flag = (k) => (fields[k] === undefined ? r[k] : truthy(fields[k]) ? 1 : 0);
+  if (fields.kind !== undefined && !['person', 'thing'].includes(fields.kind)) throw new Error('kind must be person or thing');
+  const nm = fields.name === undefined ? r.name : String(fields.name).trim();
+  if (!nm) throw new Error('A record needs a name');
+  db.prepare(
+    `UPDATE records SET kind = ?, name = ?, is_business = ?, is_personal = ?, phone = ?, email = ?, address = ?, notes = ?, updated_at = ? WHERE id = ?`
+  ).run(fields.kind || r.kind, nm, flag('is_business'), flag('is_personal'), pick('phone'), pick('email'), pick('address'), pick('notes'), nowIso(), id);
+  if (fields.categories !== undefined) setRecordCategories(r, fields.categories);
+  if (fields.tags !== undefined) setRecordTags(r, fields.tags);
+  return getRecordFor(user, id);
+}
+// A share never crosses tenants: record, owner and recipient must all match.
+function shareRecord(owner, record_id, user_id) {
+  const r = db.prepare(`SELECT * FROM records WHERE id = ?`).get(record_id);
+  const to = getUser(user_id);
+  if (!r || !owner || !to || r.owner_user_id !== owner.id) return { error: 'Not found' };
+  if (r.tenant_id !== owner.tenant_id || to.tenant_id !== r.tenant_id) return { error: 'A record can only be shared inside its own company' };
+  if (to.id === owner.id) return { error: 'That is the owner' };
+  db.prepare(`INSERT OR IGNORE INTO record_shares (id, record_id, user_id, tenant_id, created_at) VALUES (?,?,?,?,?)`).run(newId(), r.id, to.id, r.tenant_id, nowIso());
+  return { ok: true };
+}
+function unshareRecord(owner, record_id, user_id) {
+  const r = db.prepare(`SELECT * FROM records WHERE id = ?`).get(record_id);
+  if (!r || !owner || r.owner_user_id !== owner.id) return { error: 'Not found' };
+  db.prepare(`DELETE FROM record_shares WHERE record_id = ? AND user_id = ?`).run(record_id, user_id);
+  return { ok: true };
+}
+// The Desk list: filter = mine | business | personal | '' (everything I can see),
+// category = a category name, q = free text over the record and its files' text.
+function listRecordsFor(user, { filter, category, q, kind } = {}) {
+  let rows = visibleRecordRows(user).map((r) => hydrateRecord(r, user));
+  if (filter === 'mine') rows = rows.filter((r) => r.mine);
+  if (filter === 'business') rows = rows.filter((r) => r.is_business);
+  if (filter === 'personal') rows = rows.filter((r) => r.is_personal);
+  if (kind) rows = rows.filter((r) => r.kind === kind);
+  if (category) {
+    const c = String(category).trim().toLowerCase();
+    rows = rows.filter((r) => r.categories.some((n) => n.toLowerCase() === c));
+  }
+  if (q && String(q).trim()) rows = searchRecordRows(rows, q);
+  return rows;
+}
+// Every whitespace-separated term must appear in the record (name, contact,
+// notes, categories, tags) or in text extracted from one of its files. Each hit
+// says where it matched, so the assistant can cite it - and a photo with no
+// extracted text can never be the reason for a match.
+function searchRecordRows(rows, q) {
+  const terms = String(q).toLowerCase().split(/\s+/).filter(Boolean);
+  const out = [];
+  for (const r of rows) {
+    const files = listRecordFiles(r.id);
+    const own = [r.name, r.phone, r.email, r.address, r.notes, ...r.categories, ...r.tags].filter(Boolean).join(' \n ').toLowerCase();
+    const fileTexts = files.filter((f) => f.extracted_text).map((f) => ({ name: f.original_name, text: f.extracted_text.toLowerCase() }));
+    const all = [own, ...fileTexts.map((f) => f.text)].join(' \n ');
+    if (!terms.every((t) => all.includes(t))) continue;
+    const matched_in = [];
+    if (terms.some((t) => own.includes(t))) matched_in.push('record');
+    for (const f of fileTexts) if (terms.some((t) => f.text.includes(t))) matched_in.push(`file: ${f.name}`);
+    out.push({ ...r, matched_in, files_without_text: files.filter((f) => !f.extracted_text).map((f) => f.original_name) });
+  }
+  return out;
+}
+function listRecordCategoriesFor(user) {
+  const names = new Map();
+  for (const r of listRecordsFor(user)) for (const n of r.categories) names.set(n.toLowerCase(), names.get(n.toLowerCase()) || n);
+  return [...names.values()].sort((a, b) => a.localeCompare(b));
+}
+
+// Record files: bytes under uploads/_records/<record_id>/, same write-then-row
+// rule as saveUpload (BF-2639-064) so a row never exists without its bytes.
+function recordFilesDir(record_id) {
+  return path.join(UPLOADS_DIR, '_records', record_id);
+}
+function recordFilePath(f) {
+  return path.join(recordFilesDir(f.record_id), f.stored_name);
+}
+function addRecordFile(user, record_id, { filename, mimeType, data }) {
+  const r = getRecordFor(user, record_id);
+  if (!r || !r.mine) return null;
+  const dir = recordFilesDir(r.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const stored = `${newId()}${path.extname(filename || '')}`;
+  const p = path.join(dir, stored);
+  fs.writeFileSync(p, data);
+  if (!fs.existsSync(p) || fs.statSync(p).size !== data.length) {
+    try { fs.unlinkSync(p); } catch {}
+    throw new Error('Upload bytes were not written to disk');
+  }
+  const id = newId();
+  try {
+    db.prepare(
+      `INSERT INTO record_files (id, tenant_id, record_id, stored_name, original_name, mime_type, size, extracted_text, created_at) VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run(id, r.tenant_id, r.id, stored, filename || stored, mimeType || null, data.length, extractPdfText(data, mimeType, filename) || null, nowIso());
+  } catch (e) {
+    try { fs.unlinkSync(p); } catch {}
+    throw e;
+  }
+  return getRecordFile(id);
+}
+function getRecordFile(id) {
+  return db.prepare(`SELECT * FROM record_files WHERE id = ?`).get(id) || null;
+}
+function listRecordFiles(record_id) {
+  return db.prepare(`SELECT * FROM record_files WHERE record_id = ? AND deleted_at IS NULL ORDER BY created_at DESC`).all(record_id);
+}
+// A file is readable exactly when its record is.
+function getRecordFileFor(user, record_id, file_id) {
+  const r = getRecordFor(user, record_id);
+  const f = getRecordFile(file_id);
+  return r && f && f.record_id === r.id && !f.deleted_at ? f : null;
+}
+
+// Best-effort text from a text-based PDF, with no dependency: inflate each
+// FlateDecode stream and collect the string operands of Tj / TJ. Scanned PDFs,
+// photos and anything else yield '' - never a guess.
+function extractPdfText(buf, mimeType, filename) {
+  const isPdf = mimeType === 'application/pdf' || /\.pdf$/i.test(filename || '') || (buf && buf.subarray(0, 5).toString('latin1') === '%PDF-');
+  if (!isPdf || !buf) return '';
+  const zlib = require('zlib');
+  const src = buf.toString('latin1');
+  const chunks = [];
+  const re = /stream\r?\n/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const start = m.index + m[0].length;
+    const end = src.indexOf('endstream', start);
+    if (end < 0) break;
+    const raw = buf.subarray(start, end);
+    let content = null;
+    try { content = zlib.inflateSync(raw).toString('latin1'); } catch {
+      try { content = zlib.inflateSync(raw.subarray(0, raw.length - 1)).toString('latin1'); } catch { content = raw.toString('latin1'); }
+    }
+    chunks.push(content);
+    re.lastIndex = end;
+  }
+  const ESC = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' };
+  // Literal strings inside text objects (BT ... ET). PDF strings may contain
+  // balanced unescaped parentheses - "(FSD)" - so track depth, not a regex.
+  const words = [];
+  for (const c of chunks) {
+    for (const bt of c.matchAll(/\bBT\b([\s\S]*?)\bET\b/g)) {
+      const s = bt[1];
+      let line = '';
+      for (let i = 0; i < s.length; i++) {
+        if (s[i] !== '(') continue;
+        let depth = 1;
+        let str = '';
+        for (i++; i < s.length && depth > 0; i++) {
+          const ch = s[i];
+          if (ch === '\\') {
+            const oct = /^[0-7]{1,3}/.exec(s.slice(i + 1, i + 4));
+            if (oct) { str += String.fromCharCode(parseInt(oct[0], 8)); i += oct[0].length; } else { str += ESC[s[i + 1]] || ''; i++; }
+          } else if (ch === '(') { depth++; str += ch; }
+          else if (ch === ')') { depth--; if (depth) str += ch; }
+          else str += ch;
+        }
+        i--;
+        line += str;
+      }
+      if (line) words.push(line);
+    }
+  }
+  return words.join(' ').replace(/[^\x20-\x7e\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 20000);
+}
+
 module.exports = {
   db,
   DATA_DIR,
@@ -2608,6 +3036,28 @@ module.exports = {
   deleteProductOption,
   createCustomerFile,
   setFileAssignment,
+  UPLOADS_DIR,
+  uploadsDirFor,
+  fileBytesPath,
+  locateFileBytes,
+  // FF-3926-012 / FF-3926-013 record store
+  DEFAULT_TENANT_ID,
+  defaultUsername,
+  ensureUser,
+  getUser,
+  listUsers,
+  getRecordFor,
+  createRecord,
+  updateRecord,
+  shareRecord,
+  unshareRecord,
+  listRecordsFor,
+  listRecordCategoriesFor,
+  addRecordFile,
+  listRecordFiles,
+  getRecordFileFor,
+  recordFilePath,
+  extractPdfText,
   listFilesNeedingReview,
   findConfidentCustomerByName,
   decideFileAssignment,

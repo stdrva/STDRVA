@@ -44,7 +44,8 @@ test('046: Menu sheet has the exact groups and items, Training grey and not a li
   const html = layout('/dashboard');
   const sheet = html.slice(html.indexOf('id="menu-sheet"'), html.indexOf('</script>', html.indexOf('id="menu-sheet"')));
   const titles = [...sheet.matchAll(/menu-group-title">([^<]+)</g)].map((m) => m[1]);
-  assert.deepEqual(titles, ['Training', 'Marketing', 'Financial', 'Customer Relations', 'Production']);
+  // 1.8.1 BF-2639-056 reordered the groups (hrefs unchanged); see update-181.test.js.
+  assert.deepEqual(titles.slice(0, 5), ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training']);
 
   // Split the sheet into its <div class="menu-group"> blocks; each starts with its title.
   const blocks = sheet.split(/<div class="menu-group(?: menu-group-logout)?">/).slice(1);
@@ -426,7 +427,8 @@ test('025: /dashboard/files/results - empty q shows recent files, q searches, HT
   assert.equal((html.match(/<tr>(?!<th)/g) || []).length, 50, 'about 50 recent rows');
   assert.match(html, /recent-54\.pdf/);
   assert.ok(!/recent-55\.pdf/.test(html), 'soft-deleted file not listed');
-  assert.match(html, /href="#needs-review">Needs review<\/a>/, 'unassigned file points at the Needs Review panel');
+  // 1.8.1 BF-2639-053: an unassigned file links to its own review page (the #needs-review jump is gone).
+  assert.match(html, /href="\/dashboard\/files\/[^"]+\/review">Needs review<\/a>/, 'unassigned file opens its review page');
   assert.ok(!/customers\/null\//.test(html), 'no broken link for a file with no customer');
 
   // prefix matching = "as they type": "recent-3" finds recent-30..39

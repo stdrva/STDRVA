@@ -103,7 +103,7 @@ test.after(async () => {
 });
 
 // ---------------------------------------------------------------- completion logic
-test('034: completeSalePacket -> Sold, job at Measuring Scheduled, "Schedule measure" follow-up, and sends NOTHING', () => {
+test('034: completeSalePacket -> Sold, job stays Order Confirmed (1.8.1 BF-2639-060), "Schedule measure" follow-up, and sends NOTHING', () => {
   const { c, lead } = makeCustomer('Packet Complete Person');
   const before = messageCount(c.id);
   const r = db.completeSalePacket(c.id, { actor: 'user:test', via: 'signed on device' });
@@ -112,10 +112,10 @@ test('034: completeSalePacket -> Sold, job at Measuring Scheduled, "Schedule mea
   assert.equal(db.getCustomer(c.id).sales_stage, 'Sold');
   assert.equal(db.getLead(lead.id).stage, 'Sold', 'the legacy lead follows');
   assert.equal(r.job_created, true);
-  assert.equal(r.job.status, 'Measuring Scheduled');
+  assert.equal(r.job.status, 'Order Confirmed');
   assert.equal(r.job.sold_amount, 7365, 'job takes the lead estimate as its sold amount');
   assert.equal(r.job.lead_id, lead.id);
-  assert.deepEqual(db.getJobHistory(r.job.id).map((h) => h.status), ['Order Confirmed', 'Measuring Scheduled']);
+  assert.deepEqual(db.getJobHistory(r.job.id).map((h) => h.status), ['Order Confirmed']);
   assert.equal(r.job.estimated_install_at, null);
 
   const f = openFollowups(c.id, 'Schedule measure');
@@ -136,18 +136,18 @@ test('034: completing twice changes nothing the second time (one job, one follow
   assert.deepEqual([b.stage_changed, b.job_created, b.job_status_changed, b.followup_created], [false, false, false, false]);
   assert.equal(b.job.id, a.job.id);
   assert.equal(db.listJobs().filter((j) => j.customer_id === c.id).length, 1);
-  assert.equal(db.getJobHistory(a.job.id).length, 2);
+  assert.equal(db.getJobHistory(a.job.id).length, 1); // 1.8.1 BF-2639-060: the packet adds no status step
   assert.equal(openFollowups(c.id, 'Schedule measure').length, 1);
 });
 
-test('034: an existing job is reused and advanced; a job further along is never moved backward; a finished job gets a new one', () => {
-  // Order Confirmed -> Measuring Scheduled, same job
+test('034: an existing job is reused (not advanced - 1.8.1 BF-2639-060); a job further along is never moved backward; a finished job gets a new one', () => {
+  // Order Confirmed stays Order Confirmed, same job (1.8.1 BF-2639-060)
   const one = makeCustomer('Packet Existing Job');
   const j1 = db.createJob({ customer_id: one.c.id, sold_amount: 100 });
   const r1 = db.completeSalePacket(one.c.id, { actor: 't' });
   assert.equal(r1.job.id, j1.id);
   assert.equal(r1.job_created, false);
-  assert.equal(r1.job.status, 'Measuring Scheduled');
+  assert.equal(r1.job.status, 'Order Confirmed');
 
   // Measured stays Measured
   const two = makeCustomer('Packet Advanced Job');
@@ -232,7 +232,7 @@ test('034: sign on this device saves a NEW file (name + ET + file list), leaves 
   const out = await res.json();
   assert.equal(res.status, 200, JSON.stringify(out));
   assert.equal(out.ok, true);
-  assert.match(decodeURIComponent(out.redirect), /Customer marked Sold · job created · job status Measuring Scheduled · "Schedule measure" follow-up added · no message sent to the customer/);
+  assert.match(decodeURIComponent(out.redirect), /Customer marked Sold · job created · job at Order Confirmed · "Schedule measure" follow-up added · no message sent to the customer/);
 
   const all = db.listCustomerFiles(c.id);
   assert.equal(all.length, beforeFiles + 1, 'exactly one NEW file');
@@ -248,7 +248,7 @@ test('034: sign on this device saves a NEW file (name + ET + file list), leaves 
 
   const job = db.listJobs().find((j) => j.customer_id === c.id);
   assert.equal(signed.job_id, job.id, 'tagged to the job');
-  assert.equal(job.status, 'Measuring Scheduled');
+  assert.equal(job.status, 'Order Confirmed');
   assert.equal(db.getCustomer(c.id).sales_stage, 'Sold');
   assert.equal(openFollowups(c.id, 'Schedule measure').length, 1);
   assert.equal(messageCount(c.id), before, 'NO customer text/email (onJobCreated did not fire)');
@@ -410,7 +410,7 @@ test('034: confirmed email sends the selected files as attachments, then complet
     // sale completed, and the ONLY message logged to the customer is the packet email itself
     assert.equal(db.getCustomer(c.id).sales_stage, 'Sold');
     const job = db.listJobs().find((j) => j.customer_id === c.id);
-    assert.equal(job.status, 'Measuring Scheduled');
+    assert.equal(job.status, 'Order Confirmed');
     assert.equal(openFollowups(c.id, 'Schedule measure').length, 1);
     const msgs = db.listMessagesForCustomer(c.id);
     assert.equal(msgs.length, 1);

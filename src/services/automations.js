@@ -139,33 +139,100 @@ async function onJobStatusChanged(job, customer, status) {
   });
 }
 
-// Fired by the reminders scheduler ahead of an appointment. Carries the extras
-// the plain booking confirmation doesn't (spec G2): a cabinet-prep line, and
-// private Confirm / Change / Cancel links. Reviews/referrals and the info-page
-// link are explicitly out of scope for this pass.
-async function onAppointmentReminder(appt) {
-  const fullCustomer = db.getCustomer(appt.customer_id) || {};
-  const customer = { id: appt.customer_id, name: appt.customer_name, phone: appt.customer_phone, email: appt.customer_email };
-  const when = new Date(appt.scheduled_at).toLocaleString('en-US', {
-    weekday: 'short',
-    month: 'short',
+// ---- Appointment reminders (BF-2639-067) ----
+// The appointment TYPE picks the body; the send window (reminders.js) is the
+// same for all of them. Times are always America/New_York and labelled ET.
+const ESTIMATE_APPT_TYPES = ['Short Design Consultation', 'Long Design Consultation', 'Design Review'];
+
+// { weekday: 'Friday', month: 'October', day: '9', time: '2:00 PM' } in ET.
+function etParts(iso) {
+  const parts = {};
+  for (const p of new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'long',
+    month: 'long',
     day: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
-  });
+  }).formatToParts(new Date(iso))) {
+    parts[p.type] = p.value;
+  }
+  return { weekday: parts.weekday, month: parts.month, day: parts.day, time: `${parts.hour}:${parts.minute} ${parts.dayPeriod}` };
+}
+function etWhenLine(iso) {
+  const p = etParts(iso);
+  return `${p.weekday}, ${p.month} ${p.day} at ${p.time} ET`;
+}
+const htmlEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+
+// Shared frame: header, ET date line, address, the type-specific prep lines,
+// then the public-page link and the phone footer.
+function reminderMessage(label, prepLines, { appt, customer }) {
   const link = appointmentUrl(appt.public_token);
-  const body = `Reminder from ${BUSINESS_NAME}: you have a "${appt.type}" appointment on ${when}. No need to empty your cabinets - basic access is fine. Confirm, change, or cancel: ${link}`;
-  const emailHtml = `<p>Hi ${customer.name},</p>
+  const when = etWhenLine(appt.scheduled_at);
+  const lines = [
+    `${BUSINESS_NAME} — ${label}`,
+    when,
+    customer && customer.address ? customer.address : null,
+    ...prepLines,
+    `Your page (details, contact us, request a new time): ${link}`,
+    `Or call/text Andrew: ${BUSINESS_PHONE}`,
+  ].filter(Boolean);
+  return {
+    smsBody: lines.join('\n'),
+    emailSubject: `Reminder: your ${BUSINESS_NAME} ${label} - ${when}`,
+    emailHtml: `<p>${lines
+      .map((l) => (l.startsWith('Your page') ? `Your page (details, contact us, request a new time): <a href="${htmlEsc(link)}">${htmlEsc(link)}</a>` : htmlEsc(l)))
+      .join('<br>\n')}</p>`,
+  };
+}
+
+// Install: empty and wipe the cabinets (BF-2639-067).
+function buildInstallReminder({ appt, customer }) {
+  return reminderMessage(
+    'install',
+    [
+      'Please empty the cabinets completely and wipe them out before we arrive. If something in the back is stuck or heavy, leave it and we will help.',
+      'Leave a clear walkway into the house and a small open spot to stage product. A small space is enough.',
+    ],
+    { appt, customer }
+  );
+}
+
+// Estimate (design) visits: keep the do-not-empty instruction.
+function buildEstimateReminder({ appt, customer }) {
+  return reminderMessage('estimate', ['Please do not empty your cabinets - basic access to the space is all we need.'], { appt, customer });
+}
+
+// Every other type keeps the body it had before 1.8.1 (only the time is now ET).
+function buildGenericReminder({ appt, customer }) {
+  const when = etWhenLine(appt.scheduled_at);
+  const link = appointmentUrl(appt.public_token);
+  return {
+    smsBody: `Reminder from ${BUSINESS_NAME}: you have a "${appt.type}" appointment on ${when}. No need to empty your cabinets - basic access is fine. Confirm, change, or cancel: ${link}`,
+    emailSubject: `Reminder: your ${BUSINESS_NAME} appointment - ${when}`,
+    emailHtml: `<p>Hi ${htmlEsc(customer.name)},</p>
     <p>This is a reminder of your upcoming appointment:</p>
-    <p><strong>${appt.type}</strong><br>${when}</p>
+    <p><strong>${htmlEsc(appt.type)}</strong><br>${when}</p>
     <p>You don't need to empty out your cabinets before we come by - basic access to the space is all we need.</p>
     <p><a href="${link}">Confirm, change, or cancel this appointment</a></p>
-    <p>${BUSINESS_NAME}</p>`;
-  return notifyCustomer(fullCustomer.id ? fullCustomer : customer, {
-    smsBody: body,
-    emailSubject: `Reminder: your ${BUSINESS_NAME} appointment - ${when}`,
-    emailHtml,
-  });
+    <p>${BUSINESS_NAME}</p>`,
+  };
+}
+
+function buildAppointmentReminder({ appt, customer }) {
+  if (appt.type === 'Install') return buildInstallReminder({ appt, customer });
+  if (ESTIMATE_APPT_TYPES.includes(appt.type)) return buildEstimateReminder({ appt, customer });
+  return buildGenericReminder({ appt, customer });
+}
+
+// Fired by the reminders scheduler ahead of an appointment (spec G2, BF-2639-067).
+async function onAppointmentReminder(appt) {
+  const fullCustomer = db.getCustomer(appt.customer_id) || {};
+  const customer = fullCustomer.id
+    ? fullCustomer
+    : { id: appt.customer_id, name: appt.customer_name, phone: appt.customer_phone, email: appt.customer_email };
+  return notifyCustomer(customer, buildAppointmentReminder({ appt, customer }));
 }
 
 // Fired when a customer books their own appointment via the public page.
@@ -195,6 +262,10 @@ module.exports = {
   onJobCreated,
   onJobStatusChanged,
   onAppointmentReminder,
+  buildAppointmentReminder,
+  buildInstallReminder,
+  buildEstimateReminder,
+  ESTIMATE_APPT_TYPES,
   onAppointmentBooked,
   onOutOfAreaContact,
   notifyCustomer,

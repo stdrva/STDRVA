@@ -80,22 +80,10 @@ const PRIMARY_NAV = [
 
 // Everything else lives in the Menu sheet. An item with no href renders grey
 // and is not a link (Training is not built yet - SALES_TRAINING_ENABLED is off).
+// BF-2639-056: top to bottom Customer Relations, Financial, Production,
+// Marketing, Training; then the BOS version line and Log out (menuSheetHtml).
+// Hrefs are unchanged from 1.8.0.
 const MENU_GROUPS = [
-  { title: 'Training', items: [[null, 'Training']] },
-  {
-    title: 'Marketing',
-    items: [
-      ['/dashboard/marketing', 'Marketing'],
-      ['/dashboard/booking-link', 'Show Prep'],
-    ],
-  },
-  {
-    title: 'Financial',
-    items: [
-      ['/dashboard/finances', 'Bookkeeping'],
-      ['/dashboard/kpi', 'KPI'],
-    ],
-  },
   {
     title: 'Customer Relations',
     items: [
@@ -109,13 +97,34 @@ const MENU_GROUPS = [
     ],
   },
   {
+    title: 'Financial',
+    items: [
+      ['/dashboard/finances', 'Bookkeeping'],
+      ['/dashboard/kpi', 'KPI'],
+    ],
+  },
+  {
     title: 'Production',
     items: [
       ['/dashboard/jobs', 'Jobs'],
       ['/dashboard/production', 'Production Queue'],
     ],
   },
+  {
+    title: 'Marketing',
+    items: [
+      ['/dashboard/marketing', 'Marketing'],
+      ['/dashboard/booking-link', 'Show Prep'],
+    ],
+  },
+  { title: 'Training', items: [[null, 'Training']] },
+  // FF-3926-012: the record store, directly above the BOS version line.
+  { title: 'Desk', items: [['/dashboard/desk', 'Desk']] },
 ];
+
+// BF-2639-055: the Menu toggles show three horizontal lines, not the word.
+// The accessible name stays "Menu" via aria-label; the click hook is unchanged.
+const HAMBURGER = `<svg class="hamburger" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" fill="none"/></svg>`;
 
 // A menu item is "current" on its own page and on sub-pages (e.g. Bookkeeping on
 // /dashboard/finances/expenses). "/dashboard" itself only matches exactly.
@@ -132,7 +141,7 @@ function navHtml(active) {
   return `
     <nav class="topnav-links" aria-label="Main">
       ${primary}
-      <button type="button" class="nav-menu-btn${menuIsActive(active) ? ' active' : ''}" data-menu-toggle aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">Menu</button>
+      <button type="button" class="nav-menu-btn${menuIsActive(active) ? ' active' : ''}" data-menu-toggle aria-label="Menu" aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">${HAMBURGER}</button>
     </nav>`;
 }
 
@@ -148,7 +157,7 @@ function bottomNavHtml(active) {
   return `
 <nav class="bottomnav" aria-label="Main">
   ${links}
-  <button type="button" class="${menuIsActive(active) ? 'active' : ''}" data-menu-toggle aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">Menu</button>
+  <button type="button" class="${menuIsActive(active) ? 'active' : ''}" data-menu-toggle aria-label="Menu" aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">${HAMBURGER}</button>
 </nav>`;
 }
 
@@ -384,7 +393,8 @@ function assistantWidget(context) {
           .then(readJson).then(function(){ wrap.remove(); addBubble('assistant', 'Undone - moved to Needs Review on the Files page.'); });
       });
       var correctLink = document.createElement('a');
-      correctLink.href = '/dashboard/files#needs-review'; correctLink.target = '_blank'; correctLink.textContent = 'Correct…';
+      // BF-2639-053: opens this file's own review page (same tab, has a Close).
+      correctLink.href = '/dashboard/files/' + fa.file_id + '/review'; correctLink.textContent = 'Correct…';
       wrap.appendChild(confirmBtn); wrap.appendChild(undoBtn); wrap.appendChild(correctLink);
       log.appendChild(wrap);
       log.scrollTop = log.scrollHeight;
@@ -393,6 +403,14 @@ function assistantWidget(context) {
     }
   }
   var log = document.getElementById('assistant-log');
+  // BF-2639-066: a rotate changes the log's vh-based height; keep the thread
+  // pinned to the newest message instead of jumping to the first bubble.
+  (function () {
+    var t = null;
+    function repin() { clearTimeout(t); t = setTimeout(function () { if (log) log.scrollTop = log.scrollHeight; }, 250); }
+    window.addEventListener('orientationchange', repin);
+    if (window.screen && screen.orientation && screen.orientation.addEventListener) screen.orientation.addEventListener('change', repin);
+  })();
   var form = document.getElementById('assistant-form');
   var input = document.getElementById('assistant-input');
   var sendBtn = document.getElementById('assistant-send');
