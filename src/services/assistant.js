@@ -18,12 +18,12 @@ function booking() {
   return require('../routes/public');
 }
 
-// Sales-training (reps, roleplay/quiz/real-sale logging) was scaffolded -
-// tables, tools, and prompt text - but never finished with a UI and isn't in
-// use. Flipped off here: the tools are withheld from the model and the
-// training section is dropped from the system prompt. The db tables and the
-// runTool cases stay in place so turning this back on is a one-line change.
-const SALES_TRAINING_ENABLED = false;
+// Sales-training (reps, roleplay/quiz/real-sale logging): tables, tools, and
+// prompt text. When this is false the tools are withheld from the model and the
+// training section is dropped from the system prompt.
+// BF-2640-082: Andrew turned Training on. The Menu's Training item opens
+// /dashboard/training. Lessons stay L1 through L4 until Andrew adds more.
+const SALES_TRAINING_ENABLED = true;
 
 // Anthropic's per-request payload ceiling for base64 file content. Images and
 // PDFs larger than this are stored but not sent to the model for analysis.
@@ -1244,6 +1244,11 @@ function runTool(name, input, ctx = {}) {
       if (input.confirmed !== true) {
         return { error: 'Not booked - say the date, time and address back to the customer and wait for a spoken or on-screen "yes" to this exact time, then call again with confirmed:true.' };
       }
+      // BF-2640-080: never book over a scheduled visit - re-check the real
+      // appointment list at the moment of booking.
+      if (!booking().slotIsFree(input.scheduled_at, input.type)) {
+        return { error: 'Not booked - that time already has a scheduled visit in BOS. Call list_available_slots again and offer only the times it returns.' };
+      }
       // createBooking is async; runTool is sync, so hand it back as a marker
       // the loop awaits (same pattern as send_customer_message).
       return { __async_booking: { input } };
@@ -1608,6 +1613,11 @@ window on his screen and sends nothing. Tell him it is filled and waiting for hi
 and confirm. Never say it was sent. Only files already on that customer can be attached; never
 attach Desk record files.
 
+Offering times (BF-2640-080): before you offer Andrew or a customer any start time, call
+list_available_slots so you read Andrew's existing BOS appointments first. Offer only times
+it returns, never a time from memory or a guess, and never a time that already has a
+scheduled visit (those are listed under existing_appointments).
+
 Foreman notes (BF-2640-076): when Andrew clearly gives you a raw bug or feature note, call
 save_raw_note with his words as he said them, then read the saved note back. Do not give the
 note a BF- name or any ticket name - the Architect numbers tickets. Do not say the note is
@@ -1658,7 +1668,11 @@ You also have sales-training tools: list_sales_reps / create_sales_rep, get_trai
 (a rep's past role-plays, quizzes, and real-sale outcomes), and log_training_session. The
 single most important use: right after Andrew reports how an actual sales call went, log it
 as a real_sale session with a specific, honest summary of what worked and what didn't and an
-outcome of won/lost. Only pull get_training_history when it's actually relevant.`;
+outcome of won/lost. Only pull get_training_history when it's actually relevant.
+
+Training lessons (BF-2640-082): the lessons are L1 door, L2 mirroring, L3 labeling, and L4
+implication. Do not invent other lesson names or numbers; L5 through L8 are not in BOS until
+Andrew adds them. Andrew sees reps and their session logs on the Training page in the Menu.`;
 
 // Appended when the message came in over Voice Mode (spec 10-14, 24-25).
 const VOICE_PROMPT = `
@@ -1690,6 +1704,10 @@ talking directly TO the customer, warmly and simply: "Hi Donna - let's find you 
 time. What's the full address, including city and ZIP?" Then gather anything missing
 (address, phone, email), read back a spelled name/street if it sounds ambiguous, call
 list_available_slots and offer FOUR times spread out, let them pick or ask for others.
+Never offer a start time you did not get from list_available_slots in this conversation
+(BF-2640-080): it reads Andrew's real BOS appointments first, and its options already skip
+every scheduled visit. Do not guess a time, and do not offer a time listed under
+existing_appointments.
 
 Before you actually book: say the whole thing back - "I've got Tuesday, March 17th at
 2 PM at 123 Main Street in Bowling Green. Want me to book that?" - and only call

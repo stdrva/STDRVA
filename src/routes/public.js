@@ -269,7 +269,9 @@ function slotsForDate(dateStr, durationMin) {
   const dayStart = new Date(y, m - 1, d, HOURS_START, 0, 0);
   const dayEnd = new Date(y, m - 1, d, HOURS_END, 0, 0);
   const now = new Date();
-  const existing = db.listAppointmentsBetween(dayStart.toISOString(), dayEnd.toISOString());
+  // BF-2640-080: every scheduled visit that overlaps the working day, including
+  // one that started before opening and runs into it.
+  const existing = db.listScheduledOverlapping(dayStart.toISOString(), dayEnd.toISOString());
 
   const slots = [];
   for (let t = new Date(dayStart); t.getTime() + durationMin * 60000 <= dayEnd.getTime(); t = new Date(t.getTime() + SLOT_MINUTES * 60000)) {
@@ -697,8 +699,23 @@ function voiceBookingSlots({ address, near, type, count = 4, fromDate, toDate } 
     }
     round++;
   }
+  // BF-2640-080: Foreman reads Andrew's real BOS appointments before offering a
+  // time. The scheduled visits on the days looked at come back with the
+  // options (times only - no customer names, since a customer may be holding
+  // the phone), and every option above was already checked against them.
+  const busy = [];
+  for (const di of dayInfo) {
+    const d = di.date;
+    const from = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
+    const to = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59);
+    for (const a of db.listScheduledOverlapping(from.toISOString(), to.toISOString())) {
+      if (!busy.some((b) => b.id === a.id)) busy.push({ id: a.id, starts: a.scheduled_at, label: fmtSlotLong(new Date(a.scheduled_at)), duration_min: Number(a.duration_min) || 60 });
+    }
+  }
   return {
     slots: out,
+    existing_appointments: busy.map(({ starts, label, duration_min }) => ({ starts, label, duration_min })),
+    checked_existing_appointments: true,
     used_geography: !!near && dayInfo.some((d) => d.nearby),
     note: near
       ? dayInfo.some((d) => d.nearby)
@@ -706,6 +723,14 @@ function voiceBookingSlots({ address, near, type, count = 4, fromDate, toDate } 
         : 'No existing appointments near that address were found, so these are just the normal openings.'
       : undefined,
   };
+}
+
+// BF-2640-080: true when no scheduled visit overlaps this start and length.
+function slotIsFree(iso, type) {
+  const start = new Date(iso);
+  if (isNaN(start.getTime())) return false;
+  const end = new Date(start.getTime() + durationForType(type || PUBLIC_TYPE_ORDER[0]) * 60000);
+  return db.listScheduledOverlapping(start.toISOString(), end.toISOString()).length === 0;
 }
 
 function register(router) {
@@ -1309,7 +1334,7 @@ module.exports = {
   register,
   // shared with the assistant / voice booking path + tests
   createBooking,
-  voiceBookingSlots,
+  voiceBookingSlots, slotIsFree,
   parseAddress,
   addressLooksComplete,
   pickSpreadSlots,

@@ -41,7 +41,7 @@ test('046: never more than four always-visible destinations (3 links + Menu), no
   assert.ok(!/nav-more|\.nav-logout/.test(css), 'old More / logout CSS is gone');
 });
 
-test('046: Menu sheet has the exact groups and items, Training grey and not a link, Log out last and live', () => {
+test('046: Menu sheet has the exact groups and items, Log out last and live (Training is a link since BF-2640-082)', () => {
   const html = layout('/dashboard');
   const sheet = html.slice(html.indexOf('id="menu-sheet"'), html.indexOf('</script>', html.indexOf('id="menu-sheet"')));
   const titles = [...sheet.matchAll(/menu-group-title">([^<]+)</g)].map((m) => m[1]);
@@ -56,7 +56,9 @@ test('046: Menu sheet has the exact groups and items, Training grey and not a li
   };
   assert.deepEqual(groupItems('Marketing'), [['/dashboard/marketing', 'Marketing'], ['/dashboard/booking-link', 'Show Prep']]);
   assert.deepEqual(groupItems('Financial'), [['/dashboard/finances', 'Bookkeeping'], ['/dashboard/kpi', 'KPI']]);
+  // BF-2640-072 added Search as the first Customer Relations item.
   assert.deepEqual(groupItems('Customer Relations'), [
+    ['/dashboard/search', 'Search'],
     ['/dashboard', 'Overview'],
     ['/dashboard/customers', 'Customers'],
     ['/dashboard/pipeline', 'Pipeline'],
@@ -67,9 +69,9 @@ test('046: Menu sheet has the exact groups and items, Training grey and not a li
   ]);
   assert.deepEqual(groupItems('Production'), [['/dashboard/jobs', 'Jobs'], ['/dashboard/production', 'Production Queue']]);
 
-  // Training: a grey span, not an anchor.
-  assert.match(sheet, /<span class="menu-disabled" aria-disabled="true">Training<\/span>/);
-  assert.equal(groupItems('Training').length, 0);
+  // BF-2640-082 turned Training on: a real link, no longer a grey span.
+  assert.deepEqual(groupItems('Training'), [['/dashboard/training', 'Training']]);
+  assert.ok(!/menu-disabled[^>]*>Training</.test(sheet));
   // Log out: last thing in the sheet, a real link, never the disabled style.
   const logoutIdx = sheet.indexOf('href="/logout"');
   assert.ok(logoutIdx > sheet.lastIndexOf('menu-group-title'));
@@ -425,7 +427,8 @@ test('025: /dashboard/files/results - empty q shows recent files, q searches, HT
   let html = await (await app.get('/dashboard/files/results?q=')).text();
   assert.ok(!/<html|<body/i.test(html), 'a fragment, not a full page');
   assert.match(html, /Recent files \(newest first\)/);
-  assert.equal((html.match(/<tr>(?!<th)/g) || []).length, 50, 'about 50 recent rows');
+  // BF-2640-075: every file, twenty rows per page (was the 50 most recent).
+  assert.equal((html.match(/<tr data-file-kind=/g) || []).length, 20, 'twenty rows per page');
   assert.match(html, /recent-54\.pdf/);
   assert.ok(!/recent-55\.pdf/.test(html), 'soft-deleted file not listed');
   // 1.8.1 BF-2639-053: an unassigned file links to its own review page (the #needs-review jump is gone).

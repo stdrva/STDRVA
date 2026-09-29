@@ -2757,6 +2757,157 @@ function getEmailDraft(id) {
   return { ...d, file_ids: Array.isArray(ids) ? ids : [] };
 }
 
+// ---- BF-2640-072: one search across the whole database. Case-insensitive
+// substring match on each table's text columns; read-only, never deletes.
+// Desk records and Desk record files come only from what `user` can see.
+function likeTerm(term) {
+  return '%' + String(term).replace(/[\\%_]/g, (ch) => '\\' + ch) + '%';
+}
+function searchEverything(term, user, { limit = 50 } = {}) {
+  const t = String(term || '').trim();
+  const empty = { customers: [], jobs: [], appointments: [], records: [], files: [], record_files: [], followups: [], leads: [], messages: [], foreman_notes: [] };
+  if (!t) return empty;
+  const L = likeTerm(t);
+  const like = (cols) => '(' + cols.map((c) => `${c} LIKE ? ESCAPE '\\'`).join(' OR ') + ')';
+  const args = (n) => Array(n).fill(L);
+  const out = { ...empty };
+  out.customers = db
+    .prepare(`SELECT id, name, phone, email, address FROM customers WHERE ${like(['name', 'phone', 'email', 'address', 'notes'])} ORDER BY name COLLATE NOCASE LIMIT ?`)
+    .all(...args(5), limit);
+  out.jobs = db
+    .prepare(
+      `SELECT jobs.id, jobs.status, jobs.customer_id, customers.name AS customer_name FROM jobs JOIN customers ON customers.id = jobs.customer_id
+       WHERE ${like(['jobs.status', 'jobs.notes'])} ORDER BY jobs.updated_at DESC LIMIT ?`
+    )
+    .all(...args(2), limit);
+  out.appointments = db
+    .prepare(
+      `SELECT appointments.id, appointments.type, appointments.status, appointments.scheduled_at, appointments.customer_id, customers.name AS customer_name
+       FROM appointments JOIN customers ON customers.id = appointments.customer_id
+       WHERE ${like(['appointments.type', 'appointments.notes'])} ORDER BY appointments.scheduled_at DESC LIMIT ?`
+    )
+    .all(...args(2), limit);
+  out.records = user ? listRecordsFor(user, { q: t }).slice(0, limit) : [];
+  out.files = db
+    .prepare(
+      `SELECT customer_files.id, customer_files.original_name, customer_files.customer_id, customers.name AS customer_name
+       FROM customer_files LEFT JOIN customers ON customers.id = customer_files.customer_id
+       WHERE customer_files.deleted_at IS NULL AND ${like(['customer_files.original_name', 'customer_files.note', 'customer_files.extracted_text'])}
+       ORDER BY customer_files.created_at DESC LIMIT ?`
+    )
+    .all(...args(3), limit);
+  out.record_files = listVisibleRecordFiles(user).filter((f) => [f.original_name, f.extracted_text].some((v) => String(v || '').toLowerCase().includes(t.toLowerCase()))).slice(0, limit);
+  out.followups = db
+    .prepare(
+      `SELECT followups.id, followups.title, followups.status, followups.customer_id, customers.name AS customer_name
+       FROM followups JOIN customers ON customers.id = followups.customer_id
+       WHERE ${like(['followups.title', 'followups.detail', 'followups.waiting_on'])} ORDER BY followups.created_at DESC LIMIT ?`
+    )
+    .all(...args(3), limit);
+  out.leads = db
+    .prepare(
+      `SELECT leads.id, leads.stage, leads.customer_id, customers.name AS customer_name FROM leads JOIN customers ON customers.id = leads.customer_id
+       WHERE ${like(['leads.notes', 'leads.source'])} ORDER BY leads.updated_at DESC LIMIT ?`
+    )
+    .all(...args(2), limit);
+  out.messages = db
+    .prepare(
+      `SELECT messages.id, messages.channel, messages.subject, messages.body, messages.created_at, messages.customer_id, customers.name AS customer_name
+       FROM messages LEFT JOIN customers ON customers.id = messages.customer_id
+       WHERE ${like(['messages.body', 'messages.subject'])} ORDER BY messages.created_at DESC LIMIT ?`
+    )
+    .all(...args(2), limit);
+  out.foreman_notes = db
+    .prepare(`SELECT id, body, created_at FROM foreman_notes WHERE body LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`)
+    .all(L, limit);
+  return out;
+}
+
+// ---- BF-2640-075: every file the signed-in user may see - customer files
+// (and unassigned uploads waiting for review) plus the files on Desk records
+// that user owns or was shared - in one list, newest first, with a
+// description and what each file is linked to. Paged by the caller.
+function listVisibleRecordFiles(user) {
+  if (!user) return [];
+  const recs = new Map(visibleRecordRows(user).map((r) => [r.id, r]));
+  if (!recs.size) return [];
+  return db
+    .prepare(`SELECT * FROM record_files WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at DESC, rowid DESC`)
+    .all(user.tenant_id)
+    .filter((f) => recs.has(f.record_id))
+    .map((f) => ({ ...f, record_name: recs.get(f.record_id).name }));
+}
+function listAllVisibleFiles(user, q) {
+  const term = String(q || '').trim();
+  const match = term ? toFtsQuery(term) : null;
+  const customer = term
+    ? match
+      ? db
+          .prepare(
+            `SELECT customer_files.*, customers.name AS customer_name, jobs.status AS job_status,
+               snippet(file_search, 3, '[', ']', ' … ', 12) AS snippet
+             FROM file_search
+             JOIN customer_files ON customer_files.id = file_search.file_id
+             LEFT JOIN customers ON customers.id = customer_files.customer_id
+             LEFT JOIN jobs ON jobs.id = customer_files.job_id
+             WHERE file_search MATCH ? AND customer_files.deleted_at IS NULL`
+          )
+          .all(match)
+      : []
+    : db
+        .prepare(
+          `SELECT customer_files.*, customers.name AS customer_name, jobs.status AS job_status, NULL AS snippet
+           FROM customer_files
+           LEFT JOIN customers ON customers.id = customer_files.customer_id
+           LEFT JOIN jobs ON jobs.id = customer_files.job_id
+           WHERE customer_files.deleted_at IS NULL`
+        )
+        .all();
+  const terms = term.toLowerCase().split(/\s+/).filter(Boolean);
+  const records = listVisibleRecordFiles(user).filter((f) => {
+    if (!terms.length) return true;
+    const hay = [f.original_name, f.record_name, f.extracted_text].filter(Boolean).join(' \n ').toLowerCase();
+    return terms.every((w) => hay.includes(w));
+  });
+  const clip = (s) => (s ? String(s).replace(/\s+/g, ' ').trim().slice(0, 140) : '');
+  const rows = [
+    ...customer.map((f) => ({
+      kind: 'customer',
+      id: f.id,
+      original_name: f.original_name,
+      created_at: f.created_at,
+      description: clip(f.note) || clip(f.snippet) || clip(f.extracted_text),
+      customer_id: f.customer_id,
+      customer_name: f.customer_name,
+      job_id: f.job_id,
+      job_status: f.job_status,
+    })),
+    ...records.map((f) => ({
+      kind: 'record',
+      id: f.id,
+      original_name: f.original_name,
+      created_at: f.created_at,
+      description: clip(f.extracted_text),
+      record_id: f.record_id,
+      record_name: f.record_name,
+    })),
+  ];
+  rows.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+  return rows;
+}
+
+// ---- BF-2640-080: scheduled visits that overlap [startIso, endIso). Looks back
+// a full day for the start so a long visit that began earlier still counts.
+function listScheduledOverlapping(startIso, endIso) {
+  const start = new Date(startIso).getTime();
+  const end = new Date(endIso).getTime();
+  return listAppointmentsBetween(new Date(start - 86400000).toISOString(), new Date(end).toISOString()).filter((a) => {
+    const aStart = new Date(a.scheduled_at).getTime();
+    const aEnd = aStart + (Number(a.duration_min) || 60) * 60000;
+    return aStart < end && aEnd > start;
+  });
+}
+
 // The username the single env login authenticates as (see src/auth.js).
 function defaultUsername() {
   return process.env.DASHBOARD_PASSWORD ? process.env.DASHBOARD_USER || 'admin' : 'dev';
@@ -3024,6 +3175,10 @@ module.exports = {
   listForemanNotes,
   createEmailDraft,
   getEmailDraft,
+  searchEverything,
+  listVisibleRecordFiles,
+  listAllVisibleFiles,
+  listScheduledOverlapping,
   DATA_DIR,
   LEAD_STAGES,
   OPEN_LEAD_STAGES,

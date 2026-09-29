@@ -147,35 +147,63 @@ function safeReturnTo(v, fallback) {
 }
 
 // Files page results (spec 025): the same fragment is used by the full page and by
-// the live-search endpoint. Empty query -> the ~50 most recent files; otherwise a
-// full-text search. Never empty-handed just because nothing has been typed.
-const FILES_SHOWN = 50;
-function filesResultsHtml(q) {
+// the live-search endpoint. Empty query -> every file, newest first; otherwise a
+// search that shortens the list as Andrew types.
+// BF-2640-075: every file the signed-in user may see - customer files, uploads
+// waiting for review, and files on Desk records that user owns or was shared -
+// twenty rows per page, each with a description and the record it is linked to.
+const FILES_PER_PAGE = 20;
+function filesResultsHtml(q, { page = 1, user } = {}) {
   const term = (q || '').trim();
-  const rows = term ? db.searchFiles(term) : db.listRecentFiles(FILES_SHOWN);
+  const rows = db.listAllVisibleFiles(user, term);
+  const pages = Math.max(1, Math.ceil(rows.length / FILES_PER_PAGE));
+  const p = Math.min(pages, Math.max(1, parseInt(page, 10) || 1));
+  const shown = rows.slice((p - 1) * FILES_PER_PAGE, p * FILES_PER_PAGE);
   const heading = term
-    ? `<p class="subtitle" style="margin:12px 0 0">${rows.length ? rows.length + ' match' + (rows.length === 1 ? '' : 'es') : 'No files matched'} for &ldquo;${escapeHtml(term)}&rdquo;${rows.length >= FILES_SHOWN ? ' (showing the first ' + FILES_SHOWN + ')' : ''}.</p>`
-    : `<p class="subtitle" style="margin:12px 0 0">Recent files (newest first). Type above to search all of them.</p>`;
+    ? `<p class="subtitle" style="margin:12px 0 0">${rows.length ? rows.length + ' match' + (rows.length === 1 ? '' : 'es') : 'No files matched'} for &ldquo;${escapeHtml(term)}&rdquo;.</p>`
+    : `<p class="subtitle" style="margin:12px 0 0">Recent files (newest first): all ${rows.length} file${rows.length === 1 ? '' : 's'} you can see. Type above to shorten the list.</p>`;
   if (!rows.length) return term ? heading : `${heading}<p class="subtitle">No files uploaded yet.</p>`;
   // BF-2639-053: the filename is always a link - a filed file opens its viewer
   // (Close comes back to this search), an unfiled one opens its review page.
-  const back = `/dashboard/files${term ? '?q=' + encodeURIComponent(term) : ''}`;
+  const qs = (n) => {
+    const u = new URLSearchParams();
+    if (term) u.set('q', term);
+    if (n > 1) u.set('page', String(n));
+    const t = u.toString();
+    return t ? '?' + t : '';
+  };
+  const back = `/dashboard/files${qs(p)}`;
   const openHref = (f) =>
-    f.customer_id
-      ? `/dashboard/customers/${f.customer_id}/files/${f.id}/view?return_to=${encodeURIComponent(back)}`
-      : `/dashboard/files/${f.id}/review`;
+    f.kind === 'record'
+      ? `/dashboard/desk/${f.record_id}/files/${f.id}/view`
+      : f.customer_id
+        ? `/dashboard/customers/${f.customer_id}/files/${f.id}/view?return_to=${encodeURIComponent(back)}`
+        : `/dashboard/files/${f.id}/review`;
+  const linkedTo = (f) =>
+    f.kind === 'record'
+      ? `<a href="/dashboard/desk/${f.record_id}">Desk: ${escapeHtml(f.record_name || '')}</a>`
+      : f.customer_id
+        ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>${f.job_id ? ` · <a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}`
+        : `<a href="/dashboard/files/${f.id}/review">Needs review</a>`;
+  const pager =
+    pages > 1
+      ? `<nav class="files-pager" aria-label="File pages" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+          ${p > 1 ? `<a class="btn small secondary" href="/dashboard/files${escapeHtml(qs(p - 1))}" data-files-page="${p - 1}">&lsaquo; Previous</a>` : ''}
+          <span class="subtitle" style="margin:0">Page ${p} of ${pages}</span>
+          ${p < pages ? `<a class="btn small secondary" href="/dashboard/files${escapeHtml(qs(p + 1))}" data-files-page="${p + 1}">Next &rsaquo;</a>` : ''}
+        </nav>`
+      : '';
   // BF-2639-065: .table-scroll lets the date column scroll into reach on a phone.
-  return `${heading}<div class="table-scroll"><table class="files-table" style="margin-top:8px"><tr><th>File</th><th>Customer</th><th>Job</th><th>Match</th><th>Uploaded</th></tr>${rows
+  return `${heading}<div class="table-scroll"><table class="files-table" style="margin-top:8px"><tr><th>File</th><th>Description</th><th>Linked to</th><th>Uploaded</th></tr>${shown
     .map(
-      (f) => `<tr>
+      (f) => `<tr data-file-kind="${f.kind}">
         <td><a href="${escapeHtml(openHref(f))}">${escapeHtml(f.original_name)}</a></td>
-        <td>${f.customer_id ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>` : `<a href="/dashboard/files/${f.id}/review">Needs review</a>`}</td>
-        <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
-        <td class="subtitle" style="margin:0">${escapeHtml(f.snippet || f.note || '')}</td>
+        <td class="subtitle" style="margin:0">${escapeHtml(f.description || '')}</td>
+        <td>${linkedTo(f)}</td>
         <td>${fmtDate(f.created_at)}</td>
       </tr>`
     )
-    .join('')}</table></div>`;
+    .join('')}</table></div>${pager}`;
 }
 
 // One Needs Attention follow-up, laid out the same on the Overview and on the
@@ -2505,11 +2533,107 @@ function register(router, requireAuth) {
     res.send(dashboardLayout({ title: 'Message', active: '/dashboard/messages', body, flash: flashFromQuery(req.query) }));
   });
 
+  // ---------- BF-2640-072 Search: the whole database, read-only ----------
+  // Customers, jobs, appointments, Desk records, files, and notes. Every hit is
+  // a link to its record. There is no delete control on this page.
+  router.get('/dashboard/search', requireAuth, (req, res) => {
+    const q = String(req.query.q || '').trim();
+    const hits = db.searchEverything(q, deskUser(req));
+    const group = (id, title, items, row) =>
+      `<div class="panel" id="search-${id}"><h2 style="margin-top:0">${title} (${items.length})</h2>${
+        items.length ? `<ul class="search-hits">${items.map((x) => `<li>${row(x)}</li>`).join('')}</ul>` : '<p class="subtitle">No matches.</p>'
+      }</div>`;
+    const cust = (id, name) => `<a href="/dashboard/customers/${id}">${escapeHtml(name || 'Customer')}</a>`;
+    const clip = (s) => escapeHtml(String(s || '').replace(/\s+/g, ' ').trim().slice(0, 120));
+    const total = Object.values(hits).reduce((n, list) => n + list.length, 0);
+    const body = `
+      <h1>Search</h1>
+      <p class="subtitle">Search the whole BOS database: customers, jobs, appointments, Desk records, files, and notes. Nothing on this page deletes anything.</p>
+      <form method="GET" action="/dashboard/search" class="panel" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1 1 220px"><label for="search-q">Search for</label><input type="search" id="search-q" name="q" value="${escapeHtml(q)}" placeholder="a word such as test" autofocus></div>
+        <button class="btn" type="submit">Search</button>
+      </form>
+      ${
+        q
+          ? `<p class="subtitle">${total} hit${total === 1 ? '' : 's'} for &ldquo;${escapeHtml(q)}&rdquo;.</p>
+            ${group('customers', 'Customers', hits.customers, (c) => `${cust(c.id, c.name)} <span class="subtitle">${escapeHtml([c.phone ? phone(c.phone) : '', c.email || ''].filter(Boolean).join(' · '))}</span>`)}
+            ${group('jobs', 'Jobs', hits.jobs, (j) => `<a href="/dashboard/jobs/${j.id}">Job — ${escapeHtml(j.status)}</a> for ${cust(j.customer_id, j.customer_name)}`)}
+            ${group('appointments', 'Appointments', hits.appointments, (a) => `<a href="/dashboard/appointments/${a.id}/edit">${escapeHtml(a.type)} · ${fmtDateTime(a.scheduled_at)}</a> (${escapeHtml(a.status)}) for ${cust(a.customer_id, a.customer_name)}`)}
+            ${group('records', 'Desk records', hits.records, (r) => `<a href="/dashboard/desk/${r.id}">${escapeHtml(r.name)}</a>`)}
+            ${group('files', 'Files', [...hits.files.map((f) => ({ ...f, kind: 'customer' })), ...hits.record_files.map((f) => ({ ...f, kind: 'record' }))], (f) =>
+              f.kind === 'record'
+                ? `<a href="/dashboard/desk/${f.record_id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a> on Desk: <a href="/dashboard/desk/${f.record_id}">${escapeHtml(f.record_name)}</a>`
+                : f.customer_id
+                  ? `<a href="/dashboard/customers/${f.customer_id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a> on ${cust(f.customer_id, f.customer_name)}`
+                  : `<a href="/dashboard/files/${f.id}/review">${escapeHtml(f.original_name)}</a> (needs review)`
+            )}
+            ${group('notes', 'Notes', [
+              ...hits.followups.map((f) => ({ kind: 'followup', ...f })),
+              ...hits.leads.map((l) => ({ kind: 'lead', ...l })),
+              ...hits.messages.map((m) => ({ kind: 'message', ...m })),
+              ...hits.foreman_notes.map((n) => ({ kind: 'foreman', ...n })),
+            ], (n) =>
+              n.kind === 'followup'
+                ? `<a href="/dashboard/customers/${n.customer_id}">Next action: ${escapeHtml(n.title)}</a> (${escapeHtml(n.status)}) for ${cust(n.customer_id, n.customer_name)}`
+                : n.kind === 'lead'
+                  ? `<a href="/dashboard/customers/${n.customer_id}">Lead note — ${escapeHtml(n.stage)}</a> for ${cust(n.customer_id, n.customer_name)}`
+                  : n.kind === 'message'
+                    ? `<a href="/dashboard/messages/${n.id}">${escapeHtml(n.channel)} message: ${clip(n.subject || email.htmlToText(n.body))}</a>${n.customer_id ? ` with ${cust(n.customer_id, n.customer_name)}` : ''}`
+                    : `<a href="/dashboard/desk/foreman-notes">Foreman note: ${clip(n.body)}</a>`
+            )}`
+          : '<p class="subtitle">Type a word and press Search.</p>'
+      }`;
+    res.send(dashboardLayout({ title: 'Search', active: '/dashboard/search', body }));
+  });
+
+  // ---------- BF-2640-082 Training ----------
+  // The training screen Andrew opens from Menu. It shows only what BOS already
+  // holds: the lesson list from the handbook (L1 through L4 - L5 through L8 are
+  // added only when Andrew pastes them) and each sales rep's session log that
+  // Foreman keeps. Foreman runs role-plays and logs real sales calls in chat.
+  const TRAINING_LESSONS = [
+    ['L1', 'Door'],
+    ['L2', 'Mirroring'],
+    ['L3', 'Labeling'],
+    ['L4', 'Implication'],
+  ];
+  router.get('/dashboard/training', requireAuth, (req, res) => {
+    const reps = db.listSalesReps();
+    const body = `
+      <h1>Training</h1>
+      <p class="subtitle">Foreman runs role-plays and quizzes and logs how real sales calls went. Ask Foreman in chat, for example "role-play L2 with me" or "log how today's call went".</p>
+      <div class="panel" id="training-lessons">
+        <h2 style="margin-top:0">Lessons</h2>
+        <ul>${TRAINING_LESSONS.map(([id, name]) => `<li data-lesson="${id}"><strong>${id}</strong> ${name}</li>`).join('')}</ul>
+        <p class="subtitle">Lessons L5 through L8 are not in BOS yet.</p>
+      </div>
+      <div class="panel" id="training-reps">
+        <h2 style="margin-top:0">Sales reps</h2>
+        ${
+          reps.length
+            ? reps
+                .map((r) => {
+                  const sessions = db.listTrainingSessions(r.id, 20);
+                  return `<h3>${escapeHtml(r.name)}</h3>${
+                    sessions.length
+                      ? `<div class="table-scroll"><table><tr><th>When</th><th>Type</th><th>Outcome</th><th>Summary</th></tr>${sessions
+                          .map((s) => `<tr><td>${fmtDateTime(s.created_at)}</td><td>${escapeHtml(s.session_type)}</td><td>${escapeHtml(s.outcome || '')}</td><td>${escapeHtml(s.summary || '')}</td></tr>`)
+                          .join('')}</table></div>`
+                      : '<p class="subtitle">No sessions logged yet.</p>'
+                  }`;
+                })
+                .join('')
+            : '<p class="subtitle">No sales reps yet. Ask Foreman to add one.</p>'
+        }
+      </div>`;
+    res.send(dashboardLayout({ title: 'Training', active: '/dashboard/training', body }));
+  });
+
   // Live-search fragment for the Files page (spec 025). Authenticated like every
   // other dashboard route; returns just the results markup, never a full page.
   router.get('/dashboard/files/results', requireAuth, (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(filesResultsHtml(req.query.q));
+    res.end(filesResultsHtml(req.query.q, { page: req.query.page, user: deskUser(req) }));
   });
 
   // ---------- Files search (across all customers + jobs) ----------
@@ -2553,7 +2677,7 @@ function register(router, requireAuth) {
             </div>`
           : ''
       }
-      <p class="subtitle">Search every uploaded file by name, note, or - for order forms and invoices the Assistant has read - their contents. Results update as you type.</p>
+      <p class="subtitle">Every file you can see, twenty per page. Search by name, note, or - for order forms and invoices the Assistant has read - their contents. The list shortens as you type.</p>
       <div class="panel">
         <!-- BF-2639-054: a full reload of this page, keeping the current search. -->
         <div style="display:flex;justify-content:flex-end"><a class="btn small secondary" id="files-refresh" data-files-refresh href="/dashboard/files${q ? '?q=' + encodeURIComponent(q) : ''}">&#x21bb; Refresh</a></div>
@@ -2562,7 +2686,7 @@ function register(router, requireAuth) {
           <input type="search" id="files-q" name="q" value="${escapeHtml(q)}" placeholder="customer name, product, invoice number, amount..." autocomplete="off" autofocus>
           <noscript><div style="margin-top:8px"><button class="btn" type="submit">Search</button></div></noscript>
         </form>
-        <div id="file-results" aria-live="polite">${filesResultsHtml(q)}</div>
+        <div id="file-results" aria-live="polite">${filesResultsHtml(q, { page: req.query.page, user: deskUser(req) })}</div>
       </div>
       <script>
         (function () {
@@ -2570,9 +2694,10 @@ function register(router, requireAuth) {
           var box = document.getElementById('file-results');
           var form = document.getElementById('files-search-form');
           var timer = null, seq = 0;
-          function run() {
+          function run(page) {
             var q = input.value.trim(), mine = ++seq;
-            fetch('/dashboard/files/results?q=' + encodeURIComponent(q), { credentials: 'same-origin' })
+            var pg = page && page > 1 ? '&page=' + page : '';
+            fetch('/dashboard/files/results?q=' + encodeURIComponent(q) + pg, { credentials: 'same-origin' })
               .then(function (r) {
                 if (r.redirected) { window.location.reload(); return null; } // session expired -> login
                 return r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status));
@@ -2580,7 +2705,8 @@ function register(router, requireAuth) {
               .then(function (html) {
                 if (html === null || mine !== seq) return; // a newer keystroke already won
                 box.innerHTML = html;
-                try { history.replaceState(null, '', q ? '?q=' + encodeURIComponent(q) : window.location.pathname); } catch (e) {}
+                var qs = (q ? 'q=' + encodeURIComponent(q) : '') + (pg ? (q ? pg : pg.slice(1)) : '');
+                try { history.replaceState(null, '', qs ? '?' + qs : window.location.pathname); } catch (e) {}
                 var refresh = document.getElementById('files-refresh');
                 if (refresh) refresh.setAttribute('href', '/dashboard/files' + (q ? '?q=' + encodeURIComponent(q) : ''));
               })
@@ -2590,6 +2716,12 @@ function register(router, requireAuth) {
           }
           input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(run, 150); });
           form.addEventListener('submit', function (e) { e.preventDefault(); clearTimeout(timer); run(); });
+          // BF-2640-075: page links reload only the list, keeping the search box as typed.
+          box.addEventListener('click', function (e) {
+            var a = e.target.closest('[data-files-page]');
+            if (!a) return;
+            e.preventDefault(); clearTimeout(timer); run(parseInt(a.getAttribute('data-files-page'), 10) || 1);
+          });
         })();
       </script>
     `;

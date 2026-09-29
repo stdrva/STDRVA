@@ -359,7 +359,8 @@ test('BF-2639-056: menu groups run Customer Relations, Financial, Production, Ma
   const sheet = html.slice(html.indexOf('id="menu-sheet"'), html.indexOf('</script>', html.indexOf('id="menu-sheet"')));
   const titles = [...sheet.matchAll(/menu-group-title">([^<]+)</g)].map((m) => m[1]);
   assert.deepEqual(titles.slice(0, 5), ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training']);
-  assert.match(sheet, /<span class="menu-disabled" aria-disabled="true">Training<\/span>/);
+  // BF-2640-082 turned Training on: the Training item is a real link now.
+  assert.match(sheet, /<a href="\/dashboard\/training"[^>]*>Training<\/a>/);
   const version = sheet.indexOf('class="menu-version"');
   const logout = sheet.indexOf('href="/logout"');
   assert.ok(version > sheet.lastIndexOf('menu-group-title') && logout > version, 'version line after the groups, Log out last');
@@ -585,8 +586,11 @@ test('FF-3926-012: the Desk page creates, lists, filters, searches and opens rec
   const raw = await srv.get(`/dashboard/desk/${recId}/files/${f.id}`);
   assert.equal(raw.status, 200);
   assert.equal(Buffer.from(await raw.arrayBuffer()).subarray(0, 5).toString(), '%PDF-');
-  // Record files never leak onto the customer Files page.
-  assert.ok(!/warranty\.pdf/.test(await (await srv.get('/dashboard/files/results')).text()));
+  // BF-2640-075 changed this: the Files page lists every file the signed-in user
+  // may see, so the record owner's file is listed and linked to its Desk record.
+  // A user who cannot see the record never gets the file (update-2640-fix.test.js).
+  const filesHtml = await (await srv.get('/dashboard/files/results')).text();
+  assert.match(filesHtml, new RegExp(`<a href="/dashboard/desk/${recId}">Desk: Sparky Desk Electric</a>`));
 });
 
 test('FF-3926-012: a share cannot cross tenants', () => {

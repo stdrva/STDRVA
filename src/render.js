@@ -79,7 +79,8 @@ const PRIMARY_NAV = [
 ];
 
 // Everything else lives in the Menu sheet. An item with no href renders grey
-// and is not a link (Training is not built yet - SALES_TRAINING_ENABLED is off).
+// and is not a link. BF-2640-082: Training is on and is a real link now.
+// BF-2640-072: Search (the whole database) is the first Customer Relations item.
 // BF-2639-056: top to bottom Customer Relations, Financial, Production,
 // Marketing, Training; then the BOS version line and Log out (menuSheetHtml).
 // Hrefs are unchanged from 1.8.0.
@@ -87,6 +88,7 @@ const MENU_GROUPS = [
   {
     title: 'Customer Relations',
     items: [
+      ['/dashboard/search', 'Search'],
       ['/dashboard', 'Overview'],
       ['/dashboard/customers', 'Customers'],
       ['/dashboard/pipeline', 'Pipeline'],
@@ -117,7 +119,7 @@ const MENU_GROUPS = [
       ['/dashboard/booking-link', 'Show Prep'],
     ],
   },
-  { title: 'Training', items: [[null, 'Training']] },
+  { title: 'Training', items: [['/dashboard/training', 'Training']] },
   // FF-3926-012: the record store, directly above the BOS version line.
   { title: 'Desk', items: [['/dashboard/desk', 'Desk']] },
 ];
@@ -796,7 +798,11 @@ function voiceMode(context) {
   var ctxCustomerId = overlay.getAttribute('data-context-customer-id') || '';
   var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
 
-  var rec = null, running = false, speaking = false, busy = false, wantListen = false;
+  // BF-2640-070: rec is the one live recognizer. Pause aborts it and drops it,
+  // so a late event from a dead recognizer can never show Listening or add
+  // words; resume always starts a brand-new recognizer. Listening shows only
+  // after the live recognizer really starts.
+  var rec = null, running = false, speaking = false, busy = false, wantListen = false, paused = false;
 
   function setStatus(s, cls) { statusEl.textContent = s; overlay.setAttribute('data-state', cls || 'idle'); }
   function addLine(role, text) {
@@ -827,12 +833,13 @@ function voiceMode(context) {
     if (isIOS) fallbackEl.hidden = false;
     // Unlock speech synthesis inside the tap gesture (needed on iOS).
     try { if (synth) { synth.cancel(); var u0 = new SpeechSynthesisUtterance(' '); u0.volume = 0; synth.speak(u0); } } catch (e) {}
-    setStatus('Listening…', 'listening');
+    paused = false;
+    setStatus('Starting…', 'idle');
     startListening();
   }
   function close() {
     wantListen = false;
-    try { if (rec) rec.stop(); } catch (e) {}
+    killRec();
     try { if (synth) synth.cancel(); } catch (e) {}
     overlay.hidden = true;
     document.body.style.overflow = '';
@@ -842,8 +849,10 @@ function voiceMode(context) {
     var r = new SR();
     r.lang = 'en-US'; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
     var finalText = '';
-    r.onstart = function () { running = true; if (!busy && !speaking) setStatus('Listening…', 'listening'); };
+    function live() { return r === rec && wantListen && !paused; }
+    r.onstart = function () { if (!live()) return; running = true; if (!busy && !speaking) setStatus('Listening…', 'listening'); };
     r.onresult = function (ev) {
+      if (!live()) return; // words only grow while this recognizer is the live one
       var interim = '';
       for (var i = ev.resultIndex; i < ev.results.length; i++) {
         var t = ev.results[i][0].transcript;
@@ -853,27 +862,49 @@ function voiceMode(context) {
       if (speaking) { try { synth.cancel(); } catch (e) {} speaking = false; } // barge-in
     };
     r.onerror = function (ev) {
+      if (r !== rec) return;
       running = false;
       if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
         wantListen = false;
         setStatus('Microphone is blocked. Allow mic access, then reopen Voice.', 'error');
+      } else if (ev.error === 'audio-capture') {
+        wantListen = false;
+        setStatus('No microphone found. Check the microphone, then tap the mic.', 'error');
       }
     };
     r.onend = function () {
+      if (r !== rec) return; // an aborted recognizer ending late changes nothing
       running = false;
+      if (!wantListen || paused) { finalText = ''; return; }
       var said = finalText.trim(); finalText = '';
       if (said) handleUtterance(said);
       else if (wantListen && !busy && !speaking) startListening();
     };
     return r;
   }
-  function startListening() {
-    if (busy || speaking) return;
-    wantListen = true;
-    rec = makeRec();
-    try { rec.start(); } catch (e) { setTimeout(function () { if (wantListen) startListening(); }, 500); }
+  function killRec() {
+    var old = rec;
+    rec = null; running = false;
+    if (old) { try { old.abort(); } catch (e) { try { old.stop(); } catch (e2) {} } }
   }
-  function stopListening() { wantListen = false; try { if (rec) rec.stop(); } catch (e) {} }
+  function startListening() {
+    if (busy || speaking || paused) return;
+    wantListen = true;
+    killRec();
+    rec = makeRec();
+    var mine = rec;
+    try { mine.start(); } catch (e) { setTimeout(function () { if (wantListen && !paused && rec === mine) startListening(); }, 500); }
+  }
+  function pauseListening() {
+    paused = true; wantListen = false;
+    killRec();
+    setStatus('Paused — tap the mic to talk', 'idle');
+  }
+  function resumeListening() {
+    paused = false;
+    setStatus('Starting…', 'idle');
+    startListening();
+  }
 
   function handleUtterance(text) {
     addLine('user', text);
@@ -909,7 +940,7 @@ function voiceMode(context) {
     var u = new SpeechSynthesisUtterance(clean);
     u.rate = 1.03; u.pitch = 1;
     speaking = true; setStatus('Speaking…', 'speaking');
-    u.onend = function () { speaking = false; if (wantListen) startListening(); else setStatus('Tap the mic to talk', 'idle'); };
+    u.onend = function () { speaking = false; if (wantListen && !paused) startListening(); else if (!paused) setStatus('Tap the mic to talk', 'idle'); };
     u.onerror = function () { speaking = false; if (wantListen) startListening(); };
     try { synth.speak(u); } catch (e) { speaking = false; if (wantListen) startListening(); }
   }
@@ -918,9 +949,9 @@ function voiceMode(context) {
   endBtn.addEventListener('click', close);
   orb.addEventListener('click', function () {
     if (busy) return;
-    if (speaking) { try { synth.cancel(); } catch (e) {} speaking = false; startListening(); return; }
-    if (running) { stopListening(); setStatus('Paused — tap the mic to talk', 'idle'); }
-    else { startListening(); }
+    if (speaking) { try { synth.cancel(); } catch (e) {} speaking = false; paused = false; startListening(); return; }
+    if (paused || !wantListen) resumeListening();
+    else pauseListening();
   });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) close(); });
 })();
