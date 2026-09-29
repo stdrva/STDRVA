@@ -214,7 +214,8 @@ function saveUpload({ customer_id, job_id, upload, note, assignment_status, sugg
       customer_id,
       job_id: job_id || null,
       stored_name: storedName,
-      original_name: upload.filename || storedName,
+      // BF-2640-071: generic phone-camera names become i001.jpg, i002.jpg, ...
+      original_name: db.phonePhotoName(upload.filename || storedName),
       mime_type: upload.mimeType || null,
       size: upload.data.length,
       note: note || null,
@@ -1866,7 +1867,9 @@ function register(router, requireAuth) {
     const now = Date.now();
     const endsAt = (a) => new Date(a.scheduled_at).getTime() + (Number(a.duration_min) || 60) * 60000;
     const appts = db.listAppointments();
-    const upcoming = appts.filter((a) => endsAt(a) > now); // listAppointments is already ASC
+    // BF-2640-079: a canceled visit is never in Upcoming, even before its slot
+    // ends. Past still shows canceled visits whose slot has ended.
+    const upcoming = appts.filter((a) => endsAt(a) > now && a.status !== 'canceled'); // listAppointments is already ASC
     const past = appts.filter((a) => endsAt(a) <= now).reverse();
     const apptTable = (rows, emptyText) =>
       rows.length
@@ -2026,6 +2029,7 @@ function register(router, requireAuth) {
     const jobs = db.listJobs();
     const body = `
       <h1>Jobs</h1>
+      <!-- BF-2640-077: a click on a job row opens that customer's main record; Edit opens the job itself. -->
       <p class="subtitle">Usually created automatically when a lead is marked "Sold" - can also be added directly below. Each has a customer-facing status link.</p>
       <div class="panel">
         <a class="btn" href="/dashboard/jobs/new">+ Add job</a>
@@ -2034,11 +2038,11 @@ function register(router, requireAuth) {
           ${jobs
             .map(
               (j) => `
-            <tr>
+            <tr data-job="${j.id}">
               <td><a href="/dashboard/customers/${j.customer_id}">${escapeHtml(j.customer_name)}</a></td>
-              <td>${escapeHtml(j.status)}</td>
-              <td>${j.sold_amount ? fmtMoney(j.sold_amount) : ''}</td>
-              <td>${fmtDate(j.updated_at)}</td>
+              <td><a href="/dashboard/customers/${j.customer_id}" data-job-open="${j.id}">${escapeHtml(j.status)}</a></td>
+              <td><a href="/dashboard/customers/${j.customer_id}" data-job-open="${j.id}">${j.sold_amount ? fmtMoney(j.sold_amount) : '—'}</a></td>
+              <td><a href="/dashboard/customers/${j.customer_id}" data-job-open="${j.id}">${fmtDate(j.updated_at)}</a></td>
               <td><a class="btn small secondary" href="/dashboard/jobs/${j.id}">Edit</a></td>
             </tr>`
             )
@@ -3172,6 +3176,7 @@ function register(router, requireAuth) {
     const body = `
       <h1>Desk</h1>
       <p class="subtitle">People who aren't sales leads, and things like cars. Only you see your records, plus any shared with you.</p>
+      <p><a class="btn small secondary" href="/dashboard/desk/foreman-notes" download>Download Foreman notes</a></p>
       <div class="panel">
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
           ${chip('', 'All')}${chip('mine', 'Mine')}${chip('business', 'Business')}${chip('personal', 'Personal')}
@@ -3211,6 +3216,21 @@ function register(router, requireAuth) {
       </details>
     `;
     res.send(dashboardLayout({ title: 'Desk', active: '/dashboard/desk', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // BF-2640-076: every raw note Andrew gave Foreman, newest first, as a .txt
+  // download. Registered before /dashboard/desk/:id so foreman-notes is never
+  // read as a record id.
+  router.get('/dashboard/desk/foreman-notes', requireAuth, (req, res) => {
+    const notes = db.listForemanNotes();
+    const text = notes.length
+      ? notes.map((n) => `${n.created_at}\n${n.body}\n`).join('\n')
+      : 'No Foreman notes yet.\n';
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="foreman-notes.txt"',
+    });
+    res.end(text);
   });
 
   router.post('/dashboard/desk', requireAuth, (req, res) => {

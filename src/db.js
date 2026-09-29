@@ -2661,6 +2661,70 @@ CREATE TABLE IF NOT EXISTS record_files (
   }
 })();
 
+// ---- BF-2640-071: phone photos named image.jpg / image.jpeg get i001.jpg,
+// i002.jpg, ... from one company counter kept in SQLite. The counter is never
+// reset and a number is never handed out twice. Only original_name (the name
+// Andrew sees) changes; stored_name and the bytes on disk are untouched.
+db.exec(`
+CREATE TABLE IF NOT EXISTS company_counters (
+  tenant_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  value INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, name)
+);
+`);
+function nextCompanyCounter(name, tenant_id = DEFAULT_TENANT_ID) {
+  return db
+    .prepare(
+      `INSERT INTO company_counters (tenant_id, name, value) VALUES (?, ?, 1)
+       ON CONFLICT (tenant_id, name) DO UPDATE SET value = value + 1
+       RETURNING value`
+    )
+    .get(tenant_id, name).value;
+}
+function isGenericPhonePhotoName(name) {
+  const base = String(name || '').split(/[\\/]/).pop();
+  return /^image\.jpe?g$/i.test(base);
+}
+// Returns the name to show for an upload: i00N.jpg for a generic phone-camera
+// name, otherwise the name exactly as given (kitchen.jpg, IMG_1234.jpg,
+// image.png and every other real name are left alone).
+function phonePhotoName(name) {
+  if (!isGenericPhonePhotoName(name)) return name;
+  return `i${String(nextCompanyCounter('phone_photo')).padStart(3, '0')}.jpg`;
+}
+(function renameStoredPhonePhotos() {
+  const rows = db
+    .prepare(`SELECT id, original_name FROM customer_files WHERE lower(original_name) IN ('image.jpg', 'image.jpeg') ORDER BY created_at, id`)
+    .all();
+  for (const r of rows) {
+    db.prepare(`UPDATE customer_files SET original_name = ? WHERE id = ?`).run(phonePhotoName(r.original_name), r.id);
+    syncFileSearch(r.id);
+  }
+})();
+
+// ---- BF-2640-076: raw bug and feature notes Andrew gives Foreman. A note is a
+// to-do for the Architect to number later; Foreman never names or closes one.
+db.exec(`
+CREATE TABLE IF NOT EXISTS foreman_notes (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}',
+  body TEXT NOT NULL,
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+`);
+function createForemanNote({ body, created_by }) {
+  const text = String(body || '').trim();
+  if (!text) throw new Error('A Foreman note needs text');
+  const id = newId();
+  db.prepare(`INSERT INTO foreman_notes (id, body, created_by, created_at) VALUES (?,?,?,?)`).run(id, text, created_by || null, nowIso());
+  return db.prepare(`SELECT * FROM foreman_notes WHERE id = ?`).get(id);
+}
+function listForemanNotes(tenant_id = DEFAULT_TENANT_ID) {
+  return db.prepare(`SELECT * FROM foreman_notes WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC`).all(tenant_id);
+}
+
 // The username the single env login authenticates as (see src/auth.js).
 function defaultUsername() {
   return process.env.DASHBOARD_PASSWORD ? process.env.DASHBOARD_USER || 'admin' : 'dev';
@@ -2923,6 +2987,9 @@ function extractPdfText(buf, mimeType, filename) {
 
 module.exports = {
   db,
+  phonePhotoName,
+  createForemanNote,
+  listForemanNotes,
   DATA_DIR,
   LEAD_STAGES,
   OPEN_LEAD_STAGES,

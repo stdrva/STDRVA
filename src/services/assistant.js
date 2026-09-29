@@ -737,6 +737,18 @@ const BASE_TOOLS = [
       required: ['type'],
     },
   },
+  {
+    name: 'save_raw_note',
+    description:
+      "BF-2640-076: Foreman is capturing a raw bug or feature note for Andrew, word for word, so Andrew can download the list from Desk later. Use it when Andrew is clearly giving Foreman a note (for example 'note this bug', 'add a feature note', 'write this down for the Architect'). Save the raw text only. Foreman must not invent a BF- name or any other ticket name; the Architect numbers tickets. Foreman must not treat the note as done work or say the fix is made. After saving, read the saved note back to Andrew.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        body: { type: 'string', description: 'The raw text Andrew spoke or typed, unedited.' },
+      },
+      required: ['body'],
+    },
+  },
 ];
 
 // Withheld from the model unless SALES_TRAINING_ENABLED (see top of file).
@@ -1391,6 +1403,14 @@ function runTool(name, input, ctx = {}) {
       const session_id = db.createTrainingSession(input);
       return { session_id, ...input };
     }
+    case 'save_raw_note': {
+      const note = db.createForemanNote({ body: input.body, created_by: ctx.username || db.defaultUsername() });
+      return {
+        saved: true,
+        note: { id: note.id, created_at: note.created_at, body: note.body },
+        read_back: `Saved this raw note: "${note.body}". It is a to-do for the Architect to number, not finished work.`,
+      };
+    }
     // ---- Desk record store (FF-3926-013) ----
     case 'search_records':
     case 'get_record':
@@ -1541,6 +1561,11 @@ only upload is a photo with no text, say you can't tell from it - never guess. c
 and update_record are real writes: read back, wait for his yes, then confirmed:true. There
 is no tool to text or email a Desk record, and you never contact one without his explicit
 confirmation.
+
+Foreman notes (BF-2640-076): when Andrew clearly gives you a raw bug or feature note, call
+save_raw_note with his words as he said them, then read the saved note back. Do not give the
+note a BF- name or any ticket name - the Architect numbers tickets. Do not say the note is
+done or fixed; it is a to-do. Andrew downloads the list from Desk.
 
 Files: when Andrew uploads a file it has already been saved and its id is given to you in
 the message. Read it, then call save_file_extraction with a compact JSON of the key fields
