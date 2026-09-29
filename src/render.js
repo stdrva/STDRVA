@@ -329,7 +329,7 @@ function quickActions(c) {
   );
   btns.push(
     c.email
-      ? `<a class="qa" href="#send-email" data-scroll-target>✉️<span>Email</span></a>`
+      ? `<a class="qa" href="/dashboard/customers/${escapeHtml(c.id)}/email" data-email-compose>✉️<span>Email</span></a>` // BF-2640-078: opens the compose window
       : `<span class="qa disabled">✉️<span>Email</span></span>`
   );
   btns.push(

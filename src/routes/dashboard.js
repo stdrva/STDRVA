@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const db = require('../db');
 const { dashboardLayout, flashFromQuery, quickActions, section, backLink, phone } = require('../render');
 const {
@@ -101,6 +102,42 @@ function fileViewerBody({ f, rawUrl, closeUrl, prevUrl, nextUrl, missing, extraH
         });
       })();
     </script>`;
+}
+
+// BF-2640-078: canned notes for the compose window. BOS had no warranty or
+// referral wording yet, so these are two short labeled snippets - plain notes,
+// not legal warranty terms.
+const EMAIL_SNIPPETS = {
+  warranty:
+    'Warranty: If anything we built or installed for you is not working the way it should, reply to this email or give us a call and we will set up a time to take a look.',
+  referral:
+    'Referral: If you know someone who could use better storage at home, we would be glad to help them too. Pass along our name, or reply with their contact information and we will reach out.',
+};
+
+// The floating preview in the compose window is fileViewerBody in an iframe.
+// Close, Escape and Add this file to Email tell the compose page (same origin)
+// and never navigate it, so the typed draft stays.
+function emailPreviewExtra(f) {
+  return `<div class="viewer-email-actions"><button type="button" class="btn" data-email-attach="${escapeHtml(f.id)}">Add this file to Email</button></div>
+    <script>
+      (function () {
+        function tell(msg) { if (window.parent !== window) window.parent.postMessage(msg, location.origin); }
+        window.addEventListener('click', function (e) {
+          var add = e.target.closest('[data-email-attach]');
+          if (add) { e.preventDefault(); tell({ bosEmail: 'attach', fileId: add.getAttribute('data-email-attach') }); return; }
+          if (e.target.closest('[data-viewer-close]')) { e.preventDefault(); e.stopImmediatePropagation(); tell({ bosEmail: 'close' }); }
+        }, true);
+        window.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') { e.stopImmediatePropagation(); tell({ bosEmail: 'close' }); }
+        }, true);
+      })();
+    </script>`;
+}
+function embedPage(title, body) {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(title || '')}</title><link rel="stylesheet" href="/static/css/style.css"></head>
+<body class="viewer-embed">${body}</body></html>`;
 }
 
 // Only ever send Close back to a dashboard page (never an off-site URL).
@@ -835,8 +872,13 @@ function register(router, requireAuth) {
         <h1>File not found</h1><p class="subtitle">That file isn't on this customer's record (it may have been deleted or moved).</p>`;
       return res.status(404).send(dashboardLayout({ title: 'File not found', active: '/dashboard/customers', body }));
     }
-    const closeUrl = safeReturnTo(req.query.return_to, `/dashboard/customers/${c.id}?open=files#file-${f.id}`);
-    const rt = req.query.return_to ? `?return_to=${encodeURIComponent(closeUrl)}` : '';
+    // BF-2640-078: ?embed=email renders this same viewer inside the compose
+    // window's floating preview, with Add this file to Email.
+    const embed = req.query.embed === 'email';
+    const closeUrl = embed
+      ? `/dashboard/customers/${c.id}/email`
+      : safeReturnTo(req.query.return_to, `/dashboard/customers/${c.id}?open=files#file-${f.id}`);
+    const rt = embed ? '?embed=email' : req.query.return_to ? `?return_to=${encodeURIComponent(closeUrl)}` : '';
     const viewUrl = (id) => `/dashboard/customers/${c.id}/files/${id}/view${rt}`;
     const all = db.listCustomerFiles(c.id);
     const idx = all.findIndex((x) => x.id === f.id);
@@ -851,8 +893,11 @@ function register(router, requireAuth) {
       prevUrl: prev ? viewUrl(prev.id) : null,
       nextUrl: next ? viewUrl(next.id) : null,
       missing,
-      extraHtml: `<p class="subtitle">${escapeHtml(c.name)} · file ${idx + 1} of ${all.length}${f.note ? ' · ' + escapeHtml(f.note) : ''}</p>`,
+      extraHtml:
+        `<p class="subtitle">${escapeHtml(c.name)} · file ${idx + 1} of ${all.length}${f.note ? ' · ' + escapeHtml(f.note) : ''}</p>` +
+        (embed ? emailPreviewExtra(f) : ''),
     });
+    if (embed) return res.status(missing ? 404 : 200).send(embedPage(f.original_name, body));
     res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/customers', body }));
   });
 
@@ -1416,6 +1461,170 @@ function register(router, requireAuth) {
     }
     db.logActivity({ entity_type: 'customer', entity_id: c.id, customer_id: c.id, field: 'sale_packet_emailed', new_value: files.map((f) => f.original_name).join(', '), actor: actorOf(req) });
     res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent('Packet emailed to ' + c.email + '. ' + done.summary)}`);
+  });
+
+  // ---------- BF-2640-078 Email compose ----------
+  // Email on a customer opens this compose window: To, Subject, Body, canned
+  // notes, tick boxes for files already on that customer, and Send. Send shows
+  // a confirm step first; only "Yes, send" on the exact reviewed email sends.
+  // Foreman fills the same window through an email draft (?draft=) and never
+  // sends by itself.
+  const composeFiles = (c, ids) => {
+    const wanted = new Set(asArray(ids).map(String));
+    return db.listCustomerFiles(c.id).filter((f) => wanted.has(f.id));
+  };
+  const composeHash = (v) =>
+    crypto.createHash('sha256').update(JSON.stringify([v.to, v.subject, v.body, [...v.file_ids].sort()])).digest('hex');
+  function composeValues(c, src) {
+    return {
+      to: String(src.to ?? c.email ?? '').trim(),
+      subject: String(src.subject ?? '').trim(),
+      body: String(src.body ?? '').replace(/\r\n/g, '\n'),
+      file_ids: composeFiles(c, src.file_ids).map((f) => f.id),
+    };
+  }
+  function composePage(req, res, c, v, { review = false, err = '', status = 200 } = {}) {
+    const files = db.listCustomerFiles(c.id);
+    const ticked = new Set(v.file_ids);
+    const chosen = files.filter((f) => ticked.has(f.id));
+    const snippet = (key, label) =>
+      `<button type="button" class="btn small secondary" data-canned="${key}" data-canned-text="${escapeHtml(EMAIL_SNIPPETS[key])}">${label}</button>`;
+    const body = `
+      ${backLink(`/dashboard/customers/${c.id}`, c.name)}
+      <h1>Email ${escapeHtml(c.name)}</h1>
+      ${err ? `<div class="msg err">${escapeHtml(err)}</div>` : ''}
+      ${!email.emailConfigured() ? '<div class="msg err">Email NOT CONFIGURED — set GMAIL_USER / GMAIL_APP_PASSWORD. A send is recorded but not delivered.</div>' : ''}
+      <form class="panel" id="email-compose" method="POST" action="/dashboard/customers/${c.id}/email/send">
+        <label for="compose-to">To</label>
+        <input type="email" id="compose-to" name="to" value="${escapeHtml(v.to)}" required>
+        <label for="compose-subject">Subject</label>
+        <input type="text" id="compose-subject" name="subject" value="${escapeHtml(v.subject)}" placeholder="Message from ${escapeHtml(require('../render').BUSINESS_NAME)}" required>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 4px">${snippet('warranty', 'Warranty')}${snippet('referral', 'Referral')}</div>
+        <label for="compose-body">Body</label>
+        <textarea id="compose-body" name="body" rows="9" required>${escapeHtml(v.body)}</textarea>
+        <h3>Files on ${escapeHtml(c.name)}</h3>
+        ${
+          files.length
+            ? `<div class="compose-files">${files
+                .map(
+                  (f) => `<div class="compose-file" data-compose-file="${f.id}">
+                    <label style="display:flex;gap:8px;align-items:center;margin:0;flex:1"><input type="checkbox" name="file_ids" value="${f.id}" style="width:auto"${ticked.has(f.id) ? ' checked' : ''}> <span>${escapeHtml(f.original_name)}</span></label>
+                    <button type="button" class="btn small secondary" data-email-preview="${f.id}">Preview</button>
+                  </div>`
+                )
+                .join('')}</div>`
+            : '<p class="subtitle">No files on this customer yet.</p>'
+        }
+        ${
+          review
+            ? `<div class="panel compose-review" id="compose-review">
+                <h2 style="margin-top:0">Send this email?</h2>
+                <p><strong>To:</strong> ${escapeHtml(v.to)}<br><strong>Subject:</strong> ${escapeHtml(v.subject)}<br><strong>Attachments:</strong> ${chosen.length ? chosen.map((f) => escapeHtml(f.original_name)).join(', ') : 'none'}</p>
+                <div class="compose-review-body">${escapeHtml(v.body).replace(/\n/g, '<br>')}</div>
+                <input type="hidden" name="reviewed" value="${composeHash(v)}">
+                <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="btn" type="submit" name="confirmed" value="1" data-compose-confirm>Yes, send</button>
+                  <a class="btn secondary" href="#compose-body" data-compose-edit>Keep editing</a>
+                </div>
+              </div>`
+            : ''
+        }
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" type="submit" data-compose-send>Send</button>
+          <a class="btn secondary" href="/dashboard/customers/${c.id}" data-compose-close>Close</a>
+        </div>
+      </form>
+      <div class="email-preview" id="email-preview" hidden>
+        <iframe id="email-preview-frame" title="File preview"></iframe>
+      </div>
+      <script>
+        (function () {
+          var form = document.getElementById('email-compose');
+          var bodyEl = document.getElementById('compose-body');
+          var box = document.getElementById('email-preview');
+          var frame = document.getElementById('email-preview-frame');
+          var customerId = ${JSON.stringify(c.id)};
+          // A change after the confirm step drops the old confirm, so what is
+          // sent is always what Andrew confirmed.
+          form.addEventListener('input', function () {
+            var r = document.getElementById('compose-review');
+            if (r) r.parentNode.removeChild(r);
+          });
+          document.addEventListener('click', function (e) {
+            var canned = e.target.closest('[data-canned]');
+            if (canned) {
+              var text = canned.getAttribute('data-canned-text');
+              var s = bodyEl.selectionStart, t = bodyEl.selectionEnd, v = bodyEl.value;
+              if (typeof s !== 'number' || document.activeElement !== bodyEl) { s = t = v.length; }
+              var before = v.slice(0, s), after = v.slice(t);
+              var sep = before && !/\\n\\n$/.test(before) ? (/\\n$/.test(before) ? '\\n' : '\\n\\n') : '';
+              bodyEl.value = before + sep + text + after;
+              bodyEl.dispatchEvent(new Event('input', { bubbles: true }));
+              bodyEl.focus();
+              return;
+            }
+            var pv = e.target.closest('[data-email-preview]');
+            if (pv) {
+              frame.src = '/dashboard/customers/' + customerId + '/files/' + pv.getAttribute('data-email-preview') + '/view?embed=email';
+              box.hidden = false;
+            }
+          });
+          function closePreview() { box.hidden = true; frame.removeAttribute('src'); }
+          window.addEventListener('message', function (e) {
+            if (e.origin !== location.origin || !e.data || !e.data.bosEmail) return;
+            if (e.data.bosEmail === 'attach') {
+              var cb = form.querySelector('input[name="file_ids"][value="' + String(e.data.fileId).replace(/"/g, '') + '"]');
+              if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('input', { bubbles: true })); }
+            }
+            closePreview();
+          });
+          document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !box.hidden) closePreview(); });
+        })();
+      </script>`;
+    res.status(status).send(dashboardLayout({ title: `Email ${c.name}`, active: '/dashboard/customers', body, flash: flashFromQuery(req.query) }));
+  }
+
+  router.get('/dashboard/customers/:id/email', requireAuth, (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const d = req.query.draft ? db.getEmailDraft(req.query.draft) : null;
+    const src = d && d.customer_id === c.id ? { to: d.to_address ?? undefined, subject: d.subject, body: d.body, file_ids: d.file_ids } : { file_ids: req.query.file_ids };
+    composePage(req, res, c, composeValues(c, src));
+  });
+
+  router.post('/dashboard/customers/:id/email/send', requireAuth, async (req, res) => {
+    const c = db.getCustomer(req.params.id);
+    if (!c) return res.status(404).send('Customer not found');
+    const v = composeValues(c, req.body);
+    const again = (err) => composePage(req, res, c, v, { err, status: 400 });
+    if (!isValidEmail(v.to)) return again('Enter a valid To address. Nothing was sent.');
+    if (!v.subject || !v.body.trim()) return again('The email needs a subject and a body. Nothing was sent.');
+    const files = composeFiles(c, v.file_ids);
+    if (files.reduce((s, f) => s + (f.size || 0), 0) > MAX_PACKET_ATTACH_BYTES) return again('Those files are too big to email together. Nothing was sent.');
+    // Confirm before send: the first Send shows the review; only "Yes, send"
+    // on an unchanged email goes out.
+    if (String(req.body.confirmed) !== '1' || req.body.reviewed !== composeHash(v)) {
+      return composePage(req, res, c, v, { review: true });
+    }
+    const attachments = [];
+    for (const f of files) {
+      const p = db.locateFileBytes(f);
+      if (!p) return again(`"${f.original_name}" is missing from storage. Nothing was sent.`);
+      attachments.push({ filename: f.original_name, path: p });
+    }
+    const sent = await email.sendEmail({
+      to: v.to,
+      subject: v.subject,
+      html: `<p>${escapeHtml(v.body.trim()).replace(/\n/g, '<br>')}</p>`,
+      customer_id: c.id,
+      logMessage: db.logMessage,
+      attachments,
+    });
+    if (!sent.ok) {
+      const why = sent.reason === 'not_configured' ? "email isn't set up on this server" : sent.reason === 'no_email_address' ? 'no valid email address' : sent.error || 'send failed';
+      return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent(`The email was NOT sent (${why}). It is recorded in the communication history.`)}`);
+    }
+    res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent(`Email sent to ${v.to}${files.length ? ` with ${files.length} attachment${files.length === 1 ? '' : 's'}` : ''}.`)}`);
   });
 
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {

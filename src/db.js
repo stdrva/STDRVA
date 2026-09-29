@@ -2725,6 +2725,38 @@ function listForemanNotes(tenant_id = DEFAULT_TENANT_ID) {
   return db.prepare(`SELECT * FROM foreman_notes WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC`).all(tenant_id);
 }
 
+// ---- BF-2640-078: an email draft Foreman fills for the compose window on a
+// customer. A draft sends nothing; Andrew reviews it in the window, presses
+// Send, and confirms. file_ids only ever holds that customer's own files.
+db.exec(`
+CREATE TABLE IF NOT EXISTS email_drafts (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  to_address TEXT,
+  subject TEXT,
+  body TEXT,
+  file_ids TEXT NOT NULL DEFAULT '[]',
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+`);
+function createEmailDraft({ customer_id, to_address, subject, body, file_ids, created_by }) {
+  const own = new Set(listCustomerFiles(customer_id).map((f) => f.id));
+  const ids = [].concat(file_ids || []).map(String).filter((id) => own.has(id));
+  const id = newId();
+  db.prepare(
+    `INSERT INTO email_drafts (id, customer_id, to_address, subject, body, file_ids, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, to_address || null, subject || null, body || null, JSON.stringify(ids), created_by || null, nowIso());
+  return getEmailDraft(id);
+}
+function getEmailDraft(id) {
+  const d = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id);
+  if (!d) return null;
+  let ids = [];
+  try { ids = JSON.parse(d.file_ids || '[]'); } catch {}
+  return { ...d, file_ids: Array.isArray(ids) ? ids : [] };
+}
+
 // The username the single env login authenticates as (see src/auth.js).
 function defaultUsername() {
   return process.env.DASHBOARD_PASSWORD ? process.env.DASHBOARD_USER || 'admin' : 'dev';
@@ -2990,6 +3022,8 @@ module.exports = {
   phonePhotoName,
   createForemanNote,
   listForemanNotes,
+  createEmailDraft,
+  getEmailDraft,
   DATA_DIR,
   LEAD_STAGES,
   OPEN_LEAD_STAGES,

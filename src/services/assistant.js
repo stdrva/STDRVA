@@ -738,6 +738,22 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'fill_email_compose',
+    description:
+      "BF-2640-078: fill the Email compose window on a customer so Andrew can review it. You may set to, subject, body, and file_ids (only files already on that customer - use get_customer_detail or search_files to find their ids). This opens the window on Andrew's screen with those fields filled and sends nothing. Andrew presses Send and confirms in the window himself. Use this instead of send_customer_message whenever the email should carry files, or when Andrew asks you to draft or write an email for him to look over.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        customer_id: { type: 'string' },
+        to: { type: 'string', description: "Defaults to the customer's email on file" },
+        subject: { type: 'string' },
+        body: { type: 'string' },
+        file_ids: { type: 'array', items: { type: 'string' }, description: "Ids of files already on this customer to attach" },
+      },
+      required: ['customer_id'],
+    },
+  },
+  {
     name: 'save_raw_note',
     description:
       "BF-2640-076: Foreman is capturing a raw bug or feature note for Andrew, word for word, so Andrew can download the list from Desk later. Use it when Andrew is clearly giving Foreman a note (for example 'note this bug', 'add a feature note', 'write this down for the Architect'). Save the raw text only. Foreman must not invent a BF- name or any other ticket name; the Architect numbers tickets. Foreman must not treat the note as done work or say the fix is made. After saving, read the saved note back to Andrew.",
@@ -1403,6 +1419,29 @@ function runTool(name, input, ctx = {}) {
       const session_id = db.createTrainingSession(input);
       return { session_id, ...input };
     }
+    case 'fill_email_compose': {
+      const c = db.getCustomer(input.customer_id);
+      if (!c) return { error: 'Customer not found' };
+      const own = new Set(db.listCustomerFiles(c.id).map((f) => f.id));
+      const asked = [].concat(input.file_ids || []).map(String);
+      const skipped = asked.filter((id) => !own.has(id));
+      const draft = db.createEmailDraft({
+        customer_id: c.id,
+        to_address: input.to || c.email || null,
+        subject: input.subject || null,
+        body: input.body || null,
+        file_ids: asked,
+        created_by: ctx.username || 'assistant',
+      });
+      return {
+        ok: true,
+        __navigate: `/dashboard/customers/${c.id}/email?draft=${draft.id}`,
+        customer_id: c.id,
+        filled: { to: draft.to_address, subject: draft.subject, body: draft.body, file_ids: draft.file_ids },
+        skipped_file_ids: skipped,
+        note: 'The compose window is open and filled. Nothing was sent. Andrew reviews it, presses Send, and confirms before it goes out.',
+      };
+    }
     case 'save_raw_note': {
       const note = db.createForemanNote({ body: input.body, created_by: ctx.username || db.defaultUsername() });
       return {
@@ -1561,6 +1600,13 @@ only upload is a photo with no text, say you can't tell from it - never guess. c
 and update_record are real writes: read back, wait for his yes, then confirmed:true. There
 is no tool to text or email a Desk record, and you never contact one without his explicit
 confirmation.
+
+Email compose (BF-2640-078): when Andrew wants an email to a customer with files attached,
+or asks you to draft or write an email for him to look over, call fill_email_compose with the
+customer, subject, body, and the ids of files already on that customer. That opens the compose
+window on his screen and sends nothing. Tell him it is filled and waiting for him to press Send
+and confirm. Never say it was sent. Only files already on that customer can be attached; never
+attach Desk record files.
 
 Foreman notes (BF-2640-076): when Andrew clearly gives you a raw bug or feature note, call
 save_raw_note with his words as he said them, then read the saved note back. Do not give the
