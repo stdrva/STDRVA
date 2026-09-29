@@ -1,6 +1,6 @@
 docs/tickets.md
 
-Format: BF-YYWW-NNN. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Next unused whole name: BF-2640-082.
+Format: BF-YYWW-NNN. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Next unused whole name: BF-2640-083.
 
 Lessons are L1 L2 L3 L4. Do not mint new FF- names. Old FF-3926-* names in CHANGELOG.md are history only.
 
@@ -10,17 +10,23 @@ Live BOS is BOS 1.8.1 commit f5f75d9. Render auto-deploy is off.
 
 Open
 
-BF-2640-070 Voice. Now the Voice screen can say Listening while the microphone is dead after a pause. We want pause to stop the recognizer. We want resume to start a new recognizer. We want the words on screen to match the microphone.
-
-BF-2640-072 Search. We want BOS to search the whole database for the word test. We want a list of hits. We do not want a delete until Andrew says so.
-
 BF-2640-073 Retired. This was an Architect checklist problem. This is not a BOS job. Do not reuse this name.
 
 BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Code copies the Architect exact files. Claude Code does not rewrite them.
 
+Finished on main after BOS 1.8.2
+
+These tickets are committed and pushed to main at commit 755b134. Live BOS gets them after Andrew runs Manual Deploy of main on Render.
+
+BF-2640-070 Voice. Now the Voice screen can say Listening while the microphone is dead after a pause. We want pause to stop the recognizer. We want resume to start a new recognizer. We want the words on screen to match the microphone.
+
+BF-2640-072 Search. We want BOS to search the whole database for the word test. We want a list of hits. We do not want a delete until Andrew says so.
+
 BF-2640-075 Files. We want the Files page to list every file Andrew is allowed to see, ten or twenty per page. We want the search box to shorten that list as Andrew types. We want each row to show a description and the records the file is linked to.
 
 BF-2640-080 Foreman times. We want Foreman to read Andrew existing BOS appointments before Foreman offers a time.
+
+BF-2640-082 Training. Andrew turned Training on. Make Training in the Menu a real link to the existing training screens. Do not invent new lesson names. Lessons stay L1 L2 L3 L4 until Andrew pastes L5 through L8. Do not add web search or Places.
 
 Finished in BOS 1.8.2
 
