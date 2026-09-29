@@ -20,15 +20,11 @@ BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Cod
 
 BF-2640-075 Files. We want the Files page to list every file Andrew is allowed to see, ten or twenty per page. We want the search box to shorten that list as Andrew types. We want each row to show a description and the records the file is linked to.
 
-BF-2640-078 Email compose. Now Foreman can send email body text and cannot attach a PDF. We want Email on a customer to open a compose window. We want Andrew to tick files already on that customer. We want canned notes including warranty and referral. We want Foreman to fill the window. We want Andrew to confirm before send. We want a floating preview like Foreman with Close, Previous, Next, PDF zoom, and Add this file to Email. Add this file to Email attaches the file and closes the preview. The typed draft stays. No PDF thumbnails.
-
 BF-2640-080 Foreman times. We want Foreman to read Andrew existing BOS appointments before Foreman offers a time.
 
-BF-2640-081 Phone Back. Now the phone bottom bar has Overview, Appts, Pipeline, and Menu. We want Back on the far left of that same bar. We want Back to open the last BOS dashboard page Andrew was on. We do not want Back to open login or the public booking page. If Andrew is on the first page of that visit, Back does nothing. This replaces the four-destination phone rule from BOS 1.8.0 on the phone only.
+Finished in BOS 1.8.2
 
-Finished on main after BOS 1.8.1
-
-These tickets are committed and pushed to main at commit 8f48129. Live BOS gets them after Andrew runs Manual Deploy of main on Render.
+These tickets are in BOS 1.8.2 on main at commit 9823b57. Live BOS gets them after Andrew runs Manual Deploy of main on Render.
 
 BF-2640-079 Cancelled appointments. Now cancelled visits still appear under Upcoming. We do not want cancelled visits in Upcoming.
 
@@ -37,6 +33,10 @@ BF-2640-077 Job to customer. We want a click on a job record to open that custom
 BF-2640-071 Phone photos named image.jpg, image.jpeg, or image.JPG. We want those files renamed i001.jpg, i002.jpg, and so on. We want one company counter. We do not want to rename a file that already has a real name.
 
 BF-2640-076 Foreman notes. We want Foreman to save Andrew raw bug and feature notes. We want Andrew to download that list from Desk. BF-2640-076 is a to-do. BF-2640-076 is not a folder.
+
+BF-2640-078 Email compose. Now Foreman can send email body text and cannot attach a PDF. We want Email on a customer to open a compose window. We want Andrew to tick files already on that customer. We want canned notes including warranty and referral. We want Foreman to fill the window. We want Andrew to confirm before send. We want a floating preview like Foreman with Close, Previous, Next, PDF zoom, and Add this file to Email. Add this file to Email attaches the file and closes the preview. The typed draft stays. No PDF thumbnails.
+
+BF-2640-081 Phone Back. Now the phone bottom bar has Overview, Appts, Pipeline, and Menu. We want Back on the far left of that same bar. We want Back to open the last BOS dashboard page Andrew was on. We do not want Back to open login or the public booking page. If Andrew is on the first page of that visit, Back does nothing. This replaces the four-destination phone rule from BOS 1.8.0 on the phone only.
 
 Finished in BOS 1.8.1
 
