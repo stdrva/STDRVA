@@ -7,6 +7,16 @@ below that carry a `-beta.N` suffix predate that decision.
 
 ## Unreleased
 
+## 1.8.2.1 (2026-09-29) — Voice pause, Search, Files paging, Foreman times, Training
+
+The Menu now reads BOS 1.8.2.1. Tests: `tests/update-2640-fix.test.js`.
+
+- **BF-2640-070 Voice.** Pause now stops the recognizer, so the Voice screen can no longer say Listening while the microphone is dead. Resume starts a new recognizer, and the words on screen come only from that new recognizer.
+- **BF-2640-072 Search.** A new Search page, first in the Menu under Customer Relations, searches the whole database. It lists matching customers, jobs, appointments, Desk records, files, and notes, and each hit links to its record. The page has no delete control.
+- **BF-2640-075 Files.** The Files page now lists every file Andrew is allowed to see, twenty per page, and the search box still shortens the list as Andrew types. Each row shows a description and the customer or Desk record the file is linked to. Desk record files now appear for anyone who can see that record.
+- **BF-2640-080 Foreman times.** Foreman now reads the existing BOS appointments before offering a time and never offers or books a time that already has a scheduled visit. A visit that starts before business hours and runs into them now blocks those times too.
+- **BF-2640-082 Training.** Andrew turned Training on. Training in the Menu now opens a Training page that shows the lessons L1 door, L2 mirroring, L3 labeling, and L4 implication, and each sales rep session log. Foreman has its training tools again. No lesson content, web search, or Places was added.
+
 ## 1.8.2 (2026-09-29) — Phone Back, Upcoming filter, Jobs click, photo names, Foreman notes, Email compose
 
 Sales training stays off. No Twilio settings changed in this release. The Menu now reads BOS 1.8.2. Tests: `tests/update-181.test.js` (BF-2640-081), `tests/update-2640-batch.test.js` (BF-2640-079, BF-2640-077, BF-2640-071, BF-2640-076), and `tests/update-2640-078.test.js` (BF-2640-078).
