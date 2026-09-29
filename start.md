@@ -10,7 +10,7 @@ BOS is the live business app on Render. BOS is the website Andrew opens on the l
 
 Foreman is the assistant inside BOS. Foreman is not the Architect.
 
-Claude Code writes program files on the laptop in C:\Users\andre\STDRVA. Claude Code is started with C:\Users\andre.local\bin\claude.exe. Before Claude Code starts a large job, the Architect must remind Andrew to type /usage into that Claude Code window. /usage is a Claude Code command. /usage is not a BOS screen. /usage is not a Grok command.
+Claude Code writes program files on the laptop in C:\Users\andre\STDRVA. Claude Code is started with C:\Users\andre\.local\bin\claude.exe. Before Claude Code starts a large job, the Architect must remind Andrew to type /usage into that Claude Code window. /usage is a Claude Code command. /usage is not a BOS screen. /usage is not a Grok command.
 
 Andrew updates live BOS with Manual Deploy of main on Render. Render auto-deploy is off.
 
