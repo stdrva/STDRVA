@@ -5,6 +5,10 @@ feature, MAJOR only for a big breaking change. Changes are tested locally and th
 straight to the live site - there's no separate beta/staging deployment, and older entries
 below that carry a `-beta.N` suffix predate that decision.
 
+## Unreleased
+
+- **BF-2640-081 Phone Back.** BOS 1.8.0 said the app would never show more than four always-visible destinations. Now the phone bottom bar holds Back plus the four destinations, in this order: Back, Overview, Appts, Pipeline, and Menu. The desktop top bar is unchanged and has no Back. Back opens the last BOS dashboard page Andrew was on during this visit. BOS keeps that history itself in the browser tab and records only /dashboard pages, so Back never opens login, the public booking page, or any page outside /dashboard. On the first dashboard page of a visit, Back does nothing. Back loads the earlier page fresh and never re-submits a form. If Andrew has typed into a form on the current page, BOS asks before leaving so the typing is not lost by accident. The test is in `tests/update-181.test.js`.
+
 ## 1.8.1 (2026-09-27) — Files that open, phone fixes, list_jobs / create_campaign, and the Desk
 
 Sales training stays OFF; no training content, web search, Places, chat memory, Twilio or Voice

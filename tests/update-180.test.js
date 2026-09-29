@@ -28,7 +28,8 @@ test('046: never more than four always-visible destinations (3 links + Menu), no
   const bottom = html.slice(html.indexOf('<nav class="bottomnav"'));
   const bottomEnd = bottom.slice(0, bottom.indexOf('</nav>'));
   assert.equal((bottomEnd.match(/<a /g) || []).length, 3);
-  assert.equal((bottomEnd.match(/<button /g) || []).length, 1);
+  // BF-2640-081 added Back to the phone bar only: Back + 3 links + Menu (see update-181.test.js).
+  assert.equal((bottomEnd.match(/<button /g) || []).length, 2);
   assert.deepEqual(
     [...bottomEnd.matchAll(/<a href="([^"]+)"/g)].map((m) => m[1]),
     ['/dashboard', '/dashboard/appointments', '/dashboard/pipeline']

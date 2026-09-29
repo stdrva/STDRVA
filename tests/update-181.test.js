@@ -668,3 +668,61 @@ test('FF-3926-013: "which cars have FSD" matches notes and PDF text, never a pho
   assert.equal(db.listRecordFiles(photoOnly.id)[0].extracted_text, null, 'the photo yields no text');
   assert.ok(!names.includes('Red Model 3'));
 });
+
+// ================================================================ BF-2640-081
+test('BF-2640-081: phone bar is Back, Overview, Appts, Pipeline, Menu; desktop top bar has no Back', () => {
+  const render = require('../src/render');
+  const html = render.dashboardLayout({ title: 'T', active: '/dashboard', body: '<p>x</p>', context: {} });
+  const bottom = html.slice(html.indexOf('<nav class="bottomnav"'));
+  const bar = bottom.slice(0, bottom.indexOf('</nav>'));
+  const items = [...bar.matchAll(/<(a|button)\b([^>]*)>/g)].map(([, tag, attrs]) =>
+    tag === 'a' ? attrs.match(/href="([^"]+)"/)[1] : (attrs.match(/aria-label="([^"]+)"/) || [])[1]);
+  assert.deepEqual(items, ['Back', '/dashboard', '/dashboard/appointments', '/dashboard/pipeline', 'Menu']);
+  assert.match(bar, /data-dash-back[^>]*>[^]*<span>Back<\/span>/);
+  const top = html.slice(html.indexOf('<nav class="topnav-links"'), html.indexOf('</nav>', html.indexOf('<nav class="topnav-links"')));
+  assert.ok(!/data-dash-back|Back/.test(top), 'no Back on the desktop top bar');
+});
+
+test('BF-2640-081: Back walks an in-app /dashboard history and does nothing on the first page of the visit', () => {
+  const render = require('../src/render');
+  const html = render.dashboardLayout({ title: 'T', active: '/dashboard', body: '<p>x</p>', context: {} });
+  const start = html.indexOf('<script>', html.indexOf('<nav class="bottomnav"'));
+  const code = html.slice(start + '<script>'.length, html.indexOf('</script>', start));
+
+  // Minimal browser stand-ins: one sessionStorage per visit, a location, click and input listeners.
+  function visit(store, url) {
+    const [pathname, q] = url.split('?');
+    const listeners = {};
+    const loc = { pathname, search: q ? '?' + q : '', href: url };
+    const document = { addEventListener: (ev, fn) => { listeners[ev] = fn; } };
+    const sessionStorage = { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } };
+    new Function('location', 'document', 'sessionStorage', 'confirm', code)(loc, document, sessionStorage, () => false);
+    const backBtn = { closest: (sel) => (sel === '[data-dash-back]' ? {} : null) };
+    return {
+      loc,
+      back() { listeners.click({ target: backBtn }); return loc.href === url ? null : loc.href; },
+      type() { listeners.input({ target: { closest: () => ({}) } }); },
+    };
+  }
+  const store = {};
+  assert.equal(visit(store, '/dashboard').back(), null, 'first dashboard page of the visit: Back does nothing');
+  visit(store, '/dashboard/customers');
+  const page = visit(store, '/dashboard/customers/7?tab=files');
+  assert.equal(page.back(), '/dashboard/customers');
+  assert.equal(visit(store, '/dashboard/customers').back(), '/dashboard');
+  assert.equal(visit(store, '/dashboard').back(), null, 'back at the start of the visit');
+
+  // Pages outside /dashboard (login, public booking) are never recorded.
+  const s2 = {};
+  visit(s2, '/login');
+  visit(s2, '/book');
+  assert.equal(visit(s2, '/dashboard/pipeline').back(), null);
+
+  // Typed changes on the current page are not dropped without asking (confirm answers No here).
+  const s3 = {};
+  visit(s3, '/dashboard');
+  const form = visit(s3, '/dashboard/customers/7');
+  form.type();
+  assert.equal(form.back(), null, 'declined confirm keeps Andrew on the form');
+  assert.ok(!/\.back\(\)|history\.go/.test(code), 'Back never uses browser history, which can hold login or public pages');
+});

@@ -633,7 +633,7 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
   .topnav-links { display: flex; }
 }
 
-/* Phone: fixed bottom bar, four items. */
+/* Phone: fixed bottom bar - Back plus the four destinations (BF-2640-081). */
 .bottomnav { display: none; }
 @media (max-width: 720px) {
   :root { --bottomnav-h: calc(56px + env(safe-area-inset-bottom, 0px)); }
@@ -648,6 +648,9 @@ input, select, textarea { font-size: 16px; } /* stop iOS zoom-on-focus */
   }
   .bottomnav a.active, .bottomnav button.active { color: var(--brand); font-weight: 700; box-shadow: inset 0 3px 0 var(--gold); }
   .bottomnav button[aria-expanded="true"] { background: #eef2ee; }
+  /* BF-2640-081: Back on the far left of the phone bar - arrow plus the word Back. */
+  .bottomnav .nav-back { gap: 2px; }
+  .bottomnav .nav-back svg { flex: 0 0 auto; }
   /* room so neither the bar nor the assistant ever covers content */
   body.dash { padding-bottom: calc(96px + var(--bottomnav-h)); }
   /* lift the floating buttons / panel above the bar */

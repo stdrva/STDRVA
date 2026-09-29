@@ -149,16 +149,63 @@ function menuIsActive(active) {
   return !!active && !PRIMARY_NAV.some(([h]) => h === active);
 }
 
-// Phone-only fixed bottom bar: the same three destinations plus Menu.
+// Phone-only fixed bottom bar: Back, then the same three destinations plus Menu.
+// BF-2640-081: Back sits on the far left of this bar only (not the desktop top
+// bar). It opens the last BOS dashboard page Andrew was on in this visit, from a
+// history kept in sessionStorage (one tab = one visit). Only /dashboard pages
+// are recorded, so Back never opens login, the public booking page, or anything
+// outside /dashboard. On the first dashboard page of the visit Back does nothing.
+// Back is a plain GET of the stored page, so it never re-submits a form; if a
+// form on the current page has typed changes, Andrew is asked before they are
+// dropped.
+const BACK_ICON = `<svg class="back-arrow" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`;
+
+const BACK_SCRIPT = `<script>
+  (function () {
+    var KEY = 'bosDashHistory';
+    var MAX = 50;
+    function read() {
+      try { var v = JSON.parse(sessionStorage.getItem(KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+    }
+    function write(v) { try { sessionStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} }
+    function isDash(p) { return p === '/dashboard' || p.indexOf('/dashboard/') === 0; }
+    var here = location.pathname + location.search;
+    var stack = read();
+    if (isDash(location.pathname) && stack[stack.length - 1] !== here) {
+      stack.push(here);
+      if (stack.length > MAX) stack = stack.slice(stack.length - MAX);
+      write(stack);
+    }
+    var dirty = false;
+    document.addEventListener('input', function (e) {
+      var form = e.target.closest && e.target.closest('main form');
+      if (form) dirty = true;
+    });
+    document.addEventListener('submit', function () { dirty = false; });
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('[data-dash-back]')) return;
+      var s = read();
+      while (s.length && s[s.length - 1] === here) s.pop();
+      var target = s[s.length - 1];
+      if (!target || !isDash(target.split('?')[0])) return;
+      if (dirty && !confirm('Leave this page? The changes you typed here will not be saved.')) return;
+      write(s);
+      location.href = target;
+    });
+  })();
+</script>`;
+
 function bottomNavHtml(active) {
   const links = PRIMARY_NAV.map(
     ([h, l]) => `<a href="${h}"${active === h ? ' class="active" aria-current="page"' : ''}>${l}</a>`
   ).join('');
   return `
 <nav class="bottomnav" aria-label="Main">
+  <button type="button" class="nav-back" data-dash-back aria-label="Back">${BACK_ICON}<span>Back</span></button>
   ${links}
   <button type="button" class="${menuIsActive(active) ? 'active' : ''}" data-menu-toggle aria-label="Menu" aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">${HAMBURGER}</button>
-</nav>`;
+</nav>
+${BACK_SCRIPT}`;
 }
 
 // One Menu sheet, shared by the desktop top-bar button and the phone bottom-bar
