@@ -7,6 +7,12 @@ below that carry a `-beta.N` suffix predate that decision.
 
 ## Unreleased
 
+## 1.8.3 (2026-10-02) — Today, the day page
+
+The Menu now reads BOS 1.8.3. No Twilio settings changed in this release, and no reminder text is sent. Tests: `tests/update-2640-083.test.js`.
+
+- **BF-2640-083 Today.** A new Today page at /dashboard/today is a day page Andrew can use in the morning, and Today is in the Menu next to Desk. Today lists the scheduled visits Andrew already has on that day, the small items Andrew pulled onto that day, the unsorted items that have no day yet, and the morning and evening routines. An unsorted item sits until Andrew pulls it onto a day, and nothing, including a call, puts an item on a day by itself. Andrew can add an item, set or change its due date, and sort it with ABC 123, where A is must-do, B is should-do, C is could-do, and the number is the order inside that letter. An item whose due date has passed and is not done is marked overdue and shows in red. The morning list starts with Take meds, Make coffee, Shower, Brush teeth, Meditate, Exercise or yoga, Plan the day, and Leftover calls. The evening list starts with Leftover calls, Lay out tomorrow's bring-list, and Glance at tomorrow's visits. A write-in that Andrew keeps becomes part of that routine list. A routine check is stored on its calendar date, so a new date starts unchecked and an older date, such as Thursday, still shows what was checked that day. When a routine is still open, Today shows a line saying so. Foreman has four new tools: read_today reads the page, add_day_item adds an item, check_today_item checks an item, and add_routine_item adds a write-in. Each write waits for Andrew's yes, which is the same confirm-before-write rule Foreman already uses. Grocery, projects, vehicles, budget, routing, and mail intake were not built, and Desk was not renamed.
+
 ## 1.8.2.1 (2026-09-29) — Voice pause, Search, Files paging, Foreman times, Training
 
 The Menu now reads BOS 1.8.2.1. Tests: `tests/update-2640-fix.test.js`.

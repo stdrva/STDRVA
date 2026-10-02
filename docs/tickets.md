@@ -1,6 +1,6 @@
 docs/tickets.md
 
-Format: BF-YYWW-NNN. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Next unused whole name: BF-2640-083.
+Format: BF-YYWW-NNN. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Next unused whole name: BF-2640-084.
 
 Lessons are L1 L2 L3 L4. Do not mint new FF- names. Old FF-3926-* names in CHANGELOG.md are history only.
 
@@ -13,6 +13,12 @@ Open
 BF-2640-073 Retired. This was an Architect checklist problem. This is not a BOS job. Do not reuse this name.
 
 BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Code copies the Architect exact files. Claude Code does not rewrite them.
+
+Finished in BOS 1.8.3
+
+BF-2640-083 is committed and pushed to main in BOS 1.8.3. Live BOS gets it after Andrew runs Manual Deploy of main on Render.
+
+BF-2640-083 Command center day page. Andrew wants a day page Andrew can use tomorrow morning. Today shows visits already booked, plus small items Andrew pulled onto that day. Unsorted items sit until Andrew picks them onto a day. A call does not jump onto the morning list by itself. An overdue item can show in red. Andrew can change the due date. ABC 123 can sort an item. A is must-do, B is should-do, C is could-do, and the number is the order inside that letter. Morning and evening are checklists Andrew built. Take meds is on the morning list. Andrew checks a routine item off for that day. Routine checks reset at the end of the day, which means a new date starts unchecked. Store the check on the date so Thursday can still show that Thursday's meds were checked. Foreman can add an item, check an item, read today, and add a write-in to the routine list.
 
 Finished on main after BOS 1.8.2
 

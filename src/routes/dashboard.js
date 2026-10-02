@@ -10,6 +10,7 @@ const {
   fmtDateTime,
   dateInputToIso,
   etDateString,
+  isCalendarDate,
   isValidEmail,
   fmtRelativeDue,
   normalizePhone,
@@ -2597,6 +2598,141 @@ function register(router, requireAuth) {
     ['L3', 'Labeling'],
     ['L4', 'Implication'],
   ];
+  // ---------- BF-2640-083: Today, the day page ----------
+  // Today's scheduled visits, the day items pulled onto today, the unsorted
+  // items, and the morning and evening routines with today's checks. ?date=
+  // shows another date, so Thursday still shows what was checked on Thursday.
+  // No reminder text is sent; an open routine is only a line on this page.
+  const todayDate = (v) => (isCalendarDate(v) ? String(v).trim() : etDateString());
+  const todayBack = (date, msg, kind = 'ok') =>
+    `/dashboard/today?${date !== etDateString() ? `date=${date}&` : ''}${kind}=${encodeURIComponent(msg)}`;
+  router.get('/dashboard/today', requireAuth, (req, res) => {
+    const date = todayDate(req.query.date);
+    const t = db.todaySummary(date);
+    const isToday = date === etDateString();
+    const hidden = `<input type="hidden" name="date" value="${date}">`;
+    const itemRow = (it, { unsorted } = {}) => `
+      <li class="day-item${it.overdue ? ' overdue' : ''}${it.done ? ' done' : ''}" data-day-item="${it.id}"${it.overdue ? ' data-overdue="1"' : ''}>
+        <form method="POST" action="/dashboard/today/items/${it.id}/done" style="display:inline">${hidden}<input type="hidden" name="done" value="${it.done ? '0' : '1'}"><button class="btn small secondary" type="submit" aria-label="${it.done ? 'Mark not done' : 'Mark done'}">${it.done ? '☑' : '☐'}</button></form>
+        ${it.priority ? `<span class="badge" data-priority>${escapeHtml(it.priority)}</span>` : ''}
+        <span class="day-item-title">${escapeHtml(it.title)}</span>
+        ${it.due_date ? `<span class="day-item-due">due ${escapeHtml(it.due_date)}${it.overdue ? ' (overdue)' : ''}</span>` : ''}
+        <details style="display:inline-block"><summary>Change</summary>
+          <form method="POST" action="/dashboard/today/items/${it.id}/due" style="display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap">${hidden}
+            <div><label>Due date</label><input type="date" name="due_date" value="${escapeHtml(it.due_date || '')}"></div>
+            <button class="btn small secondary" type="submit">Set due date</button>
+          </form>
+          <form method="POST" action="/dashboard/today/items/${it.id}/priority" style="display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap">${hidden}
+            <div><label>ABC 123</label><input type="text" name="priority" value="${escapeHtml(it.priority)}" placeholder="A1" size="4"></div>
+            <button class="btn small secondary" type="submit">Set priority</button>
+          </form>
+          ${unsorted ? '' : `<form method="POST" action="/dashboard/today/items/${it.id}/day" style="display:inline">${hidden}<input type="hidden" name="day" value=""><button class="btn small secondary" type="submit">Back to unsorted</button></form>`}
+        </details>
+        ${unsorted ? `<form method="POST" action="/dashboard/today/items/${it.id}/day" style="display:inline">${hidden}<input type="hidden" name="day" value="${date}"><button class="btn small" type="submit" data-pull-quick>Pull onto ${isToday ? 'today' : 'this day'}</button></form>` : ''}
+      </li>`;
+    const routineBlock = (routine, rows, open) => `
+      <div class="panel" id="routine-${routine}">
+        <h2 style="margin-top:0">${routine === 'morning' ? 'Morning' : 'Evening'} routine</h2>
+        ${open ? `<p class="routine-open" data-routine-open="${routine}">The ${routine} routine still has ${open} of ${rows.length} open.</p>` : `<p class="subtitle" data-routine-done="${routine}">The ${routine} routine is all checked for ${isToday ? 'today' : date}.</p>`}
+        <ul class="routine-list">${rows
+          .map(
+            (r) => `<li data-routine-item="${r.id}"${r.checked ? ' data-checked="1"' : ''}>
+              <form method="POST" action="/dashboard/today/routine/${r.id}/check" style="display:inline">${hidden}<input type="hidden" name="checked" value="${r.checked ? '0' : '1'}"><button class="btn small secondary" type="submit" aria-label="${r.checked ? 'Uncheck' : 'Check'} ${escapeHtml(r.title)}">${r.checked ? '☑' : '☐'}</button></form>
+              ${escapeHtml(r.title)}</li>`
+          )
+          .join('')}</ul>
+        <form method="POST" action="/dashboard/today/routine" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">${hidden}
+          <input type="hidden" name="routine" value="${routine}">
+          <div style="flex:1 1 180px"><label>Write-in</label><input type="text" name="title" placeholder="Add to the ${routine} list" required></div>
+          <button class="btn small secondary" type="submit">Keep on the list</button>
+        </form>
+      </div>`;
+    const body = `
+      <style>.day-item.overdue .day-item-title,.day-item.overdue .day-item-due{color:#c62828;font-weight:600}.day-item.done .day-item-title{text-decoration:line-through;opacity:.6}.day-items,.routine-list{list-style:none;padding-left:0}.day-items li,.routine-list li{margin:6px 0}.routine-open{color:#c62828;font-weight:600}</style>
+      <h1>Today</h1>
+      <p class="subtitle">${escapeHtml(fmtDate(`${date}T12:00:00.000Z`))}${isToday ? '' : ` · <a href="/dashboard/today">Back to today</a>`}</p>
+      ${t.morning_open ? `<p class="routine-open">Morning routine: ${t.morning_open} still open.</p>` : ''}
+      ${t.evening_open ? `<p class="routine-open">Evening routine: ${t.evening_open} still open.</p>` : ''}
+      <div class="panel" id="today-visits">
+        <h2 style="margin-top:0">Visits</h2>
+        ${
+          t.visits.length
+            ? `<ul class="day-items">${t.visits
+                .map((a) => `<li data-visit="${a.id}">${escapeHtml(fmtDateTime(a.scheduled_at))} · <a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a> · ${escapeHtml(a.type)}</li>`)
+                .join('')}</ul>`
+            : '<p class="subtitle">No visits booked on this day.</p>'
+        }
+      </div>
+      <div class="panel" id="today-items">
+        <h2 style="margin-top:0">On this day</h2>
+        ${t.items.length ? `<ul class="day-items">${t.items.map((it) => itemRow(it)).join('')}</ul>` : '<p class="subtitle">Nothing pulled onto this day yet.</p>'}
+        <form method="POST" action="/dashboard/today/items" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">${hidden}
+          <input type="hidden" name="day" value="${date}">
+          <div style="flex:1 1 180px"><label>New item</label><input type="text" name="title" required></div>
+          <div><label>Due date</label><input type="date" name="due_date"></div>
+          <div><label>ABC 123</label><input type="text" name="priority" placeholder="A1" size="4"></div>
+          <button class="btn small" type="submit">Add to this day</button>
+        </form>
+      </div>
+      <div class="panel" id="today-unsorted">
+        <h2 style="margin-top:0">Unsorted</h2>
+        <p class="subtitle">These items sit here until you pull one onto a day.</p>
+        ${t.unsorted.length ? `<ul class="day-items">${t.unsorted.map((it) => itemRow(it, { unsorted: true })).join('')}</ul>` : '<p class="subtitle">No unsorted items.</p>'}
+        <form method="POST" action="/dashboard/today/items" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">${hidden}
+          <div style="flex:1 1 180px"><label>New unsorted item</label><input type="text" name="title" required></div>
+          <div><label>Due date</label><input type="date" name="due_date"></div>
+          <div><label>ABC 123</label><input type="text" name="priority" placeholder="B2" size="4"></div>
+          <button class="btn small secondary" type="submit">Add unsorted</button>
+        </form>
+      </div>
+      ${routineBlock('morning', t.morning, t.morning_open)}
+      ${routineBlock('evening', t.evening, t.evening_open)}`;
+    res.send(dashboardLayout({ title: 'Today', active: '/dashboard/today', body, flash: flashFromQuery(req.query) }));
+  });
+
+  router.post('/dashboard/today/items', requireAuth, (req, res) => {
+    const date = todayDate(req.body.date);
+    try {
+      db.createDayItem({ title: req.body.title, day: req.body.day || null, due_date: req.body.due_date || null, priority: req.body.priority, created_by: actorOf(req) });
+      res.redirect(todayBack(date, 'Item added'));
+    } catch (e) {
+      res.redirect(todayBack(date, e.message, 'err'));
+    }
+  });
+
+  const dayItemRoute = (suffix, apply, okMsg) =>
+    router.post(`/dashboard/today/items/:id/${suffix}`, requireAuth, (req, res) => {
+      const date = todayDate(req.body.date);
+      if (!db.getDayItem(req.params.id)) return res.status(404).send('Item not found');
+      try {
+        apply(req.params.id, req.body);
+        res.redirect(todayBack(date, okMsg));
+      } catch (e) {
+        res.redirect(todayBack(date, e.message, 'err'));
+      }
+    });
+  dayItemRoute('day', (id, b) => db.setDayItemDay(id, b.day || null), 'Item moved');
+  dayItemRoute('due', (id, b) => db.setDayItemDueDate(id, b.due_date || null), 'Due date set');
+  dayItemRoute('priority', (id, b) => db.setDayItemPriority(id, b.priority), 'Priority set');
+  dayItemRoute('done', (id, b) => db.setDayItemDone(id, b.done === '1'), 'Item updated');
+
+  router.post('/dashboard/today/routine', requireAuth, (req, res) => {
+    const date = todayDate(req.body.date);
+    try {
+      db.addRoutineItem({ routine: req.body.routine, title: req.body.title, created_by: actorOf(req) });
+      res.redirect(todayBack(date, 'Added to the routine list'));
+    } catch (e) {
+      res.redirect(todayBack(date, e.message, 'err'));
+    }
+  });
+
+  router.post('/dashboard/today/routine/:id/check', requireAuth, (req, res) => {
+    const date = todayDate(req.body.date);
+    if (!db.getRoutineItem(req.params.id)) return res.status(404).send('Routine item not found');
+    db.setRoutineCheck(req.params.id, date, req.body.checked === '1', actorOf(req));
+    res.redirect(todayBack(date, req.body.checked === '1' ? 'Checked' : 'Unchecked'));
+  });
+
   router.get('/dashboard/training', requireAuth, (req, res) => {
     const reps = db.listSalesReps();
     const body = `

@@ -11,7 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
-const { isValidEmail, fmtNowET, isCalendarDate, normalizePhone } = require('../util');
+const { isValidEmail, fmtNowET, isCalendarDate, normalizePhone, etDateString } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -754,6 +754,60 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'read_today',
+    description:
+      "BF-2640-083: read the Today day page for a date (default today, US Eastern): the scheduled visits on that date, the day items pulled onto that date with their ABC 123 priority, due date and overdue flag, the unsorted items, and the morning and evening routines with what is checked on that date. Read only. Use the item_id values it returns for check_today_item.",
+    input_schema: {
+      type: 'object',
+      properties: { date: { type: 'string', description: 'YYYY-MM-DD; omit for today' } },
+    },
+  },
+  {
+    name: 'add_day_item',
+    description:
+      "BF-2640-083: add a small item to Today. With on_today true it goes on today's list; otherwise it is unsorted and sits until Andrew pulls it onto a day. A call never goes on the list by itself - only add what Andrew asks for. priority is ABC 123: A must-do, B should-do, C could-do, and the number is the order inside the letter (A1, B2). A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        on_today: { type: 'boolean' },
+        due_date: { type: 'string', description: 'YYYY-MM-DD' },
+        priority: { type: 'string', description: 'A, B, or C with an optional number, like A1' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'check_today_item',
+    description:
+      "BF-2640-083: check off a day item or a morning or evening routine item (item_id from read_today). A routine check is stored on that date only, so the next date starts unchecked. Pass checked:false to uncheck. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        checked: { type: 'boolean', description: 'Default true' },
+        date: { type: 'string', description: 'YYYY-MM-DD for a routine item; omit for today' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['item_id'],
+    },
+  },
+  {
+    name: 'add_routine_item',
+    description:
+      "BF-2640-083: add a write-in to the morning or evening routine list. The write-in stays on that list for every day after. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        routine: { type: 'string', enum: ['morning', 'evening'] },
+        title: { type: 'string' },
+        confirmed: { type: 'boolean' },
+      },
+      required: ['routine', 'title'],
+    },
+  },
+  {
     name: 'save_raw_note',
     description:
       "BF-2640-076: Foreman is capturing a raw bug or feature note for Andrew, word for word, so Andrew can download the list from Desk later. Use it when Andrew is clearly giving Foreman a note (for example 'note this bug', 'add a feature note', 'write this down for the Architect'). Save the raw text only. Foreman must not invent a BF- name or any other ticket name; the Architect numbers tickets. Foreman must not treat the note as done work or say the fix is made. After saving, read the saved note back to Andrew.",
@@ -848,6 +902,7 @@ const READ_ONLY_TOOLS = new Set([
   'search_records',
   'get_record',
   'list_records_by_category',
+  'read_today',
 ]);
 
 // ---------- Tool execution - thin wrappers around db.js ----------
@@ -1447,6 +1502,68 @@ function runTool(name, input, ctx = {}) {
         note: 'The compose window is open and filled. Nothing was sent. Andrew reviews it, presses Send, and confirms before it goes out.',
       };
     }
+    // ---- BF-2640-083: Today ----
+    case 'read_today': {
+      const date = isCalendarDate(input.date) ? String(input.date).trim() : etDateString();
+      const t = db.todaySummary(date);
+      const item = (it) => ({ item_id: it.id, title: it.title, priority: it.priority || null, due_date: it.due_date, overdue: it.overdue, done: it.done });
+      const routine = (rows) => rows.map((r) => ({ item_id: r.id, title: r.title, checked: r.checked }));
+      return {
+        date,
+        visits: t.visits.map((a) => ({ appointment_id: a.id, customer: a.customer_name, type: a.type, scheduled_at: a.scheduled_at })),
+        items: t.items.map(item),
+        unsorted: t.unsorted.map(item),
+        morning: routine(t.morning),
+        evening: routine(t.evening),
+        morning_open: t.morning_open,
+        evening_open: t.evening_open,
+      };
+    }
+    case 'add_day_item': {
+      const title = String(input.title || '').trim();
+      if (!title) return { error: 'Not added - an item needs a title.' };
+      try {
+        db.parseDayPriority(input.priority);
+      } catch (e) {
+        return { error: `Not added - ${e.message}.` };
+      }
+      if (input.due_date && !isCalendarDate(input.due_date)) return { error: 'Not added - the due date must be a real date in YYYY-MM-DD form.' };
+      const today = etDateString();
+      const readback = [
+        `"${title}"`,
+        input.on_today ? `on today (${today})` : 'unsorted',
+        input.due_date ? `due ${input.due_date}` : null,
+        input.priority ? `priority ${String(input.priority).toUpperCase()}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      if (input.confirmed !== true) return { error: 'Not added yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      const it = db.createDayItem({ title, day: input.on_today ? today : null, due_date: input.due_date || null, priority: input.priority, created_by: `foreman:${ctx.username || db.defaultUsername()}` });
+      return { ok: true, item_id: it.id, readback };
+    }
+    case 'check_today_item': {
+      const checked = input.checked !== false;
+      const date = isCalendarDate(input.date) ? String(input.date).trim() : etDateString();
+      const dayItem = db.getDayItem(input.item_id);
+      const routineItem = dayItem ? null : db.getRoutineItem(input.item_id);
+      if (!dayItem && !routineItem) return { error: 'Item not found - call read_today for the item ids.' };
+      const readback = dayItem
+        ? `${checked ? 'Check' : 'Uncheck'} "${dayItem.title}"`
+        : `${checked ? 'Check' : 'Uncheck'} "${routineItem.title}" on the ${routineItem.routine} routine for ${date}`;
+      if (input.confirmed !== true) return { error: 'Not changed yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      if (dayItem) db.setDayItemDone(dayItem.id, checked);
+      else db.setRoutineCheck(routineItem.id, date, checked, `foreman:${ctx.username || db.defaultUsername()}`);
+      return { ok: true, readback };
+    }
+    case 'add_routine_item': {
+      if (!db.ROUTINES.includes(input.routine)) return { error: 'Not added - routine must be morning or evening.' };
+      const title = String(input.title || '').trim();
+      if (!title) return { error: 'Not added - a routine item needs a title.' };
+      const readback = `Add "${title}" to the ${input.routine} routine list for every day`;
+      if (input.confirmed !== true) return { error: 'Not added yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      const r = db.addRoutineItem({ routine: input.routine, title, created_by: `foreman:${ctx.username || db.defaultUsername()}` });
+      return { ok: true, item_id: r.id, readback };
+    }
     case 'save_raw_note': {
       const note = db.createForemanNote({ body: input.body, created_by: ctx.username || db.defaultUsername() });
       return {
@@ -1617,6 +1734,12 @@ Offering times (BF-2640-080): before you offer Andrew or a customer any start ti
 list_available_slots so you read Andrew's existing BOS appointments first. Offer only times
 it returns, never a time from memory or a guess, and never a time that already has a
 scheduled visit (those are listed under existing_appointments).
+
+Today (BF-2640-083): the Today page holds today's visits, small items Andrew pulled onto a
+day, unsorted items, and his morning and evening routines. read_today reads it. add_day_item,
+check_today_item, and add_routine_item are real writes: read back, wait for his yes, then
+confirmed:true. Never put a call or anything else on a day unless Andrew asks. ABC 123 means
+A must-do, B should-do, C could-do, and the number is the order inside the letter.
 
 Foreman notes (BF-2640-076): when Andrew clearly gives you a raw bug or feature note, call
 save_raw_note with his words as he said them, then read the saved note back. Do not give the

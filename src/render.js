@@ -121,7 +121,8 @@ const MENU_GROUPS = [
   },
   { title: 'Training', items: [['/dashboard/training', 'Training']] },
   // FF-3926-012: the record store, directly above the BOS version line.
-  { title: 'Desk', items: [['/dashboard/desk', 'Desk']] },
+  // BF-2640-083: Today, the day page, sits in this same command-center group.
+  { title: 'Desk', items: [['/dashboard/today', 'Today'], ['/dashboard/desk', 'Desk']] },
 ];
 
 // BF-2639-055: the Menu toggles show three horizontal lines, not the word.

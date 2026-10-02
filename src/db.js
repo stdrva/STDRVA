@@ -2757,6 +2757,187 @@ function getEmailDraft(id) {
   return { ...d, file_ids: Array.isArray(ids) ? ids : [] };
 }
 
+// ---- BF-2640-083: the Today day page. Day items are small to-dos Andrew adds.
+// An item with no day is unsorted and sits until Andrew pulls it onto a day;
+// nothing (a call included) puts an item on a day by itself. ABC 123 sorts an
+// item: A must-do, B should-do, C could-do, the number is the order inside the
+// letter. Routines are the morning and evening checklists Andrew built. A check
+// is stored on its calendar date, so a new date starts unchecked and an older
+// date still shows what was checked that day.
+const ROUTINES = ['morning', 'evening'];
+const ROUTINE_SEED = {
+  morning: ['Take meds', 'Make coffee', 'Shower', 'Brush teeth', 'Meditate', 'Exercise or yoga', 'Plan the day', 'Leftover calls'],
+  evening: ['Leftover calls', "Lay out tomorrow's bring-list", "Glance at tomorrow's visits"],
+};
+db.exec(`
+CREATE TABLE IF NOT EXISTS day_items (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}',
+  title TEXT NOT NULL,
+  day TEXT,
+  due_date TEXT,
+  priority_letter TEXT,
+  priority_number INTEGER,
+  done INTEGER NOT NULL DEFAULT 0,
+  done_at TEXT,
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS routine_items (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}',
+  routine TEXT NOT NULL,
+  title TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS routine_checks (
+  routine_item_id TEXT NOT NULL REFERENCES routine_items(id),
+  date TEXT NOT NULL,
+  checked_by TEXT,
+  checked_at TEXT NOT NULL,
+  PRIMARY KEY (routine_item_id, date)
+);
+`);
+(function seedRoutines() {
+  for (const routine of ROUTINES) {
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM routine_items WHERE tenant_id = ? AND routine = ?`).get(DEFAULT_TENANT_ID, routine).n;
+    if (n) continue;
+    ROUTINE_SEED[routine].forEach((title, i) => {
+      db.prepare(`INSERT INTO routine_items (id, routine, title, position, created_by, created_at) VALUES (?,?,?,?,?,?)`).run(newId(), routine, title, i + 1, 'seed', nowIso());
+    });
+  }
+})();
+
+// "A", "a2", "B 1", "C10" -> { letter, number }. Empty -> both null. Junk throws.
+function parseDayPriority(value) {
+  const v = String(value == null ? '' : value).trim().toUpperCase().replace(/\s+/g, '');
+  if (!v) return { letter: null, number: null };
+  const m = v.match(/^([ABC])(\d{1,3})?$/);
+  if (!m) throw new Error('Priority must be A, B, or C, optionally followed by a number, like A1 or B2');
+  return { letter: m[1], number: m[2] ? Number(m[2]) : null };
+}
+function cleanDay(value, label) {
+  if (value == null || String(value).trim() === '') return null;
+  if (!isCalendarDate(value)) throw new Error(`${label} must be a real date in YYYY-MM-DD form`);
+  return String(value).trim();
+}
+function hydrateDayItem(r, today = etDateString()) {
+  if (!r) return null;
+  return {
+    ...r,
+    done: !!r.done,
+    priority: r.priority_letter ? `${r.priority_letter}${r.priority_number == null ? '' : r.priority_number}` : '',
+    overdue: !r.done && !!r.due_date && r.due_date < today,
+  };
+}
+function sortDayItems(rows) {
+  const rank = (r) => (r.priority_letter ? 'ABC'.indexOf(r.priority_letter) : 3);
+  return rows.sort(
+    (a, b) =>
+      rank(a) - rank(b) ||
+      (a.priority_number == null ? 1e9 : a.priority_number) - (b.priority_number == null ? 1e9 : b.priority_number) ||
+      (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0)
+  );
+}
+function createDayItem({ title, day, due_date, priority, created_by }) {
+  const text = String(title || '').trim();
+  if (!text) throw new Error('An item needs a title');
+  const d = cleanDay(day, 'Day');
+  const due = cleanDay(due_date, 'Due date');
+  const p = parseDayPriority(priority);
+  const id = newId();
+  db.prepare(
+    `INSERT INTO day_items (id, title, day, due_date, priority_letter, priority_number, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)`
+  ).run(id, text, d, due, p.letter, p.number, created_by || null, nowIso());
+  return getDayItem(id);
+}
+function getDayItem(id, today) {
+  return hydrateDayItem(db.prepare(`SELECT * FROM day_items WHERE id = ?`).get(id), today);
+}
+// day null puts the item back in unsorted.
+function setDayItemDay(id, day) {
+  db.prepare(`UPDATE day_items SET day = ? WHERE id = ?`).run(cleanDay(day, 'Day'), id);
+  return getDayItem(id);
+}
+function setDayItemDueDate(id, due_date) {
+  db.prepare(`UPDATE day_items SET due_date = ? WHERE id = ?`).run(cleanDay(due_date, 'Due date'), id);
+  return getDayItem(id);
+}
+function setDayItemPriority(id, priority) {
+  const p = parseDayPriority(priority);
+  db.prepare(`UPDATE day_items SET priority_letter = ?, priority_number = ? WHERE id = ?`).run(p.letter, p.number, id);
+  return getDayItem(id);
+}
+function setDayItemDone(id, done) {
+  db.prepare(`UPDATE day_items SET done = ?, done_at = ? WHERE id = ?`).run(done ? 1 : 0, done ? nowIso() : null, id);
+  return getDayItem(id);
+}
+function listDayItemsForDay(day, today = etDateString()) {
+  return sortDayItems(db.prepare(`SELECT * FROM day_items WHERE tenant_id = ? AND day = ?`).all(DEFAULT_TENANT_ID, day)).map((r) => hydrateDayItem(r, today));
+}
+function listUnsortedDayItems(today = etDateString()) {
+  return sortDayItems(db.prepare(`SELECT * FROM day_items WHERE tenant_id = ? AND day IS NULL AND done = 0`).all(DEFAULT_TENANT_ID)).map((r) => hydrateDayItem(r, today));
+}
+function getRoutineItem(id) {
+  return db.prepare(`SELECT * FROM routine_items WHERE id = ?`).get(id) || null;
+}
+// The routine list for one date, each item with whether it was checked on that date.
+function listRoutine(routine, date) {
+  if (!ROUTINES.includes(routine)) throw new Error('Routine must be morning or evening');
+  return db
+    .prepare(
+      `SELECT routine_items.*, routine_checks.checked_at AS checked_at
+       FROM routine_items LEFT JOIN routine_checks ON routine_checks.routine_item_id = routine_items.id AND routine_checks.date = ?
+       WHERE routine_items.tenant_id = ? AND routine_items.routine = ?
+       ORDER BY routine_items.position, routine_items.created_at`
+    )
+    .all(date, DEFAULT_TENANT_ID, routine)
+    .map((r) => ({ ...r, checked: !!r.checked_at }));
+}
+// A write-in Andrew or Foreman keeps becomes part of that routine list.
+function addRoutineItem({ routine, title, created_by }) {
+  if (!ROUTINES.includes(routine)) throw new Error('Routine must be morning or evening');
+  const text = String(title || '').trim();
+  if (!text) throw new Error('A routine item needs a title');
+  const max = db.prepare(`SELECT MAX(position) AS m FROM routine_items WHERE tenant_id = ? AND routine = ?`).get(DEFAULT_TENANT_ID, routine).m || 0;
+  const id = newId();
+  db.prepare(`INSERT INTO routine_items (id, routine, title, position, created_by, created_at) VALUES (?,?,?,?,?,?)`).run(id, routine, text, max + 1, created_by || null, nowIso());
+  return getRoutineItem(id);
+}
+function setRoutineCheck(routine_item_id, date, checked, checked_by) {
+  if (!getRoutineItem(routine_item_id)) throw new Error('Routine item not found');
+  const d = cleanDay(date, 'Date');
+  if (!d) throw new Error('A routine check needs a date');
+  if (checked) {
+    db.prepare(`INSERT OR IGNORE INTO routine_checks (routine_item_id, date, checked_by, checked_at) VALUES (?,?,?,?)`).run(routine_item_id, d, checked_by || null, nowIso());
+  } else {
+    db.prepare(`DELETE FROM routine_checks WHERE routine_item_id = ? AND date = ?`).run(routine_item_id, d);
+  }
+}
+// Everything the Today page shows for one Eastern calendar date. Visits are the
+// scheduled appointments Andrew already has on that date.
+function todaySummary(date = etDateString()) {
+  const today = etDateString();
+  const noon = new Date(`${date}T12:00:00.000Z`).getTime();
+  const visits = listAppointmentsBetween(new Date(noon - 2 * 86400000).toISOString(), new Date(noon + 2 * 86400000).toISOString())
+    .filter((a) => etDateString(new Date(a.scheduled_at)) === date)
+    .sort((a, b) => (a.scheduled_at < b.scheduled_at ? -1 : 1));
+  const morning = listRoutine('morning', date);
+  const evening = listRoutine('evening', date);
+  return {
+    date,
+    visits,
+    items: listDayItemsForDay(date, today),
+    unsorted: listUnsortedDayItems(today),
+    morning,
+    evening,
+    morning_open: morning.filter((r) => !r.checked).length,
+    evening_open: evening.filter((r) => !r.checked).length,
+  };
+}
+
 // ---- BF-2640-072: one search across the whole database. Case-insensitive
 // substring match on each table's text columns; read-only, never deletes.
 // Desk records and Desk record files come only from what `user` can see.
@@ -3170,6 +3351,21 @@ function extractPdfText(buf, mimeType, filename) {
 
 module.exports = {
   db,
+  ROUTINES,
+  parseDayPriority,
+  createDayItem,
+  getDayItem,
+  setDayItemDay,
+  setDayItemDueDate,
+  setDayItemPriority,
+  setDayItemDone,
+  listDayItemsForDay,
+  listUnsortedDayItems,
+  getRoutineItem,
+  listRoutine,
+  addRoutineItem,
+  setRoutineCheck,
+  todaySummary,
   phonePhotoName,
   createForemanNote,
   listForemanNotes,

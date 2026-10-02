@@ -67,3 +67,7 @@ L1 is the door. L2 is mirroring. L3 is labeling. L4 is implication. L5 through L
 Calendar skeleton, not a ticket yet
 
 BOS is the master for customer visits. The public booking page and Foreman both use one process. Candidate starts are every thirty minutes inside working hours. Away days are work days with a different ZIP set. ZIP rebuild is skipped for now. After BOS writes a scheduled visit, we want a calendar invite to the customer and a calendar invite to Andrew. A phone edit must not rewrite BOS. Routing of back-to-back visits is later.
+
+Handoff after BF-2640-083
+
+Andrew does not want the word Desk. A contact is something Andrew can contact. A car is a car. The command center day page is BF-2640-083. Grocery, projects, vehicles, budget, routing, and mail intake are not built. Complete Sale must place a signature on the contract and on the drawing, and Andrew has not said where. Delete and Sign buttons have been disappearing from screens. Files are not vanishing from disk. Foreman should move, rename, copy, and soft-delete files. Public booking does not write a marketing source. BOS has no phone call log.
