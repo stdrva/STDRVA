@@ -11,7 +11,7 @@ const https = require('https');
 const db = require('../db');
 const sms = require('./sms');
 const email = require('./email');
-const { isValidEmail, fmtNowET, isCalendarDate, normalizePhone, etDateString } = require('../util');
+const { isValidEmail, fmtNowET, isCalendarDate, normalizePhone, etDateString, bosDayString, nextDateString } = require('../util');
 // Shared self-serve / voice booking logic (slot picking, the single createBooking
 // path). Required lazily inside the tools to avoid any load-order surprises.
 function booking() {
@@ -363,6 +363,36 @@ const BASE_TOOLS = [
     },
   },
   {
+    name: 'rename_file',
+    description:
+      "FF-2640-017: rename a customer file. If a different stored file already has that name, BOS flags the clash and changes the new name slightly (for example 'plan (2).pdf') - nothing is overwritten. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true. Tell Andrew the name the file got.",
+    input_schema: {
+      type: 'object',
+      properties: { file_id: { type: 'string' }, new_name: { type: 'string' }, confirmed: { type: 'boolean' } },
+      required: ['file_id', 'new_name'],
+    },
+  },
+  {
+    name: 'copy_file',
+    description:
+      "FF-2640-017: copy a customer file. The copy gets its own bytes on disk and stays on the same customer unless customer_id is given (find_customers first). The copy's name follows the clash rule, so it never has the exact same visible name as the original. A real write: read back first, confirmed:true only after Andrew's yes.",
+    input_schema: {
+      type: 'object',
+      properties: { file_id: { type: 'string' }, customer_id: { type: 'string' }, confirmed: { type: 'boolean' } },
+      required: ['file_id'],
+    },
+  },
+  {
+    name: 'delete_file',
+    description:
+      "FF-2640-017: soft-delete a customer file. The bytes stay on disk and Andrew can restore the file from Deleted Files. Foreman cannot delete a file permanently. A real write: read back first, confirmed:true only after Andrew's yes.",
+    input_schema: {
+      type: 'object',
+      properties: { file_id: { type: 'string' }, confirmed: { type: 'boolean' } },
+      required: ['file_id'],
+    },
+  },
+  {
     name: 'save_file_extraction',
     description:
       "After reading an uploaded file, record what you found on it so it's searchable later. Pass a compact JSON object of the key fields (products and quantities, unit/total pricing, date sold, promised/due dates, customer name/address, invoice number, etc.) plus a plain-text version. This does NOT create any CRM records - it only annotates the file.",
@@ -653,7 +683,7 @@ const BASE_TOOLS = [
   {
     name: 'search_records',
     description:
-      "Search Andrew's Desk records (people who are not sales leads, and things like cars) by words in the name, contact info, notes, categories, tags, and text extracted from uploaded PDFs. Every word must match. Each hit lists matched_in (record, or file: <name>) and files_without_text. Use it for questions like 'which cars have FSD'. Only claim a fact if it appears in matched text - a photo or scan with no extracted text tells you nothing, so never infer a feature from it.",
+      "Search Andrew's contacts (people Andrew can contact, plus older things like cars) by words in the name, contact info, notes, categories, tags, and text extracted from uploaded PDFs. Every word must match. Each hit lists matched_in (record, or file: <name>) and files_without_text. Use it for questions like 'which cars have FSD'. Only claim a fact if it appears in matched text - a photo or scan with no extracted text tells you nothing, so never infer a feature from it.",
     input_schema: {
       type: 'object',
       properties: {
@@ -666,18 +696,18 @@ const BASE_TOOLS = [
   },
   {
     name: 'get_record',
-    description: 'One Desk record in full: contact info, notes, categories, tags, and its files (with whether text was found in each).',
+    description: 'One contact in full: contact info, notes, categories, tags, and its files (with whether text was found in each).',
     input_schema: { type: 'object', properties: { record_id: { type: 'string' } }, required: ['record_id'] },
   },
   {
     name: 'list_records_by_category',
-    description: "Count and list Desk records in one category, e.g. 'how many electricians do I have' -> category 'Electrician'. Returns count and records.",
+    description: "Count and list contacts in one category, e.g. 'how many electricians do I have' -> category 'Electrician'. Returns count and records.",
     input_schema: { type: 'object', properties: { category: { type: 'string' } }, required: ['category'] },
   },
   {
     name: 'create_record',
     description:
-      "Create a Desk record: kind 'person' (a human who is not a sales lead) or 'thing' (a car or any other object). Business and personal can both be true. Categories are free names like Electrician, Accountant, Cars. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
+      "Create a contact (kind 'person'). A car is not a contact, so do not create a 'thing' unless Andrew asks for one. A contact needs at least one of name, phone, email, address, or notes. Marks: is_lead (Business lead or customer), is_personal (Personal contact), is_vendor (Vendor or supplier); more than one is allowed, and is_business is also kept. Categories are free names like Electrician, Accountant, Cars. A real write: call once without confirmed to get the read-back, say it to Andrew, and only after his yes call again with confirmed:true.",
     input_schema: {
       type: 'object',
       properties: {
@@ -685,6 +715,8 @@ const BASE_TOOLS = [
         name: { type: 'string' },
         is_business: { type: 'boolean' },
         is_personal: { type: 'boolean' },
+        is_lead: { type: 'boolean' },
+        is_vendor: { type: 'boolean' },
         phone: { type: 'string' },
         email: { type: 'string' },
         address: { type: 'string' },
@@ -693,13 +725,13 @@ const BASE_TOOLS = [
         tags: { type: 'array', items: { type: 'string' } },
         confirmed: { type: 'boolean' },
       },
-      required: ['kind', 'name'],
+      required: [],
     },
   },
   {
     name: 'update_record',
     description:
-      "Change a Desk record Andrew owns. Pass only the fields that change (categories / tags replace the whole list). Same confirm-before-write rule as create_record: read back first, confirmed:true only after his yes.",
+      "Change a contact Andrew owns. Pass only the fields that change (categories / tags replace the whole list). Same confirm-before-write rule as create_record: read back first, confirmed:true only after his yes.",
     input_schema: {
       type: 'object',
       properties: {
@@ -708,6 +740,8 @@ const BASE_TOOLS = [
         name: { type: 'string' },
         is_business: { type: 'boolean' },
         is_personal: { type: 'boolean' },
+        is_lead: { type: 'boolean' },
+        is_vendor: { type: 'boolean' },
         phone: { type: 'string' },
         email: { type: 'string' },
         address: { type: 'string' },
@@ -810,7 +844,7 @@ const BASE_TOOLS = [
   {
     name: 'save_raw_note',
     description:
-      "BF-2640-076: Foreman is capturing a raw bug or feature note for Andrew, word for word, so Andrew can download the list from Desk later. Use it when Andrew is clearly giving Foreman a note (for example 'note this bug', 'add a feature note', 'write this down for the Architect'). Save the raw text only. Foreman must not invent a BF- name or any other ticket name; the Architect numbers tickets. Foreman must not treat the note as done work or say the fix is made. After saving, read the saved note back to Andrew.",
+      "BF-2640-076: Foreman is capturing a raw bug or feature note for Andrew, word for word, so Andrew can download the list from Contacts later. Use it when Andrew is clearly giving Foreman a note (for example 'note this bug', 'add a feature note', 'write this down for the Architect'). Save the raw text only. Foreman must not invent a BF- name or any other ticket name; the Architect numbers tickets. Foreman must not treat the note as done work or say the fix is made. After saving, read the saved note back to Andrew.",
     input_schema: {
       type: 'object',
       properties: {
@@ -915,6 +949,8 @@ function recordSummary(r) {
     name: r.name,
     business: !!r.is_business,
     personal: !!r.is_personal,
+    lead_or_customer: !!r.is_lead,
+    vendor_or_supplier: !!r.is_vendor,
     phone: r.phone,
     email: r.email,
     address: r.address,
@@ -930,7 +966,9 @@ function recordReadback(f) {
     f.kind ? `${f.kind === 'thing' ? 'Thing' : 'Person'}` : null,
     f.name ? `"${f.name}"` : null,
     f.is_business !== undefined ? `business ${f.is_business ? 'yes' : 'no'}` : null,
-    f.is_personal !== undefined ? `personal ${f.is_personal ? 'yes' : 'no'}` : null,
+    f.is_personal !== undefined ? `personal contact ${f.is_personal ? 'yes' : 'no'}` : null,
+    f.is_lead !== undefined ? `business lead or customer ${f.is_lead ? 'yes' : 'no'}` : null,
+    f.is_vendor !== undefined ? `vendor or supplier ${f.is_vendor ? 'yes' : 'no'}` : null,
     f.phone ? `phone ${f.phone}` : null,
     f.email ? `email ${f.email}` : null,
     f.address ? `address ${f.address}` : null,
@@ -942,7 +980,7 @@ function recordReadback(f) {
     .join('; ');
 }
 function runRecordTool(name, input, user) {
-  const fieldKeys = ['kind', 'name', 'is_business', 'is_personal', 'phone', 'email', 'address', 'notes', 'categories', 'tags'];
+  const fieldKeys = ['kind', 'name', 'is_business', 'is_personal', 'is_lead', 'is_vendor', 'phone', 'email', 'address', 'notes', 'categories', 'tags'];
   const fields = {};
   for (const k of fieldKeys) if (input[k] !== undefined) fields[k] = input[k];
   switch (name) {
@@ -961,8 +999,10 @@ function runRecordTool(name, input, user) {
       return { category: input.category, count: rows.length, records: rows.map(recordSummary) };
     }
     case 'create_record': {
-      if (!['person', 'thing'].includes(input.kind) || !String(input.name || '').trim()) {
-        return { error: "Not created - a record needs kind 'person' or 'thing' and a name." };
+      if (!fields.kind) fields.kind = 'person';
+      if (!['person', 'thing'].includes(fields.kind)) return { error: "Not created - kind must be 'person' or 'thing'." };
+      if (!['name', 'phone', 'email', 'address', 'notes'].some((k) => String(input[k] || '').trim())) {
+        return { error: 'Not created - a contact needs at least a name, a phone, an email, an address, or a note.' };
       }
       const readback = recordReadback(fields);
       if (input.confirmed !== true) return { error: 'Not created yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
@@ -1039,7 +1079,11 @@ function runTool(name, input, ctx = {}) {
     }
     case 'create_appointment': {
       const appointment = db.createAppointment(input);
-      return { appointment };
+      // FF-2640-019: calendar invites to the customer and to Andrew.
+      require('./automations')
+        .sendCalendarInvites(appointment, db.getCustomer(appointment.customer_id))
+        .catch((e) => console.error('calendar invite failed', e));
+      return { appointment, calendar_invites: 'Invite emails with a .ics file go to the customer and to Andrew when email is set up.' };
     }
     case 'update_appointment': {
       const existing = db.getAppointment(input.appointment_id);
@@ -1416,6 +1460,45 @@ function runTool(name, input, ctx = {}) {
       db.setFileAssignment(input.file_id, { customer_id: null, assignment_status: 'needs_review', suggested_customer_id: null });
       return { ok: true, file_id: input.file_id, customer_id: null };
     }
+    // ---- FF-2640-017: file tools ----
+    case 'rename_file': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file || file.deleted_at) return { error: 'File not found' };
+      const wanted = String(input.new_name || '').trim();
+      if (!wanted) return { error: 'Not renamed - give the new name.' };
+      const readback = `Rename "${file.original_name}" to "${wanted}"`;
+      if (input.confirmed !== true) return { error: 'Not renamed yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      const out = db.renameCustomerFile(file.id, wanted, `foreman:${ctx.username || db.defaultUsername()}`);
+      return {
+        ok: true,
+        file_id: file.id,
+        name: out.file.original_name,
+        name_clash: out.clash,
+        note: out.clash ? `A different file named ${wanted} is already stored, so this file was named ${out.file.original_name}. Both files are kept.` : undefined,
+      };
+    }
+    case 'copy_file': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file || file.deleted_at) return { error: 'File not found' };
+      const target = input.customer_id ? db.getCustomer(input.customer_id) : null;
+      if (input.customer_id && !target) return { error: 'Customer not found' };
+      const readback = `Copy "${file.original_name}"${target ? ` to ${target.name}` : ''}`;
+      if (input.confirmed !== true) return { error: 'Not copied yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      try {
+        const copy = db.copyCustomerFile(file.id, { customer_id: target ? target.id : undefined, actor: `foreman:${ctx.username || db.defaultUsername()}` });
+        return { ok: true, file_id: copy.id, name: copy.original_name, customer_id: copy.customer_id };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+    case 'delete_file': {
+      const file = db.getCustomerFile(input.file_id);
+      if (!file || file.deleted_at) return { error: 'File not found' };
+      const readback = `Delete "${file.original_name}" (recoverable from Deleted Files)`;
+      if (input.confirmed !== true) return { error: 'Not deleted yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
+      db.softDeleteCustomerFile(file.id, `foreman:${ctx.username || db.defaultUsername()}`);
+      return { ok: true, file_id: file.id, note: 'Moved to Deleted Files. Andrew can restore it there.' };
+    }
     case 'save_file_extraction': {
       const file = db.getCustomerFile(input.file_id);
       if (!file) return { error: 'File not found' };
@@ -1504,7 +1587,7 @@ function runTool(name, input, ctx = {}) {
     }
     // ---- BF-2640-083: Today ----
     case 'read_today': {
-      const date = isCalendarDate(input.date) ? String(input.date).trim() : etDateString();
+      const date = isCalendarDate(input.date) ? String(input.date).trim() : bosDayString();
       const t = db.todaySummary(date);
       const item = (it) => ({ item_id: it.id, title: it.title, priority: it.priority || null, due_date: it.due_date, overdue: it.overdue, done: it.done });
       const routine = (rows) => rows.map((r) => ({ item_id: r.id, title: r.title, checked: r.checked }));
@@ -1528,7 +1611,7 @@ function runTool(name, input, ctx = {}) {
         return { error: `Not added - ${e.message}.` };
       }
       if (input.due_date && !isCalendarDate(input.due_date)) return { error: 'Not added - the due date must be a real date in YYYY-MM-DD form.' };
-      const today = etDateString();
+      const today = bosDayString();
       const readback = [
         `"${title}"`,
         input.on_today ? `on today (${today})` : 'unsorted',
@@ -1543,7 +1626,7 @@ function runTool(name, input, ctx = {}) {
     }
     case 'check_today_item': {
       const checked = input.checked !== false;
-      const date = isCalendarDate(input.date) ? String(input.date).trim() : etDateString();
+      const date = isCalendarDate(input.date) ? String(input.date).trim() : bosDayString();
       const dayItem = db.getDayItem(input.item_id);
       const routineItem = dayItem ? null : db.getRoutineItem(input.item_id);
       if (!dayItem && !routineItem) return { error: 'Item not found - call read_today for the item ids.' };
@@ -1712,15 +1795,19 @@ gave - never make up a spend, a start date or an end date. The source must alrea
 (check list_marketing). If it doesn't, ask Andrew whether he wants that source created; do
 not create or pick a different one yourself.
 
-Desk records (FF-3926-013): the Desk holds people who are not sales leads (an electrician,
-an accountant) and things (cars and other objects). They are NOT customers - use
-search_records / get_record / list_records_by_category for them, never find_customers. You
-only ever see Andrew's own records plus ones shared with him. "How many electricians do I
+Contacts (FF-2640-016, once called Desk; FF-3926-013): Andrew does not want the word Desk.
+Say Contacts. A contact is something Andrew can contact; a contact does not need a name, a
+phone, an address, and an email - any one is enough. A contact can carry marks, and more than
+one mark is allowed: Business lead or customer (is_lead), Personal contact (is_personal), and
+Vendor or supplier (is_vendor). A car is not a contact; older things such as cars are still
+readable with these same tools, and the vehicle list is on the Lists page. Contacts are NOT
+customers - use search_records / get_record / list_records_by_category for them, never
+find_customers. You only ever see Andrew's own contacts plus ones shared with him. "How many electricians do I
 have" -> list_records_by_category and answer with the count and the names. "Which cars have
 FSD" -> search_records and answer only from matched notes or extracted PDF text; if a car's
 only upload is a photo with no text, say you can't tell from it - never guess. create_record
 and update_record are real writes: read back, wait for his yes, then confirmed:true. There
-is no tool to text or email a Desk record, and you never contact one without his explicit
+is no tool to text or email a contact, and you never contact one without his explicit
 confirmation.
 
 Email compose (BF-2640-078): when Andrew wants an email to a customer with files attached,
@@ -1728,7 +1815,7 @@ or asks you to draft or write an email for him to look over, call fill_email_com
 customer, subject, body, and the ids of files already on that customer. That opens the compose
 window on his screen and sends nothing. Tell him it is filled and waiting for him to press Send
 and confirm. Never say it was sent. Only files already on that customer can be attached; never
-attach Desk record files.
+attach a contact's files.
 
 Offering times (BF-2640-080): before you offer Andrew or a customer any start time, call
 list_available_slots so you read Andrew's existing BOS appointments first. Offer only times
@@ -1744,7 +1831,18 @@ A must-do, B should-do, C could-do, and the number is the order inside the lette
 Foreman notes (BF-2640-076): when Andrew clearly gives you a raw bug or feature note, call
 save_raw_note with his words as he said them, then read the saved note back. Do not give the
 note a BF- name or any ticket name - the Architect numbers tickets. Do not say the note is
-done or fixed; it is a to-do. Andrew downloads the list from Desk.
+done or fixed; it is a to-do. Andrew downloads the list from Contacts.
+
+File tools (FF-2640-017): you can move a file to another customer (move_file_to_customer),
+rename a file (rename_file), copy a file (copy_file), and soft-delete a file (delete_file).
+rename_file, copy_file, and delete_file are real writes: call once without confirmed to get
+the read-back, say it to Andrew, and only after his yes call again with confirmed:true. A
+name that clashes with a different stored file is changed slightly, never overwritten, and
+you tell Andrew the name it got. A soft-deleted file can be restored from Deleted Files.
+
+Day boundary (BF-2640-083): the BOS day runs until 5:00 AM Eastern. From midnight until
+5:00 AM, today is still the date that just ended, so a routine check then lands on that date.
+Tomorrow is the day after that BOS day.
 
 Files: when Andrew uploads a file it has already been saved and its id is given to you in
 the message. Read it, then call save_file_extraction with a compact JSON of the key fields

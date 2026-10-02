@@ -540,57 +540,71 @@ test('FF-3926-012: the repository seeds no records - a fresh clone starts with z
   assert.equal(out.stdout, '0,1', out.stderr);
 });
 
-test('FF-3926-012: Desk sits in its own Menu group directly above the BOS version line', () => {
+// FF-2640-016 renamed Desk to Contacts and BF-2640-083 / FF-2640-015 / FF-2640-020
+// added the Today group (Today, Tomorrow, Lists) above it.
+test('FF-3926-012: Contacts (once Desk) sits in its own Menu group directly above the BOS version line', () => {
   const render = require('../src/render');
   const html = render.dashboardLayout({ title: 'T', active: '/dashboard', body: '<p>x</p>', context: {} });
   const sheet = html.slice(html.indexOf('id="menu-sheet"'), html.indexOf('</script>', html.indexOf('id="menu-sheet"')));
   const titles = [...sheet.matchAll(/menu-group-title">([^<]+)</g)].map((m) => m[1]);
-  assert.deepEqual(titles, ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training', 'Desk']);
-  const desk = sheet.indexOf('href="/dashboard/desk"');
-  assert.ok(desk > sheet.indexOf('menu-group-title">Training<') && desk < sheet.indexOf('class="menu-version"'));
+  assert.deepEqual(titles, ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training', 'Today', 'Contacts']);
+  const contacts = sheet.indexOf('href="/dashboard/contacts"');
+  assert.ok(contacts > sheet.indexOf('menu-group-title">Today<') && contacts < sheet.indexOf('class="menu-version"'));
+  assert.ok(!/>Desk</.test(sheet), 'the Menu does not say Desk');
 });
 
-test('FF-3926-012: the Desk page creates, lists, filters, searches and opens records, and a record file opens', async () => {
-  const r = await srv.post('/dashboard/desk', { kind: 'person', name: 'Sparky Desk Electric', is_business: '1', phone: '804-555-0122', categories: 'Electrician, Contractors', notes: 'Did the panel in 2025' });
+// FF-2640-016: the page is Contacts now. Old /dashboard/desk links still work
+// (a GET is sent on with 302, a POST with 307), and a car is not a contact.
+test('FF-3926-012: the Contacts page creates, lists, filters, searches and opens records, and a record file opens', async () => {
+  const old = await srv.post('/dashboard/desk', { kind: 'person', name: 'Old Link Person' });
+  assert.equal(old.status, 307);
+  assert.equal(old.headers.get('location'), '/dashboard/contacts');
+  const oldGet = await srv.get('/dashboard/desk?f=mine');
+  assert.equal(oldGet.status, 302);
+  assert.equal(oldGet.headers.get('location'), '/dashboard/contacts?f=mine');
+
+  const r = await srv.post('/dashboard/contacts', { kind: 'person', name: 'Sparky Desk Electric', is_business: '1', phone: '804-555-0122', categories: 'Electrician, Contractors', notes: 'Did the panel in 2025' });
   assert.equal(r.status, 302);
   const recUrl = r.headers.get('location').split('?')[0];
   const recId = recUrl.split('/').pop();
-  await srv.post('/dashboard/desk', { kind: 'thing', name: 'Desk Test Car', is_personal: '1', categories: 'Cars' });
+  await srv.post('/dashboard/contacts', { kind: 'person', name: 'Desk Test Friend', is_personal: '1', categories: 'Friends' });
+  await srv.post('/dashboard/contacts', { kind: 'thing', name: 'Desk Test Car', is_personal: '1', categories: 'Cars' });
 
-  const list = async (qs) => (await srv.get('/dashboard/desk' + qs)).text();
+  const list = async (qs) => (await srv.get('/dashboard/contacts' + qs)).text();
   let html = await list('');
+  assert.match(html, /<h1>Contacts<\/h1>/);
   assert.match(html, /Sparky Desk Electric/);
-  assert.match(html, /Desk Test Car/);
-  for (const f of ['all', 'mine', 'business', 'personal']) assert.match(html, new RegExp(`data-desk-filter="${f}"`));
+  assert.ok(!/Desk Test Car/.test(html), 'a car is not a contact');
+  for (const f of ['all', 'mine', 'lead', 'personal', 'vendor', 'business']) assert.match(html, new RegExp(`data-desk-filter="${f}"`));
   assert.match(html, /name="q"/);
   assert.match(html, /<select id="desk-cat" name="cat">/);
   html = await list('?f=business');
-  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Car/.test(html));
+  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Friend/.test(html));
   html = await list('?f=personal');
-  assert.ok(!/Sparky Desk Electric/.test(html) && /Desk Test Car/.test(html));
+  assert.ok(!/Sparky Desk Electric/.test(html) && /Desk Test Friend/.test(html));
   html = await list('?cat=electrician');
-  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Car/.test(html));
+  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Friend/.test(html));
   html = await list('?q=panel');
-  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Car/.test(html));
+  assert.ok(/Sparky Desk Electric/.test(html) && !/Desk Test Friend/.test(html));
   html = await (await srv.get(recUrl)).text();
   assert.match(html, /<h1>Sparky Desk Electric<\/h1>/);
 
   // Attach a file through the same multipart path and open it.
   madeDirs.add(path.join(UPLOADS, '_records', recId));
-  const up = await postMultipart(`/dashboard/desk/${recId}/files`, {}, { data: textPdf('Warranty through 2027'), name: 'warranty.pdf', type: 'application/pdf' });
+  const up = await postMultipart(`/dashboard/contacts/${recId}/files`, {}, { data: textPdf('Warranty through 2027'), name: 'warranty.pdf', type: 'application/pdf' });
   assert.equal(up.status, 302);
   const [f] = db.listRecordFiles(recId);
   assert.match(f.extracted_text, /Warranty through 2027/);
-  const view = await (await srv.get(`/dashboard/desk/${recId}/files/${f.id}/view`)).text();
+  const view = await (await srv.get(`/dashboard/contacts/${recId}/files/${f.id}/view`)).text();
   assert.match(view, /data-viewer-close/);
-  const raw = await srv.get(`/dashboard/desk/${recId}/files/${f.id}`);
+  const raw = await srv.get(`/dashboard/contacts/${recId}/files/${f.id}`);
   assert.equal(raw.status, 200);
   assert.equal(Buffer.from(await raw.arrayBuffer()).subarray(0, 5).toString(), '%PDF-');
   // BF-2640-075 changed this: the Files page lists every file the signed-in user
-  // may see, so the record owner's file is listed and linked to its Desk record.
+  // may see, so the record owner's file is listed and linked to its contact.
   // A user who cannot see the record never gets the file (update-2640-fix.test.js).
   const filesHtml = await (await srv.get('/dashboard/files/results')).text();
-  assert.match(filesHtml, new RegExp(`<a href="/dashboard/desk/${recId}">Desk: Sparky Desk Electric</a>`));
+  assert.match(filesHtml, new RegExp(`<a href="/dashboard/contacts/${recId}">Contact: Sparky Desk Electric</a>`));
 });
 
 test('FF-3926-012: a share cannot cross tenants', () => {

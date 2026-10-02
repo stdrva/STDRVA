@@ -1,8 +1,8 @@
 docs/tickets.md
 
-Format: BF-YYWW-NNN. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Next unused whole name: BF-2640-084.
+Format: BF-YYWW-NNN for bugs and FF-YYWW-NNN for features. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Features use FF- names. Bugs use BF- names. Next unused BF- name: BF-2640-085. Next unused FF- name: FF-2640-021.
 
-Lessons are L1 L2 L3 L4. Do not mint new FF- names. Old FF-3926-* names in CHANGELOG.md are history only.
+Lessons are L1 L2 L3 L4. Old FF-3926-* names in CHANGELOG.md are history.
 
 Always write the full ticket name.
 
@@ -13,6 +13,26 @@ Open
 BF-2640-073 Retired. This was an Architect checklist problem. This is not a BOS job. Do not reuse this name.
 
 BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Code copies the Architect exact files. Claude Code does not rewrite them.
+
+Finished in BOS 1.8.4
+
+These tickets are committed and pushed to main in BOS 1.8.4. Live BOS gets them after Andrew runs Manual Deploy of main on Render.
+
+BF-2640-083 day boundary. Now a new calendar date at midnight starts a new routine day, so Andrew checking an evening item after midnight checks the next day. We want the routine day to run until 5:00 AM Eastern. From midnight until 5:00 AM, Today still shows the day that just ended. Morning checks already made stay on that date. Evening checks before 5:00 AM stay on that date. At 5:00 AM the new date starts unchecked.
+
+BF-2640-084 Missing controls and signature placement. Now Delete and Sign have been disappearing from BOS screens. Files are not vanishing from disk. We want the Delete control back on the file Andrew is viewing, and that Delete is a soft delete Andrew can restore from Deleted Files. We want Sign back. Andrew locked the placement. On the sales contract, put the signature in the signature box. On the drawing, put the signature near the edge of the page. Do not invent a different spot. Do not remove a control that is already on the page.
+
+FF-2640-015 Tomorrow. Now Today shows this date only. We want a button on Today that opens tomorrow's visits from appointments BOS already stored. Tomorrow follows the same 5:00 AM Eastern day boundary.
+
+FF-2640-016 Contacts. Now the Menu says Desk. Andrew does not want that word. We want the Menu label, the page heading, and Foreman to say Contacts. A contact is something Andrew can contact. A contact does not have to have a name and a phone and an address and an email. We want marks on a contact: business lead or customer, personal contact, vendor or supplier, and more than one mark is allowed. We want the Contacts page to filter by those marks. Keep old /dashboard/desk links working. A car is not a contact.
+
+FF-2640-017 Files. We want Foreman and BOS to move a file, rename a file, copy a file, and soft-delete a file. When a new file has the same name as a different file already stored, flag the clash and change the new name slightly. Do not silently overwrite.
+
+FF-2640-018 Booking source. Now public booking creates a customer and does not write a marketing source, except Home Show. We want the book form to ask how they heard, using marketing sources BOS already has, and we want that choice written as the first attribution on that customer.
+
+FF-2640-019 Calendar invite. Now a scheduled visit does not send a calendar invite. We want an invite email to the customer and an invite email to Andrew after BOS writes a scheduled visit, using the email path BOS already has. If BOS has no invite attachment yet, add a simple .ics file. Do not connect iCloud.
+
+FF-2640-020 Lists. We want a grocery list, a project list, and a vehicle list Andrew can add a row to. A vehicle is not a contact. Do not rebuild bookkeeping. Budget stays the bookkeeping Andrew already has.
 
 Finished in BOS 1.8.3
 

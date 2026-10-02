@@ -257,7 +257,73 @@ async function onAppointmentBooked(appt, customer) {
   });
 }
 
+// ---- FF-2640-019: calendar invites ----
+// After BOS writes a scheduled visit, BOS emails a calendar invite to the
+// customer and one to Andrew (OWNER_NOTIFY_EMAIL), over the same Gmail path BOS
+// already uses. Each email carries a simple .ics file. BOS does not connect to
+// iCloud or any calendar account; the .ics is a plain attachment any calendar
+// app can open. Without OWNER_NOTIFY_EMAIL, Andrew's copy is only logged.
+function icsEscape(s) {
+  return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+}
+function icsStamp(d) {
+  return new Date(d).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+function buildVisitIcs(appt, customer) {
+  const start = new Date(appt.scheduled_at);
+  const end = new Date(start.getTime() + (Number(appt.duration_min) || 60) * 60000);
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    `PRODID:-//${icsEscape(BUSINESS_NAME)}//BOS//EN`,
+    'METHOD:PUBLISH',
+    'BEGIN:VEVENT',
+    `UID:${appt.id}@bos`,
+    `DTSTAMP:${icsStamp(Date.now())}`,
+    `DTSTART:${icsStamp(start)}`,
+    `DTEND:${icsStamp(end)}`,
+    `SUMMARY:${icsEscape(`${appt.type} - ${BUSINESS_NAME}${customer && customer.name ? ` - ${customer.name}` : ''}`)}`,
+    customer && customer.address ? `LOCATION:${icsEscape(customer.address)}` : null,
+    `DESCRIPTION:${icsEscape(`${appt.type} with ${BUSINESS_NAME}. Questions? Call ${BUSINESS_PHONE}.`)}`,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].filter(Boolean);
+  return lines.join('\r\n') + '\r\n';
+}
+async function sendCalendarInvites(appt, customer) {
+  if (!appt || (appt.status && appt.status !== 'scheduled')) return {};
+  const ics = buildVisitIcs(appt, customer);
+  const attachments = [{ filename: 'visit.ics', content: ics, contentType: 'text/calendar; charset=utf-8' }];
+  const when = etWhenLine(appt.scheduled_at);
+  const results = {};
+  if (customer && customer.email) {
+    results.customer = await sendEmail({
+      to: customer.email,
+      subject: `Calendar invite: ${appt.type}, ${when}`,
+      html: `<p>Hi ${htmlEsc((customer.name || '').split(' ')[0] || 'there')},</p><p>Here is a calendar invite for your ${htmlEsc(appt.type)} on ${when}${customer.address ? ` at ${htmlEsc(customer.address)}` : ''}. Open the attached visit.ics file to add it to your calendar.</p><p>Andrew<br>${BUSINESS_NAME}</p>`,
+      customer_id: customer.id,
+      logMessage: db.logMessage,
+      attachments,
+    });
+  }
+  const ownerEmail = process.env.OWNER_NOTIFY_EMAIL;
+  if (ownerEmail) {
+    results.owner = await sendEmail({
+      to: ownerEmail,
+      subject: `Calendar invite: ${appt.type} with ${(customer && customer.name) || 'a customer'}, ${when}`,
+      html: `<p>${htmlEsc(appt.type)} with ${htmlEsc((customer && customer.name) || 'a customer')} on ${when}${customer && customer.address ? ` at ${htmlEsc(customer.address)}` : ''}. The visit.ics file adds it to your calendar.</p>`,
+      logMessage: db.logMessage,
+      attachments,
+    });
+  } else {
+    console.log(`[Calendar invite - OWNER_NOTIFY_EMAIL not set] Would email Andrew an invite for ${appt.type} on ${when}`);
+  }
+  return results;
+}
+
 module.exports = {
+  buildVisitIcs,
+  sendCalendarInvites,
   onLeadCreated,
   onJobCreated,
   onJobStatusChanged,

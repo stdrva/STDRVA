@@ -144,7 +144,7 @@ test('BF-2640-072: Search finds the word test across customers, jobs, appointmen
   assert.match(html, new RegExp(`<a href="/dashboard/customers/${c.id}">Testerson Search 072</a>`));
   assert.match(html, new RegExp(`<a href="/dashboard/jobs/${jobId}">`));
   assert.match(html, new RegExp(`<a href="/dashboard/appointments/${apptId}/edit">`));
-  assert.match(html, new RegExp(`<a href="/dashboard/desk/${rec.id}">Test Car 072</a>`));
+  assert.match(html, new RegExp(`<a href="/dashboard/contacts/${rec.id}">Test Car 072</a>`));
   assert.match(html, new RegExp(`<a href="/dashboard/customers/${c.id}/files/${fileId}/view">quote-072\\.pdf</a>`));
   assert.match(html, /Next action: Call back about the test sample/);
   assert.match(html, /Foreman note: Bug: test the Search page/);
@@ -190,7 +190,7 @@ test('BF-2640-075: Files lists every visible file twenty per page, each row with
   const deskRow = all.find((f) => f.kind === 'record');
   assert.equal(deskRow.record_name, 'Desk Truck 075');
   const both = (await (await srv.get('/dashboard/files/results?q=page075-title')).text());
-  assert.match(both, new RegExp(`<a href="/dashboard/desk/${rec.id}">Desk: Desk Truck 075</a>`));
+  assert.match(both, new RegExp(`<a href="/dashboard/contacts/${rec.id}">Contact: Desk Truck 075</a>`));
   // A user who cannot see that Desk record never gets its file.
   const stranger = db.ensureUser('stranger-075');
   assert.ok(!db.listAllVisibleFiles(stranger, 'page075').some((f) => f.kind === 'record'));

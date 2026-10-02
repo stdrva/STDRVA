@@ -120,9 +120,11 @@ const MENU_GROUPS = [
     ],
   },
   { title: 'Training', items: [['/dashboard/training', 'Training']] },
-  // FF-3926-012: the record store, directly above the BOS version line.
-  // BF-2640-083: Today, the day page, sits in this same command-center group.
-  { title: 'Desk', items: [['/dashboard/today', 'Today'], ['/dashboard/desk', 'Desk']] },
+  // BF-2640-083: Today, the day page. FF-2640-015: Tomorrow. FF-2640-020: Lists.
+  { title: 'Today', items: [['/dashboard/today', 'Today'], ['/dashboard/tomorrow', 'Tomorrow'], ['/dashboard/lists', 'Lists']] },
+  // FF-3926-012 record store, called Contacts since FF-2640-016. Directly above
+  // the BOS version line. Old /dashboard/desk links still open it.
+  { title: 'Contacts', items: [['/dashboard/contacts', 'Contacts']] },
 ];
 
 // BF-2639-055: the Menu toggles show three horizontal lines, not the word.

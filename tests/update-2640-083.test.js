@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const { db } = require('./helpers');
 const { startServer } = require('./http-helper');
 const assistant = require('../src/services/assistant');
-const { etDateString } = require('../src/util');
+const { bosDayString } = require('../src/util');
 
 let srv;
 test.before(async () => {
@@ -16,7 +16,7 @@ test.after(async () => {
   if (srv) await srv.stop();
 });
 
-const TODAY = etDateString();
+const TODAY = bosDayString();
 const nextDate = (d) => new Date(new Date(`${d}T12:00:00.000Z`).getTime() + 86400000).toISOString().slice(0, 10);
 const prevDate = (d) => new Date(new Date(`${d}T12:00:00.000Z`).getTime() - 86400000).toISOString().slice(0, 10);
 const takeMeds = () => db.listRoutine('morning', TODAY).find((r) => r.title === 'Take meds');
@@ -37,7 +37,7 @@ test('BF-2640-083: Today contains Take meds, and the Menu links to Today', async
 });
 
 test('BF-2640-083: a checked morning item is stored on that date, and the next date starts unchecked', async () => {
-  const thursday = '2026-10-01';
+  const thursday = '2026-01-15';
   const meds = db.listRoutine('morning', thursday).find((r) => r.title === 'Take meds');
   const res = await srv.post(`/dashboard/today/routine/${meds.id}/check`, { date: thursday, checked: '1' });
   assert.equal(res.status, 302);

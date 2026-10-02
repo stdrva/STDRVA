@@ -95,6 +95,20 @@ function etDateString(date = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 }
 
+// BF-2640-083 day boundary: the BOS day (Today, routine checks, Tomorrow) runs
+// until 5:00 AM Eastern. From midnight until 5:00 AM it is still the date that
+// just ended; at 5:00 AM the new date starts. Shifting the instant back five
+// hours and taking its Eastern calendar date does that. (On the two nights a
+// year the clocks change, the switch can land an hour off.)
+const BOS_DAY_START_HOUR = 5;
+function bosDayString(date = new Date()) {
+  return etDateString(new Date(new Date(date).getTime() - BOS_DAY_START_HOUR * 3600000));
+}
+// The calendar date one day after a YYYY-MM-DD date.
+function nextDateString(day) {
+  return new Date(new Date(`${day}T12:00:00.000Z`).getTime() + 86400000).toISOString().slice(0, 10);
+}
+
 // A calendar-date <input type="date"> value ("2026-09-25") -> a due timestamp.
 // new Date("2026-09-25") is midnight UTC, i.e. 8pm ET the evening BEFORE, so a
 // snoozed-to date would show a day early. Noon UTC is the same calendar day in
@@ -230,6 +244,9 @@ module.exports = {
   dateInputToIso,
   isCalendarDate,
   etDateString,
+  bosDayString,
+  nextDateString,
+  BOS_DAY_START_HOUR,
   humanizeActivityValue,
   fmtRelativeDue,
   nowIso,

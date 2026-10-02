@@ -121,10 +121,11 @@ test('BF-2640-076: Foreman saves raw notes and Andrew downloads them from Desk, 
   const bodies = db.listForemanNotes().map((n) => n.body);
   assert.deepEqual(bodies, ['Feature: let me print a job sheet.', 'Bug: the Pipeline page jumps when I scroll.']);
 
-  const desk = await (await srv.get('/dashboard/desk')).text();
-  assert.match(desk, /href="\/dashboard\/desk\/foreman-notes"[^>]*>Download Foreman notes</);
+  const desk = await (await srv.get('/dashboard/contacts')).text();
+  // FF-2640-016: Desk is called Contacts now; the download button moved with it.
+  assert.match(desk, /href="\/dashboard\/contacts\/foreman-notes"[^>]*>Download Foreman notes</);
 
-  const dl = await srv.get('/dashboard/desk/foreman-notes');
+  const dl = await srv.get('/dashboard/contacts/foreman-notes');
   assert.equal(dl.status, 200);
   assert.match(dl.headers.get('content-disposition'), /attachment; filename="foreman-notes\.txt"/);
   assert.match(dl.headers.get('content-type'), /^text\/plain/);

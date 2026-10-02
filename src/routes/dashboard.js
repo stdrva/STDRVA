@@ -10,6 +10,8 @@ const {
   fmtDateTime,
   dateInputToIso,
   etDateString,
+  bosDayString,
+  nextDateString,
   isCalendarDate,
   isValidEmail,
   fmtRelativeDue,
@@ -23,6 +25,7 @@ const automations = require('../services/automations');
 const assistant = require('../services/assistant');
 const sms = require('../services/sms');
 const email = require('../services/email');
+const signature = require('../services/signature');
 
 // Who's making this change - for the activity log. Session middleware sets
 // req.authUser; assistant calls pass their own actor directly to db.*.
@@ -105,6 +108,41 @@ function fileViewerBody({ f, rawUrl, closeUrl, prevUrl, nextUrl, missing, extraH
     </script>`;
 }
 
+// BF-2640-084 / FF-2640-017: the controls on the file Andrew is viewing. Delete
+// is the soft delete (restore from Deleted Files). Sign opens the signing page
+// for an image. Rename, Copy, and Move change only this file; a clashing name
+// is changed slightly, never overwritten.
+function fileToolsHtml(c, f, returnTo) {
+  const isImg = (f.mime_type || '').startsWith('image/');
+  const base = `/dashboard/customers/${c.id}/files/${f.id}`;
+  const customers = db.listCustomers().filter((x) => x.id !== c.id);
+  return `
+    <div class="panel" id="file-tools">
+      <h2 style="margin-top:0">File tools</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        ${
+          isImg
+            ? `<a class="btn small secondary" href="${base}/sign" data-file-sign>Sign</a>`
+            : `<span class="subtitle" data-file-sign-note>Sign places a signature on a photo or image of a page. BOS cannot place a signature inside a PDF yet.</span>`
+        }
+        <form class="inline" method="POST" action="${base}/delete"><button class="btn small warn" type="submit" data-file-delete title="Recoverable - restore from Deleted Files">Delete</button></form>
+        <form class="inline" method="POST" action="${base}/copy"><button class="btn small secondary" type="submit" data-file-copy>Copy</button></form>
+      </div>
+      <form method="POST" action="${base}/rename" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+        <div style="flex:1 1 200px"><label>Rename</label><input type="text" name="name" value="${escapeHtml(f.original_name || '')}" required></div>
+        <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">
+        <button class="btn small secondary" type="submit" data-file-rename>Rename</button>
+      </form>
+      <form method="POST" action="${base}/move" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+        <div style="flex:1 1 200px"><label>Move to customer</label><select name="customer_id" required><option value="">Pick a customer…</option>${customers
+          .map((x) => `<option value="${x.id}">${escapeHtml(x.name)}</option>`)
+          .join('')}</select></div>
+        <button class="btn small secondary" type="submit" data-file-move>Move</button>
+      </form>
+      <p class="subtitle" style="margin-top:8px">Delete is recoverable. Find the file under <a href="/dashboard/files/deleted">Deleted Files</a> and press Restore.</p>
+    </div>`;
+}
+
 // BF-2640-078: canned notes for the compose window. BOS had no warranty or
 // referral wording yet, so these are two short labeled snippets - plain notes,
 // not legal warranty terms.
@@ -176,13 +214,13 @@ function filesResultsHtml(q, { page = 1, user } = {}) {
   const back = `/dashboard/files${qs(p)}`;
   const openHref = (f) =>
     f.kind === 'record'
-      ? `/dashboard/desk/${f.record_id}/files/${f.id}/view`
+      ? `/dashboard/contacts/${f.record_id}/files/${f.id}/view`
       : f.customer_id
         ? `/dashboard/customers/${f.customer_id}/files/${f.id}/view?return_to=${encodeURIComponent(back)}`
         : `/dashboard/files/${f.id}/review`;
   const linkedTo = (f) =>
     f.kind === 'record'
-      ? `<a href="/dashboard/desk/${f.record_id}">Desk: ${escapeHtml(f.record_name || '')}</a>`
+      ? `<a href="/dashboard/contacts/${f.record_id}">Contact: ${escapeHtml(f.record_name || '')}</a>`
       : f.customer_id
         ? `<a href="/dashboard/customers/${f.customer_id}">${escapeHtml(f.customer_name || '')}</a>${f.job_id ? ` · <a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}`
         : `<a href="/dashboard/files/${f.id}/review">Needs review</a>`;
@@ -669,7 +707,7 @@ function register(router, requireAuth) {
              ? `<div class="table-scroll"><table class="files-table" style="margin-top:12px"><tr><th>File</th><th>Note</th><th>Job</th><th>Uploaded</th><th></th></tr>${files
                  .map(
                    (f) => `<tr id="file-${f.id}">
-                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}</td>
+                     <td><a href="/dashboard/customers/${c.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a>${f.extraction_status === 'done' ? ' <span class="badge">indexed</span>' : ''}${f.name_clash_of ? ` <span class="badge" data-name-clash title="A different file named ${escapeHtml(f.name_clash_of)} was already stored">renamed: name clash</span>` : ''}</td>
                      <td>${escapeHtml(f.note || '')}</td>
                      <td>${f.job_id ? `<a href="/dashboard/jobs/${f.job_id}">${escapeHtml(f.job_status || 'job')}</a>` : ''}</td>
                      <td>${fmtDate(f.created_at)}</td>
@@ -867,13 +905,19 @@ function register(router, requireAuth) {
       const job = db.getJob(jobId);
       if (!job || job.customer_id !== c.id) jobId = null;
     }
+    let savedId;
     try {
-      saveUpload({ customer_id: c.id, job_id: jobId, upload, note: req.body.note || null });
+      savedId = saveUpload({ customer_id: c.id, job_id: jobId, upload, note: req.body.note || null });
     } catch (e) {
       console.error('[files] customer upload failed:', e);
       return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
     }
-    res.redirect(`/dashboard/customers/${c.id}?ok=File uploaded`);
+    // FF-2640-017: say so when the name clashed and the new file was renamed.
+    const saved = db.getCustomerFile(savedId);
+    const okMsg = saved && saved.name_clash_of
+      ? `File uploaded. A different file named ${saved.name_clash_of} is already stored, so this one was saved as ${saved.original_name}. Both files are kept.`
+      : 'File uploaded';
+    res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent(okMsg)}`);
   });
 
   router.get('/dashboard/customers/:id/files/:fileId', requireAuth, (req, res) => {
@@ -924,10 +968,11 @@ function register(router, requireAuth) {
       missing,
       extraHtml:
         `<p class="subtitle">${escapeHtml(c.name)} · file ${idx + 1} of ${all.length}${f.note ? ' · ' + escapeHtml(f.note) : ''}</p>` +
-        (embed ? emailPreviewExtra(f) : ''),
+        (f.name_clash_of ? `<p class="msg" data-name-clash>A different file named ${escapeHtml(f.name_clash_of)} was already stored, so this file was saved as ${escapeHtml(f.original_name)}.</p>` : '') +
+        (embed ? emailPreviewExtra(f) : fileToolsHtml(c, f, closeUrl)),
     });
     if (embed) return res.status(missing ? 404 : 200).send(embedPage(f.original_name, body));
-    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/customers', body }));
+    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/customers', body, flash: flashFromQuery(req.query) }));
   });
 
   // Bytes for any live file by id - used where there is no customer yet (the
@@ -985,6 +1030,45 @@ function register(router, requireAuth) {
     res.redirect(`/dashboard/customers/${req.params.id}?ok=File moved to Deleted Files (recoverable)`);
   });
 
+  // FF-2640-017: rename, copy, and move one file. Nothing is overwritten.
+  const ownFile = (req) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    return f && !f.deleted_at && f.customer_id === req.params.id ? f : null;
+  };
+  router.post('/dashboard/customers/:id/files/:fileId/rename', requireAuth, (req, res) => {
+    const f = ownFile(req);
+    if (!f) return res.status(404).send('File not found');
+    const view = `/dashboard/customers/${f.customer_id}/files/${f.id}/view`;
+    try {
+      const out = db.renameCustomerFile(f.id, req.body.name, actorOf(req));
+      const msg = out.clash
+        ? `A different file named ${out.asked_for} is already stored, so this file was renamed ${out.file.original_name}.`
+        : `Renamed to ${out.file.original_name}`;
+      res.redirect(`${view}?ok=${encodeURIComponent(msg)}`);
+    } catch (e) {
+      res.redirect(`${view}?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+  router.post('/dashboard/customers/:id/files/:fileId/copy', requireAuth, (req, res) => {
+    const f = ownFile(req);
+    if (!f) return res.status(404).send('File not found');
+    try {
+      const copy = db.copyCustomerFile(f.id, { actor: actorOf(req) });
+      res.redirect(`/dashboard/customers/${copy.customer_id}/files/${copy.id}/view?ok=${encodeURIComponent(`Copied as ${copy.original_name}`)}`);
+    } catch (e) {
+      res.redirect(`/dashboard/customers/${f.customer_id}/files/${f.id}/view?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+  router.post('/dashboard/customers/:id/files/:fileId/move', requireAuth, (req, res) => {
+    const f = ownFile(req);
+    if (!f) return res.status(404).send('File not found');
+    const to = db.getCustomer(req.body.customer_id);
+    if (!to) return res.redirect(`/dashboard/customers/${f.customer_id}/files/${f.id}/view?err=${encodeURIComponent('Pick a customer to move the file to')}`);
+    db.setFileAssignment(f.id, { customer_id: to.id, assignment_status: 'confirmed' });
+    db.logActivity({ entity_type: 'file', entity_id: f.id, customer_id: to.id, field: 'moved_from_customer', old_value: f.customer_id, new_value: to.id, actor: actorOf(req) });
+    res.redirect(`/dashboard/customers/${to.id}/files/${f.id}/view?ok=${encodeURIComponent(`Moved to ${to.name}`)}`);
+  });
+
   // ---------- Deleted files: recover or permanently purge ----------
   router.get('/dashboard/files/deleted', requireAuth, (req, res) => {
     const deleted = db.listDeletedFiles();
@@ -1033,99 +1117,127 @@ function register(router, requireAuth) {
     res.redirect('/dashboard/files/deleted?ok=File permanently deleted');
   });
 
-  // ---------- Sign a drawing/photo (e.g. "sign the measure drawing") ----------
-  // Draws a free-hand signature on top of an existing image file and saves
-  // the result as a NEW file (the original stays untouched). Not a legal
-  // e-signature system - for actual contracts, keep using DocuSign and
-  // upload the signed PDF via the regular file upload above.
+  // ---------- Sign a contract or a drawing ----------
+  // BF-2640-084: Andrew locked the placement (src/services/signature.js). On
+  // the sales contract the signature goes in the signature box, which Andrew
+  // marks on the page. On the drawing the signature goes near the edge of the
+  // page, a small margin in from the bottom-right corner. The signature is drawn
+  // on its own pad, then fitted into that spot, and the result is saved as a
+  // NEW file; the original is kept untouched. Not a legal e-signature service.
   router.get('/dashboard/customers/:id/files/:fileId/sign', requireAuth, (req, res) => {
     const c = db.getCustomer(req.params.id);
     const f = db.getCustomerFile(req.params.fileId);
     if (!c || !f || f.customer_id !== c.id) return res.status(404).send('File not found');
     if (!(f.mime_type || '').startsWith('image/')) return res.status(400).send('Only image files can be signed');
+    const kind = ['contract', 'drawing'].includes(req.query.kind) ? req.query.kind : signature.signatureKindForName(f.original_name);
+    const cfg = JSON.stringify({ kind, img: `/dashboard/customers/${c.id}/files/${f.id}`, post: `/dashboard/customers/${c.id}/files/${f.id}/sign`, done: `/dashboard/customers/${c.id}` }).replace(/</g, '\\u003c');
 
     const body = `
       ${backLink(`/dashboard/customers/${c.id}`, 'Cancel — back to customer, nothing saved')}
       <h1>Sign: ${escapeHtml(f.original_name)}</h1>
-      <p class="subtitle">Draw a signature on top of the image below, then save. This creates a NEW file - the original is kept untouched. Cancel any time; nothing is saved until you press "Save signed copy".</p>
+      <p class="subtitle">This creates a NEW signed file. The original is kept untouched, and nothing is saved until you press Save signed copy.</p>
       <div class="panel">
-        <canvas id="sign-canvas" style="max-width:100%;border:1px solid var(--line);touch-action:none;cursor:crosshair;display:block"></canvas>
+        <h2 style="margin-top:0">1. What is this page?</h2>
+        <label class="check" style="display:inline-flex;align-items:center;gap:8px;margin-right:16px"><input type="radio" name="sign-kind" value="contract" style="width:auto" ${kind === 'contract' ? 'checked' : ''}> Sales contract: the signature goes in the signature box</label>
+        <label class="check" style="display:inline-flex;align-items:center;gap:8px"><input type="radio" name="sign-kind" value="drawing" style="width:auto" ${kind === 'drawing' ? 'checked' : ''}> Drawing: the signature goes near the edge of the page</label>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">2. Sign here</h2>
+        <canvas id="sign-pad" width="480" height="160" style="max-width:100%;border:1px solid var(--line);touch-action:none;cursor:crosshair;display:block;background:#fff"></canvas>
+        <button class="btn secondary small" type="button" id="sign-clear" style="margin-top:8px">Clear signature</button>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">3. Check the spot</h2>
+        <p class="subtitle" id="sign-hint"></p>
+        <canvas id="sign-canvas" data-sign-target="${kind === 'contract' ? 'signature_box' : 'page_edge'}" style="max-width:100%;border:1px solid var(--line);touch-action:none;display:block"></canvas>
         <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn" type="button" id="sign-save">Save signed copy</button>
-          <button class="btn secondary" type="button" id="sign-clear">Clear drawing</button>
           <a class="btn secondary" href="/dashboard/customers/${c.id}">Cancel</a>
         </div>
         <p id="sign-status" class="subtitle" style="margin-top:8px"></p>
       </div>
       <script>
       (function () {
-        var canvas = document.getElementById('sign-canvas');
-        var ctx = canvas.getContext('2d');
-        var img = new Image();
-        var drawing = false;
-        var last = null;
+        var CFG = ${cfg};
+        var signaturePlacement = ${signature.signaturePlacement.toString()};
+        var pad = document.getElementById('sign-pad'), pctx = pad.getContext('2d');
+        var canvas = document.getElementById('sign-canvas'), ctx = canvas.getContext('2d');
+        var hint = document.getElementById('sign-hint'), status = document.getElementById('sign-status');
+        var img = new Image(), kind = CFG.kind, box = null, inked = false, drag = null;
 
-        img.onload = function () {
-          var maxW = Math.min(800, img.width);
-          var scale = maxW / img.width;
-          canvas.width = maxW;
-          canvas.height = img.height * scale;
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        };
-        img.src = '/dashboard/customers/${c.id}/files/${f.id}';
-
-        function posFromEvent(e) {
-          var rect = canvas.getBoundingClientRect();
-          var point = e.touches ? e.touches[0] : e;
-          return {
-            x: (point.clientX - rect.left) * (canvas.width / rect.width),
-            y: (point.clientY - rect.top) * (canvas.height / rect.height),
-          };
+        function pos(el, e) {
+          var r = el.getBoundingClientRect();
+          return { x: (e.clientX - r.left) * (el.width / r.width), y: (e.clientY - r.top) * (el.height / r.height) };
         }
-        function start(e) { e.preventDefault(); drawing = true; last = posFromEvent(e); }
-        function move(e) {
-          if (!drawing) return;
-          e.preventDefault();
-          var p = posFromEvent(e);
-          ctx.strokeStyle = '#2A4D3A';
-          ctx.lineWidth = 2.5;
-          ctx.lineCap = 'round';
-          ctx.beginPath();
-          ctx.moveTo(last.x, last.y);
-          ctx.lineTo(p.x, p.y);
-          ctx.stroke();
-          last = p;
-        }
-        function end() { drawing = false; }
-
-        canvas.addEventListener('mousedown', start);
-        canvas.addEventListener('mousemove', move);
-        window.addEventListener('mouseup', end);
-        canvas.addEventListener('touchstart', start);
-        canvas.addEventListener('touchmove', move);
-        canvas.addEventListener('touchend', end);
-
-        document.getElementById('sign-clear').addEventListener('click', function () {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        // Signature pad.
+        var down = false, last = null;
+        pctx.strokeStyle = '#1a1a1a'; pctx.lineWidth = 3; pctx.lineCap = 'round'; pctx.lineJoin = 'round';
+        pad.addEventListener('pointerdown', function (e) { e.preventDefault(); pad.setPointerCapture(e.pointerId); down = true; last = pos(pad, e); });
+        pad.addEventListener('pointermove', function (e) {
+          if (!down) return; e.preventDefault();
+          var p = pos(pad, e); pctx.beginPath(); pctx.moveTo(last.x, last.y); pctx.lineTo(p.x, p.y); pctx.stroke(); last = p; inked = true; render();
         });
+        pad.addEventListener('pointerup', function () { down = false; });
+        document.getElementById('sign-clear').addEventListener('click', function () { pctx.clearRect(0, 0, pad.width, pad.height); inked = false; render(); });
+
+        // The inked part of the pad, so empty pad space does not shrink the signature.
+        function inkBounds() {
+          var d = pctx.getImageData(0, 0, pad.width, pad.height).data, x0 = pad.width, y0 = pad.height, x1 = -1, y1 = -1;
+          for (var y = 0; y < pad.height; y++) for (var x = 0; x < pad.width; x++) if (d[(y * pad.width + x) * 4 + 3] > 0) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+          return x1 < 0 ? null : { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+        }
+        function place() { return signaturePlacement(kind, { width: canvas.width, height: canvas.height }, box); }
+        function render(withOutline) {
+          if (!img.complete || !canvas.width) return;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          var p = place();
+          hint.textContent = kind === 'contract'
+            ? (box ? 'The signature goes in the signature box you marked. Drag again to mark it again.' : 'Drag a rectangle over the signature box on the contract.')
+            : 'The signature goes near the edge of the page, in the bottom-right corner.';
+          if (p.error) return;
+          var ink = inked && inkBounds();
+          if (ink) {
+            var s = Math.min(p.w / ink.w, p.h / ink.h);
+            var w = ink.w * s, h = ink.h * s;
+            ctx.drawImage(pad, ink.x, ink.y, ink.w, ink.h, p.x + (p.w - w) / 2, p.y + (p.h - h) / 2, w, h);
+          }
+          if (withOutline !== false) { ctx.save(); ctx.strokeStyle = '#2A4D3A'; ctx.setLineDash([6, 4]); ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.restore(); }
+        }
+        img.onload = function () {
+          var scale = Math.min(1, 1400 / img.width);
+          canvas.width = Math.round(img.width * scale); canvas.height = Math.round(img.height * scale);
+          render();
+        };
+        img.src = CFG.img;
+
+        document.querySelectorAll('input[name="sign-kind"]').forEach(function (r) {
+          r.addEventListener('change', function () { kind = r.value; canvas.setAttribute('data-sign-target', kind === 'contract' ? 'signature_box' : 'page_edge'); render(); });
+        });
+        // Contract: Andrew marks the signature box by dragging over it.
+        canvas.addEventListener('pointerdown', function (e) { if (kind !== 'contract') return; e.preventDefault(); canvas.setPointerCapture(e.pointerId); drag = pos(canvas, e); });
+        canvas.addEventListener('pointermove', function (e) {
+          if (!drag) return; var p = pos(canvas, e);
+          box = { x: Math.min(drag.x, p.x), y: Math.min(drag.y, p.y), w: Math.abs(p.x - drag.x), h: Math.abs(p.y - drag.y) }; render();
+        });
+        canvas.addEventListener('pointerup', function () { drag = null; if (box && (box.w < 8 || box.h < 8)) box = null; render(); });
 
         document.getElementById('sign-save').addEventListener('click', function () {
-          var status = document.getElementById('sign-status');
+          if (!inked) { status.textContent = 'Sign on the pad first.'; return; }
+          var p = place();
+          if (p.error) { status.textContent = p.error; return; }
+          render(false);
           status.textContent = 'Saving...';
-          fetch('/dashboard/customers/${c.id}/files/${f.id}/sign', {
+          fetch(CFG.post, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ data_url: canvas.toDataURL('image/png') }),
+            body: JSON.stringify({ data_url: canvas.toDataURL('image/png'), kind: kind, placement: p, page: { width: canvas.width, height: canvas.height } }),
           })
             .then(function (r) { return r.json(); })
             .then(function (data) {
-              if (data.ok) {
-                window.location.href = '/dashboard/customers/${c.id}?ok=Signed copy saved';
-              } else {
-                status.textContent = data.error || 'Something went wrong saving.';
-              }
+              if (data.ok) window.location.href = CFG.done + '?ok=' + encodeURIComponent(data.message || 'Signed copy saved');
+              else { status.textContent = data.error || 'Something went wrong saving.'; render(); }
             })
-            .catch(function () { status.textContent = 'Something went wrong saving.'; });
+            .catch(function () { status.textContent = 'Something went wrong saving.'; render(); });
         });
       })();
       </script>
@@ -1141,6 +1253,19 @@ function register(router, requireAuth) {
     }
     const match = /^data:image\/png;base64,(.+)$/.exec(req.body.data_url || '');
     if (!match) return res.status(400).json({ ok: false, error: 'No signature data received' });
+    // BF-2640-084: the spot must be the locked one for that kind of page.
+    const kind = req.body.kind;
+    let where = '';
+    if (kind) {
+      const target = signature.SIGNATURE_TARGETS[kind];
+      if (!target) return res.status(400).json({ ok: false, error: 'Choose Sales contract or Drawing first.' });
+      const want = signature.signaturePlacement(kind, req.body.page || {}, kind === 'contract' ? req.body.placement : null);
+      if (want.error) return res.status(400).json({ ok: false, error: want.error });
+      if (!req.body.placement || req.body.placement.target !== target.target) {
+        return res.status(400).json({ ok: false, error: `The signature on a ${kind === 'contract' ? 'sales contract' : 'drawing'} goes ${target.label}.` });
+      }
+      where = ` The signature is ${target.label}.`;
+    }
 
     const buffer = Buffer.from(match[1], 'base64');
     const storedName = `${newId()}.png`;
@@ -1152,7 +1277,7 @@ function register(router, requireAuth) {
       original_name: `signed-${original.original_name.replace(/\.[^.]+$/, '')}.png`,
       mime_type: 'image/png',
       size: buffer.length,
-      note: `Signed copy of "${original.original_name}"`,
+      note: `Signed copy of "${original.original_name}".${where}`,
     });
     db.logActivity({
       entity_type: 'file',
@@ -1162,7 +1287,7 @@ function register(router, requireAuth) {
       new_value: original.original_name,
       actor: actorOf(req),
     });
-    res.json({ ok: true });
+    res.json({ ok: true, file_id: fileId, message: `Signed copy saved.${where}` });
   });
 
   // ---------- Sale packet (spec 034) ----------
@@ -2179,7 +2304,14 @@ function register(router, requireAuth) {
     const returnTo = req.body.return_to || '/dashboard/appointments';
     if (!customer_id || !scheduled_at) return res.redirect(`${returnTo}?err=Customer and time are required`);
     const iso = new Date(scheduled_at).toISOString();
-    db.createAppointment({ customer_id, type, scheduled_at: iso, duration_min: Number(duration_min) || 60, notes, created_by: actorOf(req) });
+    const appt = db.createAppointment({ customer_id, type, scheduled_at: iso, duration_min: Number(duration_min) || 60, notes, created_by: actorOf(req) });
+    // FF-2640-019: calendar invites to the customer and to Andrew. A failed
+    // send is logged and never blocks the booking.
+    try {
+      await automations.sendCalendarInvites(appt, db.getCustomer(customer_id));
+    } catch (e) {
+      console.error('calendar invite failed', e);
+    }
     // A design appointment being set advances the KPI stage (if it isn't already past it).
     if (/design|consultation/i.test(type || '')) {
       const c = db.getCustomer(customer_id);
@@ -2549,7 +2681,7 @@ function register(router, requireAuth) {
     const total = Object.values(hits).reduce((n, list) => n + list.length, 0);
     const body = `
       <h1>Search</h1>
-      <p class="subtitle">Search the whole BOS database: customers, jobs, appointments, Desk records, files, and notes. Nothing on this page deletes anything.</p>
+      <p class="subtitle">Search the whole BOS database: customers, jobs, appointments, contacts, files, and notes. Nothing on this page deletes anything.</p>
       <form method="GET" action="/dashboard/search" class="panel" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
         <div style="flex:1 1 220px"><label for="search-q">Search for</label><input type="search" id="search-q" name="q" value="${escapeHtml(q)}" placeholder="a word such as test" autofocus></div>
         <button class="btn" type="submit">Search</button>
@@ -2560,10 +2692,10 @@ function register(router, requireAuth) {
             ${group('customers', 'Customers', hits.customers, (c) => `${cust(c.id, c.name)} <span class="subtitle">${escapeHtml([c.phone ? phone(c.phone) : '', c.email || ''].filter(Boolean).join(' · '))}</span>`)}
             ${group('jobs', 'Jobs', hits.jobs, (j) => `<a href="/dashboard/jobs/${j.id}">Job — ${escapeHtml(j.status)}</a> for ${cust(j.customer_id, j.customer_name)}`)}
             ${group('appointments', 'Appointments', hits.appointments, (a) => `<a href="/dashboard/appointments/${a.id}/edit">${escapeHtml(a.type)} · ${fmtDateTime(a.scheduled_at)}</a> (${escapeHtml(a.status)}) for ${cust(a.customer_id, a.customer_name)}`)}
-            ${group('records', 'Desk records', hits.records, (r) => `<a href="/dashboard/desk/${r.id}">${escapeHtml(r.name)}</a>`)}
+            ${group('records', 'Contacts', hits.records, (r) => `<a href="/dashboard/contacts/${r.id}">${escapeHtml(r.name || r.phone || r.email || '(no name)')}</a>`)}
             ${group('files', 'Files', [...hits.files.map((f) => ({ ...f, kind: 'customer' })), ...hits.record_files.map((f) => ({ ...f, kind: 'record' }))], (f) =>
               f.kind === 'record'
-                ? `<a href="/dashboard/desk/${f.record_id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a> on Desk: <a href="/dashboard/desk/${f.record_id}">${escapeHtml(f.record_name)}</a>`
+                ? `<a href="/dashboard/contacts/${f.record_id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a> on contact: <a href="/dashboard/contacts/${f.record_id}">${escapeHtml(f.record_name)}</a>`
                 : f.customer_id
                   ? `<a href="/dashboard/customers/${f.customer_id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a> on ${cust(f.customer_id, f.customer_name)}`
                   : `<a href="/dashboard/files/${f.id}/review">${escapeHtml(f.original_name)}</a> (needs review)`
@@ -2580,7 +2712,7 @@ function register(router, requireAuth) {
                   ? `<a href="/dashboard/customers/${n.customer_id}">Lead note — ${escapeHtml(n.stage)}</a> for ${cust(n.customer_id, n.customer_name)}`
                   : n.kind === 'message'
                     ? `<a href="/dashboard/messages/${n.id}">${escapeHtml(n.channel)} message: ${clip(n.subject || email.htmlToText(n.body))}</a>${n.customer_id ? ` with ${cust(n.customer_id, n.customer_name)}` : ''}`
-                    : `<a href="/dashboard/desk/foreman-notes">Foreman note: ${clip(n.body)}</a>`
+                    : `<a href="/dashboard/contacts/foreman-notes">Foreman note: ${clip(n.body)}</a>`
             )}`
           : '<p class="subtitle">Type a word and press Search.</p>'
       }`;
@@ -2603,13 +2735,13 @@ function register(router, requireAuth) {
   // items, and the morning and evening routines with today's checks. ?date=
   // shows another date, so Thursday still shows what was checked on Thursday.
   // No reminder text is sent; an open routine is only a line on this page.
-  const todayDate = (v) => (isCalendarDate(v) ? String(v).trim() : etDateString());
+  const todayDate = (v) => (isCalendarDate(v) ? String(v).trim() : bosDayString());
   const todayBack = (date, msg, kind = 'ok') =>
-    `/dashboard/today?${date !== etDateString() ? `date=${date}&` : ''}${kind}=${encodeURIComponent(msg)}`;
+    `/dashboard/today?${date !== bosDayString() ? `date=${date}&` : ''}${kind}=${encodeURIComponent(msg)}`;
   router.get('/dashboard/today', requireAuth, (req, res) => {
     const date = todayDate(req.query.date);
     const t = db.todaySummary(date);
-    const isToday = date === etDateString();
+    const isToday = date === bosDayString();
     const hidden = `<input type="hidden" name="date" value="${date}">`;
     const itemRow = (it, { unsorted } = {}) => `
       <li class="day-item${it.overdue ? ' overdue' : ''}${it.done ? ' done' : ''}" data-day-item="${it.id}"${it.overdue ? ' data-overdue="1"' : ''}>
@@ -2651,6 +2783,8 @@ function register(router, requireAuth) {
       <style>.day-item.overdue .day-item-title,.day-item.overdue .day-item-due{color:#c62828;font-weight:600}.day-item.done .day-item-title{text-decoration:line-through;opacity:.6}.day-items,.routine-list{list-style:none;padding-left:0}.day-items li,.routine-list li{margin:6px 0}.routine-open{color:#c62828;font-weight:600}</style>
       <h1>Today</h1>
       <p class="subtitle">${escapeHtml(fmtDate(`${date}T12:00:00.000Z`))}${isToday ? '' : ` · <a href="/dashboard/today">Back to today</a>`}</p>
+      <p class="subtitle">The BOS day runs until 5:00 AM Eastern, so after midnight this page still shows the day that just ended.</p>
+      <p><a class="btn small secondary" href="/dashboard/tomorrow" data-tomorrow>Tomorrow</a></p>
       ${t.morning_open ? `<p class="routine-open">Morning routine: ${t.morning_open} still open.</p>` : ''}
       ${t.evening_open ? `<p class="routine-open">Evening routine: ${t.evening_open} still open.</p>` : ''}
       <div class="panel" id="today-visits">
@@ -2688,6 +2822,82 @@ function register(router, requireAuth) {
       ${routineBlock('morning', t.morning, t.morning_open)}
       ${routineBlock('evening', t.evening, t.evening_open)}`;
     res.send(dashboardLayout({ title: 'Today', active: '/dashboard/today', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // FF-2640-015: tomorrow's visits, from the appointments BOS already stored.
+  // Tomorrow is the BOS day after today, on the same 5:00 AM Eastern boundary.
+  router.get('/dashboard/tomorrow', requireAuth, (req, res) => {
+    const date = nextDateString(bosDayString());
+    const visits = db.visitsOnDay(date);
+    const body = `
+      ${backLink('/dashboard/today', 'Back to Today')}
+      <h1>Tomorrow</h1>
+      <p class="subtitle">${escapeHtml(fmtDate(`${date}T12:00:00.000Z`))}. These are the visits already booked in BOS for tomorrow.</p>
+      <div class="panel" id="tomorrow-visits">
+        ${
+          visits.length
+            ? `<ul class="day-items" style="list-style:none;padding-left:0">${visits
+                .map((a) => `<li data-visit="${a.id}">${escapeHtml(fmtDateTime(a.scheduled_at))} · <a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a> · ${escapeHtml(a.type)}${a.customer_address ? ` · ${escapeHtml(a.customer_address)}` : ''}</li>`)
+                .join('')}</ul>`
+            : '<p class="subtitle">No visits booked for tomorrow.</p>'
+        }
+      </div>
+      <p><a class="btn small secondary" href="/dashboard/today?date=${date}">Open tomorrow's day page</a></p>`;
+    res.send(dashboardLayout({ title: 'Tomorrow', active: '/dashboard/tomorrow', body }));
+  });
+
+  // FF-2640-020: the grocery list, the project list, and the vehicle list. Andrew
+  // adds a row and checks it off. A vehicle is not a contact; cars saved earlier
+  // as things in the old record store are linked under the vehicle list. Budget
+  // stays the bookkeeping BOS already has.
+  router.get('/dashboard/lists', requireAuth, (req, res) => {
+    const things = db.listRecordsFor(db.ensureUser(req.authUser || db.defaultUsername()), { kind: 'thing' });
+    const block = (key, label) => {
+      const rows = db.listListRows(key);
+      return `
+      <div class="panel" id="list-${key}">
+        <h2 style="margin-top:0">${label}</h2>
+        ${
+          rows.length
+            ? `<ul style="list-style:none;padding-left:0">${rows
+                .map(
+                  (r) => `<li data-list-row="${r.id}" style="margin:6px 0">
+                  <form method="POST" action="/dashboard/lists/rows/${r.id}/done" style="display:inline"><input type="hidden" name="done" value="${r.done ? '0' : '1'}"><button class="btn small secondary" type="submit" aria-label="${r.done ? 'Mark not done' : 'Mark done'}">${r.done ? '☑' : '☐'}</button></form>
+                  <span${r.done ? ' style="text-decoration:line-through;opacity:.6"' : ''}>${escapeHtml(r.title)}</span>${r.notes ? ` <span class="subtitle">${escapeHtml(r.notes)}</span>` : ''}</li>`
+                )
+                .join('')}</ul>`
+            : '<p class="subtitle">No rows yet.</p>'
+        }
+        ${
+          key === 'vehicle' && things.length
+            ? `<p class="subtitle">Saved earlier as things: ${things.map((t) => `<a href="/dashboard/contacts/${t.id}">${escapeHtml(t.label)}</a>`).join(', ')}</p>`
+            : ''
+        }
+        <form method="POST" action="/dashboard/lists/${key}" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">
+          <div style="flex:1 1 180px"><label>Add a row</label><input type="text" name="title" required></div>
+          <div style="flex:1 1 140px"><label>Notes</label><input type="text" name="notes"></div>
+          <button class="btn small" type="submit">Add</button>
+        </form>
+      </div>`;
+    };
+    const body = `
+      <h1>Lists</h1>
+      <p class="subtitle">Budget stays in <a href="/dashboard/finances">Bookkeeping</a>.</p>
+      ${Object.entries(db.LISTS).map(([k, label]) => block(k, label)).join('')}`;
+    res.send(dashboardLayout({ title: 'Lists', active: '/dashboard/lists', body, flash: flashFromQuery(req.query) }));
+  });
+  router.post('/dashboard/lists/rows/:id/done', requireAuth, (req, res) => {
+    const r = db.setListRowDone(req.params.id, req.body.done === '1');
+    if (!r) return res.status(404).send('Row not found');
+    res.redirect(`/dashboard/lists?ok=Updated#list-${r.list}`);
+  });
+  router.post('/dashboard/lists/:list', requireAuth, (req, res) => {
+    try {
+      db.addListRow({ list: req.params.list, title: req.body.title, notes: req.body.notes, created_by: actorOf(req) });
+      res.redirect(`/dashboard/lists?ok=Row added#list-${req.params.list}`);
+    } catch (e) {
+      res.redirect(`/dashboard/lists?err=${encodeURIComponent(e.message)}`);
+    }
   });
 
   router.post('/dashboard/today/items', requireAuth, (req, res) => {
@@ -3599,22 +3809,49 @@ function register(router, requireAuth) {
     res.redirect(`${redirectTo}?ok=Assistant conversation cleared`);
   });
 
-  // ---------- Desk: the thin record store (FF-3926-012, FF-3926-013) ----------
+  // ---------- Contacts (FF-2640-016), the thin record store once called Desk (FF-3926-012, FF-3926-013) ----------
   // People who aren't sales leads and things such as cars. Every read goes
   // through db.getRecordFor / db.listRecordsFor, which only return what the
   // signed-in user owns or was shared - a record anyone else can't see is a 404.
   const deskUser = (req) => db.ensureUser(req.authUser || db.defaultUsername());
+  // FF-2640-016: old /dashboard/desk links keep working. A GET is sent to the
+  // same page under /dashboard/contacts; a POST is re-sent there with 307 so the
+  // form data and the method are kept.
+  for (const tail of ['', '/:a', '/:a/:b', '/:a/:b/:c', '/:a/:b/:c/:d']) {
+    const to = (req) => {
+      const rest = req.url.slice('/dashboard/desk'.length);
+      return `/dashboard/contacts${rest}`;
+    };
+    router.get(`/dashboard/desk${tail}`, requireAuth, (req, res) => {
+      res.writeHead(302, { Location: to(req) });
+      res.end();
+    });
+    router.post(`/dashboard/desk${tail}`, requireAuth, (req, res) => {
+      res.writeHead(307, { Location: to(req) });
+      res.end();
+    });
+  }
   const recordNotFound = (res) =>
-    res.status(404).send(dashboardLayout({ title: 'Not found', active: '/dashboard/desk', body: `${backLink('/dashboard/desk', 'Back to Desk')}<h1>Record not found</h1>` }));
+    res.status(404).send(dashboardLayout({ title: 'Not found', active: '/dashboard/contacts', body: `${backLink('/dashboard/contacts', 'Back to Contacts')}<h1>Contact not found</h1>` }));
   const recordForm = (r) => `
     <div class="grid cols-2">
-      <div><label>Kind</label><select name="kind">
-        <option value="person" ${!r || r.kind === 'person' ? 'selected' : ''}>Person</option>
-        <option value="thing" ${r && r.kind === 'thing' ? 'selected' : ''}>Thing (car, equipment…)</option>
-      </select></div>
-      <div><label>Name *</label><input type="text" name="name" value="${escapeHtml((r && r.name) || '')}" required></div>
-      <div><label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_business" value="1" style="width:auto" ${r && r.is_business ? 'checked' : ''}> Business</label></div>
-      <div><label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_personal" value="1" style="width:auto" ${r && r.is_personal ? 'checked' : ''}> Personal</label></div>
+      ${
+        r && r.kind === 'thing'
+          ? `<div><label>Kind</label><select name="kind">
+        <option value="person">Person</option>
+        <option value="thing" selected>Thing (car, equipment…)</option>
+      </select></div>`
+          : '<input type="hidden" name="kind" value="person">'
+      }
+      <div><label>Name</label><input type="text" name="name" value="${escapeHtml((r && r.name) || '')}"></div>
+      <div style="grid-column: span 2"><label>Marks (more than one is fine)</label>
+        <div style="display:flex;gap:14px;flex-wrap:wrap">
+          <label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_lead" value="1" style="width:auto" ${r && r.is_lead ? 'checked' : ''}> Business lead or customer</label>
+          <label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_personal" value="1" style="width:auto" ${r && r.is_personal ? 'checked' : ''}> Personal contact</label>
+          <label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_vendor" value="1" style="width:auto" ${r && r.is_vendor ? 'checked' : ''}> Vendor or supplier</label>
+          <label class="check" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="is_business" value="1" style="width:auto" ${r && r.is_business ? 'checked' : ''}> Business</label>
+        </div>
+      </div>
       <div><label>Phone</label><input type="tel" name="phone" value="${escapeHtml((r && r.phone) || '')}"></div>
       <div><label>Email</label><input type="email" name="email" value="${escapeHtml((r && r.email) || '')}"></div>
       <div style="grid-column: span 2"><label>Address</label><input type="text" name="address" value="${escapeHtml((r && r.address) || '')}"></div>
@@ -3622,11 +3859,17 @@ function register(router, requireAuth) {
       <div><label>Tags (comma-separated)</label><input type="text" name="tags" value="${escapeHtml(r ? r.tags.join(', ') : '')}"></div>
       <div style="grid-column: span 2"><label>Notes</label><textarea name="notes" rows="4">${escapeHtml((r && r.notes) || '')}</textarea></div>
     </div>`;
+  const contactMarks = (r) =>
+    [r.is_lead ? 'Business lead or customer' : '', r.is_personal ? 'Personal contact' : '', r.is_vendor ? 'Vendor or supplier' : '', r.is_business ? 'Business' : '']
+      .filter(Boolean)
+      .join(' · ');
   const recordFields = (b) => ({
     kind: b.kind,
     name: b.name,
     is_business: b.is_business === '1',
     is_personal: b.is_personal === '1',
+    is_lead: b.is_lead === '1',
+    is_vendor: b.is_vendor === '1',
     phone: b.phone ? normalizePhone(b.phone) || b.phone : '',
     email: b.email || '',
     address: b.address || '',
@@ -3635,30 +3878,31 @@ function register(router, requireAuth) {
     tags: b.tags || '',
   });
 
-  router.get('/dashboard/desk', requireAuth, (req, res) => {
+  router.get('/dashboard/contacts', requireAuth, (req, res) => {
     const user = deskUser(req);
-    const filter = ['mine', 'business', 'personal'].includes(req.query.f) ? req.query.f : '';
+    const filter = ['mine', 'lead', 'personal', 'vendor', 'business'].includes(req.query.f) ? req.query.f : '';
     const cat = String(req.query.cat || '').trim();
     const q = String(req.query.q || '').trim();
-    const rows = db.listRecordsFor(user, { filter, category: cat, q });
+    // A car is not a contact: things live on the vehicle list page (Lists).
+    const rows = db.listRecordsFor(user, { filter, category: cat, q, kind: 'person' });
     const cats = db.listRecordCategoriesFor(user);
     const link = (over) => {
       const p = new URLSearchParams();
       const v = { f: filter, cat, q, ...over };
       for (const k of ['f', 'cat', 'q']) if (v[k]) p.set(k, v[k]);
       const s = p.toString();
-      return `/dashboard/desk${s ? '?' + s : ''}`;
+      return `/dashboard/contacts${s ? '?' + s : ''}`;
     };
     const chip = (f, label) => `<a class="btn small ${filter === f ? '' : 'secondary'}" href="${escapeHtml(link({ f }))}" data-desk-filter="${f || 'all'}">${label}</a>`;
     const body = `
-      <h1>Desk</h1>
-      <p class="subtitle">People who aren't sales leads, and things like cars. Only you see your records, plus any shared with you.</p>
-      <p><a class="btn small secondary" href="/dashboard/desk/foreman-notes" download>Download Foreman notes</a></p>
+      <h1>Contacts</h1>
+      <p class="subtitle">A contact is someone Andrew can contact. A contact does not need a name, a phone, an address, and an email; any one is enough. Only you see your contacts, plus any shared with you. Cars and other things are on <a href="/dashboard/lists">Lists</a>.</p>
+      <p><a class="btn small secondary" href="/dashboard/contacts/foreman-notes" download>Download Foreman notes</a></p>
       <div class="panel">
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-          ${chip('', 'All')}${chip('mine', 'Mine')}${chip('business', 'Business')}${chip('personal', 'Personal')}
+          ${chip('', 'All')}${chip('mine', 'Mine')}${chip('lead', 'Business lead or customer')}${chip('personal', 'Personal contact')}${chip('vendor', 'Vendor or supplier')}${chip('business', 'Business')}
         </div>
-        <form method="GET" action="/dashboard/desk" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <form method="GET" action="/dashboard/contacts" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
           ${filter ? `<input type="hidden" name="f" value="${escapeHtml(filter)}">` : ''}
           <div style="flex:1 1 180px"><label for="desk-q">Search</label><input type="search" id="desk-q" name="q" value="${escapeHtml(q)}" placeholder="name, notes, text in PDFs…"></div>
           <div><label for="desk-cat">Category</label><select id="desk-cat" name="cat"><option value="">All categories</option>${cats
@@ -3668,37 +3912,36 @@ function register(router, requireAuth) {
         </form>
         ${
           rows.length
-            ? `<div class="table-scroll"><table class="files-table" style="margin-top:12px"><tr><th>Name</th><th>Kind</th><th>Type</th><th>Categories</th><th>Phone</th></tr>${rows
+            ? `<div class="table-scroll"><table class="files-table" style="margin-top:12px"><tr><th>Name</th><th>Marks</th><th>Categories</th><th>Phone</th></tr>${rows
                 .map(
                   (r) => `<tr data-record="${r.id}">
-                    <td><a href="/dashboard/desk/${r.id}">${escapeHtml(r.name)}</a>${r.mine ? '' : ' <span class="badge">shared</span>'}</td>
-                    <td>${r.kind === 'thing' ? 'Thing' : 'Person'}</td>
-                    <td>${[r.is_business ? 'Business' : '', r.is_personal ? 'Personal' : ''].filter(Boolean).join(' · ')}</td>
+                    <td><a href="/dashboard/contacts/${r.id}">${escapeHtml(r.label)}</a>${r.mine ? '' : ' <span class="badge">shared</span>'}</td>
+                    <td data-marks>${contactMarks(r)}</td>
                     <td>${escapeHtml(r.categories.join(', '))}</td>
                     <td>${r.phone ? phone(r.phone) : ''}</td>
                   </tr>`
                 )
                 .join('')}</table></div>`
-            : `<p class="subtitle" style="margin-top:12px">${filter || cat || q ? 'No records match.' : 'No records yet.'}</p>`
+            : `<p class="subtitle" style="margin-top:12px">${filter || cat || q ? 'No contacts match.' : 'No contacts yet.'}</p>`
         }
       </div>
       <details class="section" id="desk-new"${rows.length ? '' : ' open'}>
-        <summary>New record</summary>
+        <summary>New contact</summary>
         <div class="section-body">
-          <form method="POST" action="/dashboard/desk">
+          <form method="POST" action="/dashboard/contacts">
             ${recordForm(null)}
-            <div style="margin-top:10px"><button class="btn" type="submit">Create record</button></div>
+            <div style="margin-top:10px"><button class="btn" type="submit">Create contact</button></div>
           </form>
         </div>
       </details>
     `;
-    res.send(dashboardLayout({ title: 'Desk', active: '/dashboard/desk', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: 'Contacts', active: '/dashboard/contacts', body, flash: flashFromQuery(req.query) }));
   });
 
   // BF-2640-076: every raw note Andrew gave Foreman, newest first, as a .txt
-  // download. Registered before /dashboard/desk/:id so foreman-notes is never
+  // download. Registered before /dashboard/contacts/:id so foreman-notes is never
   // read as a record id.
-  router.get('/dashboard/desk/foreman-notes', requireAuth, (req, res) => {
+  router.get('/dashboard/contacts/foreman-notes', requireAuth, (req, res) => {
     const notes = db.listForemanNotes();
     const text = notes.length
       ? notes.map((n) => `${n.created_at}\n${n.body}\n`).join('\n')
@@ -3710,25 +3953,25 @@ function register(router, requireAuth) {
     res.end(text);
   });
 
-  router.post('/dashboard/desk', requireAuth, (req, res) => {
+  router.post('/dashboard/contacts', requireAuth, (req, res) => {
     try {
       const r = db.createRecord(deskUser(req), recordFields(req.body));
-      res.redirect(`/dashboard/desk/${r.id}?ok=Record created`);
+      res.redirect(`/dashboard/contacts/${r.id}?ok=Contact created`);
     } catch (e) {
-      res.redirect(`/dashboard/desk?err=${encodeURIComponent(e.message)}`);
+      res.redirect(`/dashboard/contacts?err=${encodeURIComponent(e.message)}`);
     }
   });
 
-  router.get('/dashboard/desk/:id', requireAuth, (req, res) => {
+  router.get('/dashboard/contacts/:id', requireAuth, (req, res) => {
     const user = deskUser(req);
     const r = db.getRecordFor(user, req.params.id);
     if (!r) return recordNotFound(res);
     const files = db.listRecordFiles(r.id);
     const others = r.mine ? db.listUsers(user.tenant_id).filter((u) => u.id !== user.id) : [];
     const body = `
-      ${backLink('/dashboard/desk', 'Back to Desk')}
-      <h1>${escapeHtml(r.name)}</h1>
-      <p class="subtitle">${r.kind === 'thing' ? 'Thing' : 'Person'}${r.is_business ? ' · Business' : ''}${r.is_personal ? ' · Personal' : ''}${r.categories.length ? ' · ' + escapeHtml(r.categories.join(', ')) : ''}${r.tags.length ? ' · tags: ' + escapeHtml(r.tags.join(', ')) : ''}${r.mine ? '' : ' · shared with you'}</p>
+      ${backLink('/dashboard/contacts', 'Back to Contacts')}
+      <h1>${escapeHtml(r.label)}</h1>
+      <p class="subtitle">${r.kind === 'thing' ? 'Thing (not a contact)' : 'Contact'}${contactMarks(r) ? ' · ' + contactMarks(r) : ''}${r.categories.length ? ' · ' + escapeHtml(r.categories.join(', ')) : ''}${r.tags.length ? ' · tags: ' + escapeHtml(r.tags.join(', ')) : ''}${r.mine ? '' : ' · shared with you'}</p>
       <div class="panel">
         ${r.phone ? `📞 <a href="tel:${escapeHtml(telHref(r.phone))}">${phone(r.phone)}</a><br>` : ''}
         ${r.email ? `✉️ <a href="mailto:${escapeHtml(r.email)}">${escapeHtml(r.email)}</a><br>` : ''}
@@ -3741,14 +3984,14 @@ function register(router, requireAuth) {
           files.length
             ? `<div class="table-scroll"><table class="files-table"><tr><th>File</th><th>Text found</th><th>Uploaded</th></tr>${files
                 .map(
-                  (f) => `<tr id="file-${f.id}"><td><a href="/dashboard/desk/${r.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a></td><td>${f.extracted_text ? 'yes' : 'no'}</td><td>${fmtDate(f.created_at)}</td></tr>`
+                  (f) => `<tr id="file-${f.id}"><td><a href="/dashboard/contacts/${r.id}/files/${f.id}/view">${escapeHtml(f.original_name)}</a></td><td>${f.extracted_text ? 'yes' : 'no'}</td><td>${fmtDate(f.created_at)}</td></tr>`
                 )
                 .join('')}</table></div>`
             : '<p class="subtitle">No files yet.</p>'
         }
         ${
           r.mine
-            ? `<form method="POST" action="/dashboard/desk/${r.id}/files" enctype="multipart/form-data" style="margin-top:10px">
+            ? `<form method="POST" action="/dashboard/contacts/${r.id}/files" enctype="multipart/form-data" style="margin-top:10px">
                 <label>Attach a file</label><input type="file" name="file" required>
                 <div style="margin-top:8px"><button class="btn secondary" type="submit">Upload</button></div>
               </form>`
@@ -3758,7 +4001,7 @@ function register(router, requireAuth) {
       ${
         r.mine
           ? `<details class="section" id="record-edit"><summary>Edit</summary><div class="section-body">
-              <form method="POST" action="/dashboard/desk/${r.id}">
+              <form method="POST" action="/dashboard/contacts/${r.id}">
                 ${recordForm(r)}
                 <div style="margin-top:10px"><button class="btn" type="submit">Save</button></div>
               </form>
@@ -3766,7 +4009,7 @@ function register(router, requireAuth) {
             ${
               others.length
                 ? `<details class="section" id="record-share"><summary>Share</summary><div class="section-body">
-                    <form method="POST" action="/dashboard/desk/${r.id}/share">
+                    <form method="POST" action="/dashboard/contacts/${r.id}/share">
                       <select name="user_id">${others.map((u) => `<option value="${u.id}">${escapeHtml(u.display_name || u.username)}${r.shared_with.includes(u.id) ? ' (shared)' : ''}</option>`).join('')}</select>
                       <button class="btn small secondary" type="submit">Share</button>
                     </form>
@@ -3776,43 +4019,43 @@ function register(router, requireAuth) {
           : ''
       }
     `;
-    res.send(dashboardLayout({ title: r.name, active: '/dashboard/desk', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: r.label, active: '/dashboard/contacts', body, flash: flashFromQuery(req.query) }));
   });
 
-  router.post('/dashboard/desk/:id', requireAuth, (req, res) => {
+  router.post('/dashboard/contacts/:id', requireAuth, (req, res) => {
     try {
       const r = db.updateRecord(deskUser(req), req.params.id, recordFields(req.body));
       if (!r) return recordNotFound(res);
-      res.redirect(`/dashboard/desk/${r.id}?ok=Saved`);
+      res.redirect(`/dashboard/contacts/${r.id}?ok=Saved`);
     } catch (e) {
-      res.redirect(`/dashboard/desk/${req.params.id}?err=${encodeURIComponent(e.message)}`);
+      res.redirect(`/dashboard/contacts/${req.params.id}?err=${encodeURIComponent(e.message)}`);
     }
   });
 
-  router.post('/dashboard/desk/:id/share', requireAuth, (req, res) => {
+  router.post('/dashboard/contacts/:id/share', requireAuth, (req, res) => {
     const out = db.shareRecord(deskUser(req), req.params.id, req.body.user_id);
     if (out.error === 'Not found') return recordNotFound(res);
-    res.redirect(`/dashboard/desk/${req.params.id}?${out.ok ? 'ok=Shared' : 'err=' + encodeURIComponent(out.error)}`);
+    res.redirect(`/dashboard/contacts/${req.params.id}?${out.ok ? 'ok=Shared' : 'err=' + encodeURIComponent(out.error)}`);
   });
 
   // Files on a record reuse the customer-file machinery: the multipart parser,
   // write-then-row upload (BF-2639-064) and the same viewer (BF-2639-069).
-  router.post('/dashboard/desk/:id/files', requireAuth, (req, res) => {
+  router.post('/dashboard/contacts/:id/files', requireAuth, (req, res) => {
     const user = deskUser(req);
     const r = db.getRecordFor(user, req.params.id);
     if (!r || !r.mine) return recordNotFound(res);
     const upload = (req.files || []).find((f) => f.fieldname === 'file');
-    if (!upload || !upload.filename) return res.redirect(`/dashboard/desk/${r.id}?err=Choose a file first`);
+    if (!upload || !upload.filename) return res.redirect(`/dashboard/contacts/${r.id}?err=Choose a file first`);
     try {
       db.addRecordFile(user, r.id, { filename: upload.filename, mimeType: upload.mimeType, data: upload.data });
     } catch (e) {
       console.error('[desk] upload failed:', e);
-      return res.redirect(`/dashboard/desk/${r.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
+      return res.redirect(`/dashboard/contacts/${r.id}?err=${encodeURIComponent('Upload failed - the file was not saved. Try again.')}`);
     }
-    res.redirect(`/dashboard/desk/${r.id}?ok=File uploaded#record-files`);
+    res.redirect(`/dashboard/contacts/${r.id}?ok=File uploaded#record-files`);
   });
 
-  router.get('/dashboard/desk/:id/files/:fileId', requireAuth, (req, res) => {
+  router.get('/dashboard/contacts/:id/files/:fileId', requireAuth, (req, res) => {
     const f = db.getRecordFileFor(deskUser(req), req.params.id, req.params.fileId);
     if (!f) return res.status(404).send('File not found');
     const p = db.recordFilePath(f);
@@ -3824,7 +4067,7 @@ function register(router, requireAuth) {
     fs.createReadStream(p).pipe(res);
   });
 
-  router.get('/dashboard/desk/:id/files/:fileId/view', requireAuth, (req, res) => {
+  router.get('/dashboard/contacts/:id/files/:fileId/view', requireAuth, (req, res) => {
     const user = deskUser(req);
     const f = db.getRecordFileFor(user, req.params.id, req.params.fileId);
     if (!f) return recordNotFound(res);
@@ -3833,17 +4076,17 @@ function register(router, requireAuth) {
     const openable = (x) => fs.existsSync(db.recordFilePath(x));
     const prev = all.slice(0, idx).reverse().find(openable);
     const next = all.slice(idx + 1).find(openable);
-    const url = (id) => `/dashboard/desk/${f.record_id}/files/${id}/view`;
+    const url = (id) => `/dashboard/contacts/${f.record_id}/files/${id}/view`;
     const missing = !openable(f);
     const body = fileViewerBody({
       f,
-      rawUrl: `/dashboard/desk/${f.record_id}/files/${f.id}`,
-      closeUrl: `/dashboard/desk/${f.record_id}#file-${f.id}`,
+      rawUrl: `/dashboard/contacts/${f.record_id}/files/${f.id}`,
+      closeUrl: `/dashboard/contacts/${f.record_id}#file-${f.id}`,
       prevUrl: prev ? url(prev.id) : null,
       nextUrl: next ? url(next.id) : null,
       missing,
     });
-    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/desk', body }));
+    res.status(missing ? 404 : 200).send(dashboardLayout({ title: f.original_name, active: '/dashboard/contacts', body }));
   });
 
   // JSON versions of the two routes above, used by the in-widget chat log so

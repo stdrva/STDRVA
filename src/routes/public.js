@@ -521,7 +521,7 @@ function bookingContact(q) {
 // book_design_appointment tool call this so the two paths can never drift
 // (customer upsert with latest values (spec 7), Home Show consultant credit
 // (spec 9), lead, appointment, notify automations, idempotency + slot re-check).
-async function createBooking({ name, phone, email, address, slotIso, type, consultantName, leadSource, actor }) {
+async function createBooking({ name, phone, email, address, slotIso, type, consultantName, leadSource, sourceId, actor }) {
   type = type || PUBLIC_TYPE_ORDER[0];
   name = (name || '').trim();
   phone = (phone || '').trim();
@@ -593,6 +593,19 @@ async function createBooking({ name, phone, email, address, slotIso, type, consu
     customer = db.getCustomer(customer.id);
   }
 
+  // FF-2640-018: how they heard, picked on the book form from the marketing
+  // sources BOS already has, is written as the first attribution on that
+  // customer. A customer who already has an attribution keeps it as the first.
+  const heard = sourceId ? db.getSource(sourceId) : null;
+  if (heard && heard.active && !db.getCustomerAttribution(customer.id).original) {
+    try {
+      db.setCustomerAttribution({ customer_id: customer.id, source_id: heard.id, note: `Public booking: how they heard - ${heard.name}`, actor: who });
+      customer = db.getCustomer(customer.id);
+    } catch (e) {
+      console.error('booking source attribution failed', e);
+    }
+  }
+
   const existingLeads = db.listLeads().filter((l) => l.customer_id === customer.id);
   let lead = existingLeads.find((l) => db.OPEN_LEAD_STAGES.includes(l.stage));
   if (!lead) {
@@ -629,6 +642,8 @@ async function createBooking({ name, phone, email, address, slotIso, type, consu
     });
     try {
       await automations.onAppointmentBooked(appt, customer);
+      // FF-2640-019: calendar invites to the customer and to Andrew.
+      await automations.sendCalendarInvites(appt, customer);
       if (outOfArea) await automations.onOutOfAreaContact('booked', customer, { type });
     } catch (e) {
       console.error('onAppointmentBooked failed', e);
@@ -731,6 +746,17 @@ function slotIsFree(iso, type) {
   if (isNaN(start.getTime())) return false;
   const end = new Date(start.getTime() + durationForType(type || PUBLIC_TYPE_ORDER[0]) * 60000);
   return db.listScheduledOverlapping(start.toISOString(), end.toISOString()).length === 0;
+}
+
+// FF-2640-018: "How did you hear about us?" on the book form, using only the
+// marketing sources BOS already has. Optional; a blank choice writes nothing.
+function heardSelect(selected) {
+  const sources = db.listSources();
+  if (!sources.length) return '';
+  return `<label for="heard-source">How did you hear about us?</label>
+          <select id="heard-source" name="heard_source_id"><option value="">Choose one (optional)</option>${sources
+            .map((s) => `<option value="${escapeHtml(s.id)}"${s.id === selected ? ' selected' : ''}>${escapeHtml(s.name)}</option>`)
+            .join('')}</select>`;
 }
 
 function register(router) {
@@ -933,6 +959,7 @@ function register(router) {
           <input type="hidden" name="type" value="${escapeHtml(type)}">
           <input type="hidden" name="slot" value="${escapeHtml(slotIso)}">
           ${['consultant', 'lead_source', 'src', 'campaign'].map((k) => (req.query[k] ? `<input type="hidden" name="${k}" value="${escapeHtml(req.query[k])}">` : '')).join('')}
+          ${heardSelect(req.query.heard_source_id)}
           <details class="review-edit">
             <summary>Something wrong? Edit your details</summary>
             <label>Name *</label><input type="text" name="name" value="${escapeHtml(name)}" autocomplete="name" required>
@@ -987,6 +1014,7 @@ function register(router) {
       type,
       consultantName: (body.consultant || req.query.consultant || '').trim(),
       leadSource: (body.lead_source || req.query.lead_source || '').trim(),
+      sourceId: String(body.heard_source_id || '').trim() || null,
       actor: 'public',
     });
 

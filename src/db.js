@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const { DatabaseSync } = require('node:sqlite');
-const { newId, newToken, nowIso, dateInputToIso, etDateString, isCalendarDate } = require('./util');
+const { newId, newToken, nowIso, dateInputToIso, etDateString, bosDayString, isCalendarDate } = require('./util');
 
 // DB location is overridable via BOS_DB_PATH so the test suite can run against
 // a throwaway file instead of the live database. Production/dev leave it unset.
@@ -1177,23 +1177,27 @@ function syncFileSearch(id) {
     f.extracted_text || ''
   );
 }
+// FF-2640-017: a name that matches a different stored file is flagged
+// (name_clash_of keeps the name asked for) and changed slightly; both files stay.
 function createCustomerFile({ customer_id, job_id, stored_name, original_name, mime_type, size, note, assignment_status, suggested_customer_id }) {
   const id = newId();
+  const u = uniqueFileName(original_name, null, customer_id);
   db.prepare(
-    `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at, assignment_status, suggested_customer_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at, assignment_status, suggested_customer_id, name_clash_of)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     customer_id || null,
     job_id || null,
     stored_name,
-    original_name,
+    u.name,
     mime_type || null,
     size || 0,
     note || null,
     nowIso(),
     assignment_status || null,
-    suggested_customer_id || null
+    suggested_customer_id || null,
+    u.clash ? String(original_name) : null
   );
   syncFileSearch(id);
   return id;
@@ -1246,6 +1250,15 @@ function setFileAssignment(id, { customer_id, assignment_status, suggested_custo
     suggested_customer_id || null,
     id
   );
+  // FF-2640-017: moving onto a customer that already has a different file with
+  // this name changes the moved file's name slightly instead of clashing.
+  if (before && (before.customer_id || null) !== (customer_id || null)) {
+    const u = uniqueFileName(before.original_name, id, customer_id);
+    if (u.clash) {
+      db.prepare(`UPDATE customer_files SET original_name = ?, name_clash_of = ? WHERE id = ?`).run(u.name, before.original_name, id);
+      syncFileSearch(id);
+    }
+  }
   const after = getCustomerFile(id);
   // BF-2639-064: the bytes follow the row to its new customer's folder.
   if (from && after) {
@@ -2378,7 +2391,14 @@ function softDeleteCustomerFile(id, actor) {
 function restoreCustomerFile(id, actor) {
   const f = getCustomerFile(id);
   if (!f) return null;
-  db.prepare(`UPDATE customer_files SET deleted_at = NULL, deleted_by = NULL WHERE id = ?`).run(id);
+  // FF-2640-017: if a different live file took this name while it was deleted,
+  // the restored file's name is changed slightly instead of clashing.
+  const u = uniqueFileName(f.original_name, f.id, f.customer_id);
+  db.prepare(`UPDATE customer_files SET deleted_at = NULL, deleted_by = NULL, original_name = ?, name_clash_of = COALESCE(?, name_clash_of) WHERE id = ?`).run(
+    u.name,
+    u.clash ? f.original_name : null,
+    id
+  );
   syncFileSearch(id);
   logActivity({
     entity_type: 'file',
@@ -2659,7 +2679,106 @@ CREATE TABLE IF NOT EXISTS record_files (
     const cols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
     if (!cols.has('tenant_id')) db.exec(`ALTER TABLE ${table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}'`);
   }
+  // FF-2640-016: marks on a contact. is_personal is the Personal contact mark;
+  // is_lead is Business lead or customer; is_vendor is Vendor or supplier.
+  // More than one mark is allowed.
+  const recCols = new Set(db.prepare(`PRAGMA table_info(records)`).all().map((c) => c.name));
+  if (!recCols.has('is_lead')) db.exec(`ALTER TABLE records ADD COLUMN is_lead INTEGER NOT NULL DEFAULT 0`);
+  if (!recCols.has('is_vendor')) db.exec(`ALTER TABLE records ADD COLUMN is_vendor INTEGER NOT NULL DEFAULT 0`);
+  // FF-2640-017: when a new file's name clashed with a different stored file,
+  // the name Andrew asked for is kept here and the visible name is changed slightly.
+  const fileCols = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
+  if (!fileCols.has('name_clash_of')) db.exec(`ALTER TABLE customer_files ADD COLUMN name_clash_of TEXT`);
 })();
+
+// ---- FF-2640-020: the grocery list, the project list, and the vehicle list.
+// Plain rows Andrew adds. A vehicle is not a contact. Budget stays the
+// bookkeeping BOS already has; nothing here touches the books.
+const LISTS = { grocery: 'Grocery list', project: 'Project list', vehicle: 'Vehicle list' };
+db.exec(`
+CREATE TABLE IF NOT EXISTS list_rows (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}',
+  list TEXT NOT NULL,
+  title TEXT NOT NULL,
+  notes TEXT,
+  done INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT,
+  created_at TEXT NOT NULL
+);
+`);
+function addListRow({ list, title, notes, created_by }) {
+  if (!LISTS[list]) throw new Error('List must be grocery, project, or vehicle');
+  const text = String(title || '').trim();
+  if (!text) throw new Error('A row needs some text');
+  const id = newId();
+  db.prepare(`INSERT INTO list_rows (id, list, title, notes, created_by, created_at) VALUES (?,?,?,?,?,?)`).run(id, list, text, String(notes || '').trim() || null, created_by || null, nowIso());
+  return db.prepare(`SELECT * FROM list_rows WHERE id = ?`).get(id);
+}
+function listListRows(list) {
+  return db.prepare(`SELECT * FROM list_rows WHERE tenant_id = ? AND list = ? ORDER BY done, created_at`).all(DEFAULT_TENANT_ID, list);
+}
+function setListRowDone(id, done) {
+  db.prepare(`UPDATE list_rows SET done = ? WHERE id = ?`).run(done ? 1 : 0, id);
+  return db.prepare(`SELECT * FROM list_rows WHERE id = ?`).get(id) || null;
+}
+
+// ---- FF-2640-017: file names never silently collide. A new name that matches
+// a different live stored file in the same place (the same customer, or the
+// unassigned files) gets " (2)", " (3)", ... before the extension. Different
+// customers can each keep a file called contract.pdf.
+function uniqueFileName(name, exceptId, customer_id) {
+  const want = String(name || 'file').trim() || 'file';
+  const taken = (n) =>
+    !!db
+      .prepare(`SELECT 1 FROM customer_files WHERE deleted_at IS NULL AND lower(original_name) = lower(?) AND id IS NOT ? AND customer_id IS ?`)
+      .get(n, exceptId || null, customer_id || null);
+  if (!taken(want)) return { name: want, clash: false };
+  const m = want.match(/^(.*?)(\.[^.]+)?$/);
+  const base = m[1].replace(/ \(\d+\)$/, '');
+  const ext = m[2] || '';
+  for (let i = 2; ; i++) {
+    const candidate = `${base} (${i})${ext}`;
+    if (!taken(candidate)) return { name: candidate, clash: true };
+  }
+}
+function renameCustomerFile(id, newName, actor) {
+  const f = getCustomerFile(id);
+  if (!f || f.deleted_at) throw new Error('File not found');
+  const wanted = String(newName || '').trim();
+  if (!wanted) throw new Error('A file needs a name');
+  const u = uniqueFileName(wanted, f.id, f.customer_id);
+  db.prepare(`UPDATE customer_files SET original_name = ?, name_clash_of = ? WHERE id = ?`).run(u.name, u.clash ? wanted : null, f.id);
+  syncFileSearch(f.id);
+  logActivity({ entity_type: 'file', entity_id: f.id, customer_id: f.customer_id, field: 'renamed', old_value: f.original_name, new_value: u.name, actor });
+  return { file: getCustomerFile(f.id), clash: u.clash, asked_for: wanted };
+}
+// A copy is a new row with its own bytes on disk, on the same customer unless
+// another is given. The copy's name follows the clash rule, so it never shares
+// the original's visible name.
+function copyCustomerFile(id, { customer_id, actor } = {}) {
+  const f = getCustomerFile(id);
+  if (!f || f.deleted_at) throw new Error('File not found');
+  const src = locateFileBytes(f);
+  if (!src) throw new Error('That file is missing from storage, so it cannot be copied');
+  const target = customer_id === undefined ? f.customer_id : customer_id || null;
+  const stored = `${newId()}${path.extname(f.stored_name || '') || path.extname(f.original_name || '')}`;
+  const dir = uploadsDirFor(target);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(src, path.join(dir, stored));
+  const newId_ = createCustomerFile({
+    customer_id: target,
+    job_id: target === f.customer_id ? f.job_id : null,
+    stored_name: stored,
+    original_name: f.original_name,
+    mime_type: f.mime_type,
+    size: f.size,
+    note: `Copy of "${f.original_name}"`,
+    assignment_status: target ? 'confirmed' : 'unassigned',
+  });
+  logActivity({ entity_type: 'file', entity_id: newId_, customer_id: target, field: 'copied_from', new_value: f.original_name, actor });
+  return getCustomerFile(newId_);
+}
 
 // ---- BF-2640-071: phone photos named image.jpg / image.jpeg get i001.jpg,
 // i002.jpg, ... from one company counter kept in SQLite. The counter is never
@@ -2823,7 +2942,7 @@ function cleanDay(value, label) {
   if (!isCalendarDate(value)) throw new Error(`${label} must be a real date in YYYY-MM-DD form`);
   return String(value).trim();
 }
-function hydrateDayItem(r, today = etDateString()) {
+function hydrateDayItem(r, today = bosDayString()) {
   if (!r) return null;
   return {
     ...r,
@@ -2874,10 +2993,10 @@ function setDayItemDone(id, done) {
   db.prepare(`UPDATE day_items SET done = ?, done_at = ? WHERE id = ?`).run(done ? 1 : 0, done ? nowIso() : null, id);
   return getDayItem(id);
 }
-function listDayItemsForDay(day, today = etDateString()) {
+function listDayItemsForDay(day, today = bosDayString()) {
   return sortDayItems(db.prepare(`SELECT * FROM day_items WHERE tenant_id = ? AND day = ?`).all(DEFAULT_TENANT_ID, day)).map((r) => hydrateDayItem(r, today));
 }
-function listUnsortedDayItems(today = etDateString()) {
+function listUnsortedDayItems(today = bosDayString()) {
   return sortDayItems(db.prepare(`SELECT * FROM day_items WHERE tenant_id = ? AND day IS NULL AND done = 0`).all(DEFAULT_TENANT_ID)).map((r) => hydrateDayItem(r, today));
 }
 function getRoutineItem(id) {
@@ -2906,24 +3025,29 @@ function addRoutineItem({ routine, title, created_by }) {
   db.prepare(`INSERT INTO routine_items (id, routine, title, position, created_by, created_at) VALUES (?,?,?,?,?,?)`).run(id, routine, text, max + 1, created_by || null, nowIso());
   return getRoutineItem(id);
 }
-function setRoutineCheck(routine_item_id, date, checked, checked_by) {
+// With no date, the check lands on the BOS day at that moment (`at`, default
+// now), so a check at 1:00 AM Eastern is stored on the date that just ended.
+function setRoutineCheck(routine_item_id, date, checked, checked_by, { at } = {}) {
   if (!getRoutineItem(routine_item_id)) throw new Error('Routine item not found');
-  const d = cleanDay(date, 'Date');
-  if (!d) throw new Error('A routine check needs a date');
+  const d = date ? cleanDay(date, 'Date') : bosDayString(at || new Date());
   if (checked) {
     db.prepare(`INSERT OR IGNORE INTO routine_checks (routine_item_id, date, checked_by, checked_at) VALUES (?,?,?,?)`).run(routine_item_id, d, checked_by || null, nowIso());
   } else {
     db.prepare(`DELETE FROM routine_checks WHERE routine_item_id = ? AND date = ?`).run(routine_item_id, d);
   }
 }
-// Everything the Today page shows for one Eastern calendar date. Visits are the
-// scheduled appointments Andrew already has on that date.
-function todaySummary(date = etDateString()) {
-  const today = etDateString();
+// Everything the Today page shows for one BOS day. A BOS day runs until 5:00 AM
+// Eastern (util.bosDayString), so a 2:00 AM visit belongs to the day before.
+// Visits are the scheduled appointments Andrew already has on that day.
+function visitsOnDay(date) {
   const noon = new Date(`${date}T12:00:00.000Z`).getTime();
-  const visits = listAppointmentsBetween(new Date(noon - 2 * 86400000).toISOString(), new Date(noon + 2 * 86400000).toISOString())
-    .filter((a) => etDateString(new Date(a.scheduled_at)) === date)
+  return listAppointmentsBetween(new Date(noon - 2 * 86400000).toISOString(), new Date(noon + 2 * 86400000).toISOString())
+    .filter((a) => bosDayString(new Date(a.scheduled_at)) === date)
     .sort((a, b) => (a.scheduled_at < b.scheduled_at ? -1 : 1));
+}
+function todaySummary(date = bosDayString()) {
+  const today = bosDayString();
+  const visits = visitsOnDay(date);
   const morning = listRoutine('morning', date);
   const evening = listRoutine('evening', date);
   return {
@@ -3131,7 +3255,9 @@ function hydrateRecord(r, user) {
     .map((x) => x.name);
   const tags = db.prepare(`SELECT tag FROM record_tags WHERE record_id = ? ORDER BY tag`).all(r.id).map((x) => x.tag);
   const shared_with = db.prepare(`SELECT user_id FROM record_shares WHERE record_id = ?`).all(r.id).map((x) => x.user_id);
-  return { ...r, categories, tags, mine: !!user && r.owner_user_id === user.id, shared_with };
+  // FF-2640-016: a contact without a name shows its phone, email, or address instead.
+  const label = r.name || r.phone || r.email || r.address || '(no name)';
+  return { ...r, label, categories, tags, mine: !!user && r.owner_user_id === user.id, shared_with };
 }
 function visibleRecordRows(user) {
   if (!user) return [];
@@ -3163,17 +3289,23 @@ function setRecordTags(record, tags) {
   db.prepare(`DELETE FROM record_tags WHERE record_id = ?`).run(record.id);
   for (const t of cleanList(tags)) db.prepare(`INSERT OR IGNORE INTO record_tags (record_id, tag) VALUES (?,?)`).run(record.id, t);
 }
-function createRecord(user, { kind, name, is_business, is_personal, phone, email, address, notes, categories, tags }) {
+// FF-2640-016: a contact is something Andrew can contact. It does not need a
+// name, a phone, an address and an email; any one of them (or notes) is enough.
+function recordHasSomething(f) {
+  return ['name', 'phone', 'email', 'address', 'notes'].some((k) => String(f[k] || '').trim());
+}
+function createRecord(user, { kind, name, is_business, is_personal, is_lead, is_vendor, phone, email, address, notes, categories, tags }) {
   if (!user) throw new Error('No user');
+  kind = kind || 'person';
   if (!['person', 'thing'].includes(kind)) throw new Error('kind must be person or thing');
   const nm = String(name || '').trim();
-  if (!nm) throw new Error('A record needs a name');
+  if (!recordHasSomething({ name, phone, email, address, notes })) throw new Error('A contact needs at least a name, a phone, an email, an address, or a note');
   const id = newId();
   const ts = nowIso();
   db.prepare(
-    `INSERT INTO records (id, tenant_id, owner_user_id, kind, name, is_business, is_personal, phone, email, address, notes, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(id, user.tenant_id, user.id, kind, nm, truthy(is_business) ? 1 : 0, truthy(is_personal) ? 1 : 0, phone || null, email || null, address || null, notes || null, ts, ts);
+    `INSERT INTO records (id, tenant_id, owner_user_id, kind, name, is_business, is_personal, is_lead, is_vendor, phone, email, address, notes, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(id, user.tenant_id, user.id, kind, nm, truthy(is_business) ? 1 : 0, truthy(is_personal) ? 1 : 0, truthy(is_lead) ? 1 : 0, truthy(is_vendor) ? 1 : 0, phone || null, email || null, address || null, notes || null, ts, ts);
   const row = db.prepare(`SELECT * FROM records WHERE id = ?`).get(id);
   setRecordCategories(row, categories);
   setRecordTags(row, tags);
@@ -3186,11 +3318,13 @@ function updateRecord(user, id, fields) {
   const pick = (k) => (fields[k] === undefined ? r[k] : fields[k] === '' ? null : fields[k]);
   const flag = (k) => (fields[k] === undefined ? r[k] : truthy(fields[k]) ? 1 : 0);
   if (fields.kind !== undefined && !['person', 'thing'].includes(fields.kind)) throw new Error('kind must be person or thing');
-  const nm = fields.name === undefined ? r.name : String(fields.name).trim();
-  if (!nm) throw new Error('A record needs a name');
+  const nm = fields.name === undefined ? r.name : String(fields.name || '').trim();
+  if (!recordHasSomething({ name: nm, phone: pick('phone'), email: pick('email'), address: pick('address'), notes: pick('notes') })) {
+    throw new Error('A contact needs at least a name, a phone, an email, an address, or a note');
+  }
   db.prepare(
-    `UPDATE records SET kind = ?, name = ?, is_business = ?, is_personal = ?, phone = ?, email = ?, address = ?, notes = ?, updated_at = ? WHERE id = ?`
-  ).run(fields.kind || r.kind, nm, flag('is_business'), flag('is_personal'), pick('phone'), pick('email'), pick('address'), pick('notes'), nowIso(), id);
+    `UPDATE records SET kind = ?, name = ?, is_business = ?, is_personal = ?, is_lead = ?, is_vendor = ?, phone = ?, email = ?, address = ?, notes = ?, updated_at = ? WHERE id = ?`
+  ).run(fields.kind || r.kind, nm, flag('is_business'), flag('is_personal'), flag('is_lead'), flag('is_vendor'), pick('phone'), pick('email'), pick('address'), pick('notes'), nowIso(), id);
   if (fields.categories !== undefined) setRecordCategories(r, fields.categories);
   if (fields.tags !== undefined) setRecordTags(r, fields.tags);
   return getRecordFor(user, id);
@@ -3218,6 +3352,8 @@ function listRecordsFor(user, { filter, category, q, kind } = {}) {
   if (filter === 'mine') rows = rows.filter((r) => r.mine);
   if (filter === 'business') rows = rows.filter((r) => r.is_business);
   if (filter === 'personal') rows = rows.filter((r) => r.is_personal);
+  if (filter === 'lead') rows = rows.filter((r) => r.is_lead);
+  if (filter === 'vendor') rows = rows.filter((r) => r.is_vendor);
   if (kind) rows = rows.filter((r) => r.kind === kind);
   if (category) {
     const c = String(category).trim().toLowerCase();
@@ -3366,6 +3502,14 @@ module.exports = {
   addRoutineItem,
   setRoutineCheck,
   todaySummary,
+  visitsOnDay,
+  LISTS,
+  addListRow,
+  listListRows,
+  setListRowDone,
+  uniqueFileName,
+  renameCustomerFile,
+  copyCustomerFile,
   phonePhotoName,
   createForemanNote,
   listForemanNotes,
