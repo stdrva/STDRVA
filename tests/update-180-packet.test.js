@@ -237,12 +237,15 @@ test('034: sign on this device saves a NEW file (name + ET + file list), leaves 
   const all = db.listCustomerFiles(c.id);
   assert.equal(all.length, beforeFiles + 1, 'exactly one NEW file');
   const signed = all.find((f) => f.original_name.startsWith('sale-packet-signed-'));
-  assert.equal(signed.original_name, `sale-packet-signed-sign-device-person-${util.etDateString()}.png`);
+  // FF-2640-021: one readable name, the thing plus the year and week, with no first name in it.
+  assert.equal(signed.original_name, `sale-packet-signed-${db.yearWeekTag(util.etDateString())}.png`);
   assert.equal(signed.mime_type, 'image/png');
   assert.match(signed.note, /signed on this device by Sign Device Person, \w{3} \d{1,2}, \d{4}, \d{1,2}:\d{2}[\s ][AP]M ET/);
   const listed = signed.note.split('Files: ')[1].split(', ').sort();
   assert.deepEqual(listed, ['doc-1.pdf', 'doc-2.pdf'], 'the note lists the packet files');
-  const onDisk = fs.readFileSync(path.join(UPLOADS, c.id, signed.stored_name));
+  const onDisk = fs.readFileSync(path.join(UPLOADS, signed.folder, signed.stored_name)); // FF-2640-021: last-name folder
+  assert.equal(signed.folder, db.getCustomer(c.id).folder_name);
+  assert.match(signed.folder, /^Person(-\d+)?$/);
   assert.equal(onDisk.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'a real PNG is on disk');
   for (const f of files) assert.deepEqual(fs.readFileSync(path.join(UPLOADS, c.id, 'stored-' + f.name.match(/\d/)[0] + '.pdf')), f.content, 'original files untouched');
 

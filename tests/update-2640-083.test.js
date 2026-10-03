@@ -25,7 +25,7 @@ test('BF-2640-083: Today contains Take meds, and the Menu links to Today', async
   const res = await srv.get('/dashboard/today');
   assert.equal(res.status, 200);
   const html = await res.text();
-  assert.match(html, /<h1>Today<\/h1>/);
+  assert.match(html, /<h1 data-day-heading>Today<\/h1>/);
   assert.match(html, /id="routine-morning"[\s\S]*Take meds/);
   assert.match(html, /<a href="\/dashboard\/today" class="active">Today<\/a>/, 'Today is in the Menu');
 

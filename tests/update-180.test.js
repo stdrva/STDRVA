@@ -32,7 +32,8 @@ test('046: never more than four always-visible destinations (3 links + Menu), no
   assert.equal((bottomEnd.match(/<button /g) || []).length, 2);
   assert.deepEqual(
     [...bottomEnd.matchAll(/<a href="([^"]+)"/g)].map((m) => m[1]),
-    ['/dashboard', '/dashboard/appointments', '/dashboard/pipeline']
+    // FF-2640-024: Today took the Pipeline spot on the phone bar only.
+    ['/dashboard', '/dashboard/appointments', '/dashboard/today']
   );
   const topNav = html.slice(html.indexOf('<nav class="topnav-links"'), html.indexOf('</nav>', html.indexOf('<nav class="topnav-links"')));
   assert.equal((topNav.match(/<a /g) || []).length, 3);

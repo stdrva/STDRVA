@@ -77,6 +77,13 @@ const PRIMARY_NAV = [
   ['/dashboard/appointments', 'Appts'],
   ['/dashboard/pipeline', 'Pipeline'],
 ];
+// FF-2640-024: the phone bottom bar puts Today in the Pipeline spot. Pipeline
+// stays on the desktop top bar and in the Menu.
+const PHONE_NAV = [
+  ['/dashboard', 'Overview'],
+  ['/dashboard/appointments', 'Appts'],
+  ['/dashboard/today', 'Today'],
+];
 
 // Everything else lives in the Menu sheet. An item with no href renders grey
 // and is not a link. BF-2640-082: Training is on and is a real link now.
@@ -125,6 +132,9 @@ const MENU_GROUPS = [
   // FF-3926-012 record store, called Contacts since FF-2640-016. Directly above
   // the BOS version line. Old /dashboard/desk links still open it.
   { title: 'Contacts', items: [['/dashboard/contacts', 'Contacts']] },
+  // FF-2640-022: the company documents shelf, and FF-2640-023: Andrew's vault.
+  // The last group, directly above the BOS version line and Log out.
+  { title: 'Documents', items: [['/dashboard/documents', 'Documents'], ['/dashboard/vault', 'Vault']] },
 ];
 
 // BF-2639-055: the Menu toggles show three horizontal lines, not the word.
@@ -150,11 +160,11 @@ function navHtml(active) {
     </nav>`;
 }
 
-function menuIsActive(active) {
-  return !!active && !PRIMARY_NAV.some(([h]) => h === active);
+function menuIsActive(active, nav = PRIMARY_NAV) {
+  return !!active && !nav.some(([h]) => h === active);
 }
 
-// Phone-only fixed bottom bar: Back, then the same three destinations plus Menu.
+// Phone-only fixed bottom bar: Back, Overview, Appts, Today (FF-2640-024), Menu.
 // BF-2640-081: Back sits on the far left of this bar only (not the desktop top
 // bar). It opens the last BOS dashboard page Andrew was on in this visit, from a
 // history kept in sessionStorage (one tab = one visit). Only /dashboard pages
@@ -201,14 +211,14 @@ const BACK_SCRIPT = `<script>
 </script>`;
 
 function bottomNavHtml(active) {
-  const links = PRIMARY_NAV.map(
+  const links = PHONE_NAV.map(
     ([h, l]) => `<a href="${h}"${active === h ? ' class="active" aria-current="page"' : ''}>${l}</a>`
   ).join('');
   return `
 <nav class="bottomnav" aria-label="Main">
   <button type="button" class="nav-back" data-dash-back aria-label="Back">${BACK_ICON}<span>Back</span></button>
   ${links}
-  <button type="button" class="${menuIsActive(active) ? 'active' : ''}" data-menu-toggle aria-label="Menu" aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">${HAMBURGER}</button>
+  <button type="button" class="${menuIsActive(active, PHONE_NAV) ? 'active' : ''}" data-menu-toggle aria-label="Menu" aria-haspopup="dialog" aria-controls="menu-sheet" aria-expanded="false">${HAMBURGER}</button>
 </nav>
 ${BACK_SCRIPT}`;
 }

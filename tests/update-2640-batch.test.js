@@ -81,7 +81,10 @@ test('BF-2640-071: generic phone photo names become i001.jpg, i002.jpg; real nam
     assert.equal(r.status, 302);
   }
   const names = () => db.db.prepare(`SELECT original_name, stored_name FROM customer_files WHERE customer_id = ? ORDER BY created_at, rowid`).all(c.id);
-  assert.deepEqual(names().map((f) => f.original_name), ['i001.jpg', 'i002.jpg', 'kitchen.jpg']);
+  // FF-2640-021: a new file's one readable name adds the year and week (i001-2640.jpg).
+  const wk = db.yearWeekTag();
+  assert.deepEqual(names().map((f) => f.original_name), [`i001-${wk}.jpg`, `i002-${wk}.jpg`, `kitchen-${wk}.jpg`]);
+  assert.deepEqual(names().map((f) => f.stored_name), names().map((f) => f.original_name), 'the same name on the Files page and in the folder');
 
   // Other real names are never renamed.
   for (const real of ['IMG_1234.jpg', 'image.png', 'sale-packet-signed-2026-09-29.png', 'photos/kitchen.jpg']) {
@@ -98,8 +101,8 @@ test('BF-2640-071: generic phone photo names become i001.jpg, i002.jpg; real nam
   assert.equal(old.original_name, 'i003.jpg');
   assert.equal(old.stored_name, 'old-2640.jpg');
   assert.equal(db.phonePhotoName('image.jpeg'), 'i004.jpg');
-  const all = db.db.prepare(`SELECT original_name FROM customer_files WHERE original_name LIKE 'i0%.jpg'`).all().map((r) => r.original_name);
-  assert.equal(all.filter((n) => n === 'i001.jpg').length, 1, 'i001.jpg is handed out once');
+  const all = db.db.prepare(`SELECT original_name FROM customer_files WHERE original_name LIKE 'i0%.jpg'`).all().map((r) => r.original_name.replace(/-\d{4}\.jpg$/, '.jpg'));
+  assert.equal(all.filter((n) => n === 'i001.jpg').length, 1, 'i001 is handed out once');
   assert.equal(new Set(all).size, all.length, 'no number is reused');
 });
 

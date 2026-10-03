@@ -7,3 +7,4 @@ data/*.xlsx
 data/*.md
 data/*.html
 data/*.txt
+data/vault-seed*.json

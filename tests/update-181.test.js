@@ -87,7 +87,9 @@ test('BF-2639-064: a file uploaded through the assistant and filed by naming the
   const body = Buffer.from(await raw.arrayBuffer());
   assert.ok(isPng(body), 'body starts with 89 50 4E 47');
   assert.ok(body.equals(png), 'exactly the uploaded bytes');
-  assert.ok(fs.existsSync(path.join(UPLOADS, c.id, row.stored_name)), 'bytes moved to the customer folder');
+  // FF-2640-021: a new file lives in the customer's last-name folder under its readable name.
+  assert.equal(row.folder, 'Copeland');
+  assert.ok(fs.existsSync(path.join(UPLOADS, 'Copeland', row.stored_name)), 'bytes moved to the customer folder');
 });
 
 test('BF-2639-064: a direct upload on the customer page opens with 200 and PNG bytes', async () => {
@@ -135,8 +137,9 @@ test('BF-2639-064: a missing stored_name gives a normal error, and its viewer st
 test('BF-2639-064: if the bytes cannot be written, the upload fails and no row is kept', async () => {
   const c = db.createCustomer({ name: 'Write Fails', phone: '+18045550169' });
   // Make the customer's upload folder impossible to create: a plain FILE sits at that path.
+  // FF-2640-021: that folder is the customer's last-name folder now.
   fs.mkdirSync(UPLOADS, { recursive: true });
-  const blocker = path.join(UPLOADS, c.id);
+  const blocker = path.join(UPLOADS, db.customerFolderName(c.id));
   fs.writeFileSync(blocker, 'not a directory');
   madeDirs.add(blocker);
   const r = await postMultipart(`/dashboard/customers/${c.id}/files`, {}, { data: makePng(), name: 'x.png' });
@@ -547,9 +550,10 @@ test('FF-3926-012: Contacts (once Desk) sits in its own Menu group directly abov
   const html = render.dashboardLayout({ title: 'T', active: '/dashboard', body: '<p>x</p>', context: {} });
   const sheet = html.slice(html.indexOf('id="menu-sheet"'), html.indexOf('</script>', html.indexOf('id="menu-sheet"')));
   const titles = [...sheet.matchAll(/menu-group-title">([^<]+)</g)].map((m) => m[1]);
-  assert.deepEqual(titles, ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training', 'Today', 'Contacts']);
+  // FF-2640-022 added the Documents group as the last group, above the version line.
+  assert.deepEqual(titles, ['Customer Relations', 'Financial', 'Production', 'Marketing', 'Training', 'Today', 'Contacts', 'Documents']);
   const contacts = sheet.indexOf('href="/dashboard/contacts"');
-  assert.ok(contacts > sheet.indexOf('menu-group-title">Today<') && contacts < sheet.indexOf('class="menu-version"'));
+  assert.ok(contacts > sheet.indexOf('menu-group-title">Today<') && contacts < sheet.indexOf('menu-group-title">Documents<'));
   assert.ok(!/>Desk</.test(sheet), 'the Menu does not say Desk');
 });
 
@@ -688,14 +692,15 @@ test('FF-3926-013: "which cars have FSD" matches notes and PDF text, never a pho
 });
 
 // ================================================================ BF-2640-081
-test('BF-2640-081: phone bar is Back, Overview, Appts, Pipeline, Menu; desktop top bar has no Back', () => {
+// FF-2640-024 put Today in the Pipeline spot on the phone bar; Pipeline stays in the Menu.
+test('BF-2640-081: phone bar is Back, Overview, Appts, Today, Menu; desktop top bar has no Back', () => {
   const render = require('../src/render');
   const html = render.dashboardLayout({ title: 'T', active: '/dashboard', body: '<p>x</p>', context: {} });
   const bottom = html.slice(html.indexOf('<nav class="bottomnav"'));
   const bar = bottom.slice(0, bottom.indexOf('</nav>'));
   const items = [...bar.matchAll(/<(a|button)\b([^>]*)>/g)].map(([, tag, attrs]) =>
     tag === 'a' ? attrs.match(/href="([^"]+)"/)[1] : (attrs.match(/aria-label="([^"]+)"/) || [])[1]);
-  assert.deepEqual(items, ['Back', '/dashboard', '/dashboard/appointments', '/dashboard/pipeline', 'Menu']);
+  assert.deepEqual(items, ['Back', '/dashboard', '/dashboard/appointments', '/dashboard/today', 'Menu']);
   assert.match(bar, /data-dash-back[^>]*>[^]*<span>Back<\/span>/);
   const top = html.slice(html.indexOf('<nav class="topnav-links"'), html.indexOf('</nav>', html.indexOf('<nav class="topnav-links"')));
   assert.ok(!/data-dash-back|Back/.test(top), 'no Back on the desktop top bar');

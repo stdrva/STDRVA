@@ -1,6 +1,6 @@
 docs/tickets.md
 
-Format: BF-YYWW-NNN for bugs and FF-YYWW-NNN for features. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Features use FF- names. Bugs use BF- names. Next unused BF- name: BF-2640-085. Next unused FF- name: FF-2640-021.
+Format: BF-YYWW-NNN for bugs and FF-YYWW-NNN for features. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Features use FF- names. Bugs use BF- names. Next unused BF- name: BF-2640-086. Next unused FF- name: FF-2640-025.
 
 Lessons are L1 L2 L3 L4. Old FF-3926-* names in CHANGELOG.md are history.
 
@@ -13,6 +13,20 @@ Open
 BF-2640-073 Retired. This was an Architect checklist problem. This is not a BOS job. Do not reuse this name.
 
 BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Code copies the Architect exact files. Claude Code does not rewrite them.
+
+Finished in BOS 1.8.5
+
+These tickets are committed and pushed to main in BOS 1.8.5. Live BOS gets them after Andrew runs Manual Deploy of main on Render.
+
+BF-2640-085 Tomorrow page. Now Tomorrow opens a list that says Tomorrow, then Open tomorrow's day page opens a day page that says Today. We do not want that list. The button Tomorrow on Today opens the day page for the next day. The heading and the title say Tomorrow when the date is tomorrow. A day that is not today and not tomorrow says the date. Back to today stays. The visit list does not get a second screen in front of it. The day page must show the visits BOS already stored for that date. A visit that exists only on the phone calendar is not in BOS.
+
+FF-2640-024 Today on the phone bar. Now the phone bottom bar is Back, Overview, Appts, Pipeline, and Menu. We want Today in the Pipeline spot. The bar is Back, Overview, Appts, Today, and Menu. Pipeline stays in the Menu. Today opens the day page.
+
+FF-2640-021 One file name. Now BOS keeps a machine id in the uploads folder and a different name on the Files page. We want one readable name on new files. The folder is the customer last name. A second customer with the same last name is Walker-2. The file name is the thing plus the year and week, as in contract-2640.pdf. October 2, 2026 is week 40, so the week part is 2640. Do not put a first name in the name. Do not add a customer number in this upload. The same name is the name on the Files page and the name in the folder. A rename on the Files page renames the file. Search still uses that name, the note, and the words already read out of the file. Old files stay as they are. Do not rename files already stored. When BOS will not start, we want that same folder and those same file names, plus customer.txt with the name, the phone, the email, the address, and the note.
+
+FF-2640-022 Company documents. We want a Documents item in the Menu near the end, above the version line and Log out. The shelf holds the warranty certificate, product pages, handwritten referrals, insurance, the business license, and product photos. The first insurance file is the certificate of liability, policy Q51-0725519, and the umbrella policy Q34-0270524, effective 10/02/2026 through 10/02/2027. Warranty in the email box attaches the warranty certificate. Andrew can upload a product photo from the email box and tick that photo, and the description goes with the photo. Andrew can attach any document on this shelf the same way Andrew ticks a file. Andrew still confirms before send. If the warranty PDF is not in the repo, Claude Code asks Andrew for the file. Claude Code does not invent a new certificate. Claude Code note: the certificate Andrew has shows the general liability policy as Q61-0725519, so BOS uses Q61-0725519. The warranty PDF is not in the repo, and Claude Code asked Andrew for the file.
+
+FF-2640-023 Personal vault. We want a vault for Andrew only. A login row holds the site name, the URL, the username, the password, and a note. Build the Clerk's Information System row. The site is https://cis.scc.virginia.gov/. The username is andrewkerwin. The email is andrew2481@aol.com. The password is blank. The note is kept only in the vault and is not written here. The password does not go in GitHub.
 
 Finished in BOS 1.8.4
 

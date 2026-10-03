@@ -836,6 +836,7 @@ function updateCustomer(id, { name, phone, email, address, notes }, { actor } = 
       }
     }
   }
+  writeCustomerTxt(id); // FF-2640-021: keep customer.txt current
   return getCustomer(id);
 }
 
@@ -1213,7 +1214,10 @@ const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 function uploadsDirFor(customer_id) {
   return path.join(UPLOADS_DIR, customer_id || '_unassigned');
 }
+// FF-2640-021: a readable-name file records its folder; older files live in
+// uploads/<customer_id>/ under a machine id.
 function fileBytesPath(fileRow) {
+  if (fileRow.folder) return path.join(UPLOADS_DIR, fileRow.folder, fileRow.stored_name);
   return path.join(uploadsDirFor(fileRow.customer_id), fileRow.stored_name);
 }
 // Returns the path the bytes can actually be read from, or null. Rows filed
@@ -1250,6 +1254,28 @@ function setFileAssignment(id, { customer_id, assignment_status, suggested_custo
     suggested_customer_id || null,
     id
   );
+  // FF-2640-021: a readable-name file moves into the new customer's folder
+  // under the same name (changed slightly on a clash), and the row follows.
+  if (before && before.folder && (before.customer_id || null) !== (customer_id || null)) {
+    const folder = customer_id ? customerFolderName(customer_id) : UNASSIGNED_FOLDER;
+    const dir = path.join(UPLOADS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    const u = uniqueFileName(before.original_name, id, customer_id, dir);
+    if (from) fs.renameSync(from, path.join(dir, u.name));
+    db.prepare(`UPDATE customer_files SET customer_id = ?, assignment_status = ?, suggested_customer_id = ?, folder = ?, stored_name = ?, original_name = ?, name_clash_of = ? WHERE id = ?`).run(
+      customer_id || null,
+      assignment_status || null,
+      suggested_customer_id || null,
+      folder,
+      u.name,
+      u.name,
+      u.clash ? before.original_name : before.name_clash_of || null,
+      id
+    );
+    syncFileSearch(id);
+    if (customer_id) writeCustomerTxt(customer_id);
+    return getCustomerFile(id);
+  }
   // FF-2640-017: moving onto a customer that already has a different file with
   // this name changes the moved file's name slightly instead of clashing.
   if (before && (before.customer_id || null) !== (customer_id || null)) {
@@ -2726,13 +2752,15 @@ function setListRowDone(id, done) {
 // ---- FF-2640-017: file names never silently collide. A new name that matches
 // a different live stored file in the same place (the same customer, or the
 // unassigned files) gets " (2)", " (3)", ... before the extension. Different
-// customers can each keep a file called contract.pdf.
-function uniqueFileName(name, exceptId, customer_id) {
+// customers can each keep a file called contract.pdf. With `dir`, a name that
+// is already a file on disk in that folder counts as taken too (FF-2640-021).
+function uniqueFileName(name, exceptId, customer_id, dir) {
   const want = String(name || 'file').trim() || 'file';
   const taken = (n) =>
     !!db
       .prepare(`SELECT 1 FROM customer_files WHERE deleted_at IS NULL AND lower(original_name) = lower(?) AND id IS NOT ? AND customer_id IS ?`)
-      .get(n, exceptId || null, customer_id || null);
+      .get(n, exceptId || null, customer_id || null) ||
+    (!!dir && fs.existsSync(path.join(dir, n)) && !(exceptId && fileOnDiskIs(exceptId, path.join(dir, n))));
   if (!taken(want)) return { name: want, clash: false };
   const m = want.match(/^(.*?)(\.[^.]+)?$/);
   const base = m[1].replace(/ \(\d+\)$/, '');
@@ -2742,42 +2770,343 @@ function uniqueFileName(name, exceptId, customer_id) {
     if (!taken(candidate)) return { name: candidate, clash: true };
   }
 }
+function fileOnDiskIs(id, p) {
+  const f = getCustomerFile(id);
+  return !!f && path.resolve(fileBytesPath(f)).toLowerCase() === path.resolve(p).toLowerCase();
+}
+
+// ---- FF-2640-021: one readable file name. New customer files are stored under
+// uploads/<customer last name>/<thing>-<YYWW>.<ext>, and that same name is the
+// name on the Files page, so the folder can be read without BOS. A second
+// customer with the same last name gets Walker-2, Walker-3, and so on. No first
+// name and no customer number go in a name. Files stored before this release
+// keep their machine-id names and folders (customer_files.folder is NULL).
+// Each customer folder also holds customer.txt with the name, phone, email,
+// address, and note, so the files still make sense when BOS will not start.
+(function readableNameColumns() {
+  const custCols = new Set(db.prepare(`PRAGMA table_info(customers)`).all().map((c) => c.name));
+  if (!custCols.has('folder_name')) db.exec(`ALTER TABLE customers ADD COLUMN folder_name TEXT`);
+  const fileCols = new Set(db.prepare(`PRAGMA table_info(customer_files)`).all().map((c) => c.name));
+  if (!fileCols.has('folder')) db.exec(`ALTER TABLE customer_files ADD COLUMN folder TEXT`);
+})();
+const UNASSIGNED_FOLDER = '_unassigned';
+
+// Year and ISO week of an Eastern calendar date: 2026-10-02 is week 40 -> "2640".
+function yearWeekTag(day = etDateString()) {
+  const [y, m, d] = String(day).split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  const dow = (t.getUTCDay() + 6) % 7; // Monday = 0
+  t.setUTCDate(t.getUTCDate() - dow + 3); // the Thursday of this ISO week
+  const weekYear = t.getUTCFullYear();
+  const jan4 = new Date(Date.UTC(weekYear, 0, 4));
+  const week = 1 + Math.round((t - jan4) / 86400000 / 7 - 3 / 7 + ((jan4.getUTCDay() + 6) % 7) / 7);
+  return `${String(weekYear % 100).padStart(2, '0')}${String(week).padStart(2, '0')}`;
+}
+
+// The customer's folder name, assigned once and kept: the last name, then
+// Last-2, Last-3 for a second and third customer with the same last name.
+function customerFolderName(customer_id) {
+  const c = getCustomer(customer_id);
+  if (!c) return UNASSIGNED_FOLDER;
+  if (c.folder_name) return c.folder_name;
+  const words = String(c.name || '').trim().split(/\s+/).filter(Boolean);
+  const last = (words[words.length - 1] || '').replace(/[^A-Za-z0-9'-]+/g, '').replace(/'/g, '');
+  const base = last ? last.charAt(0).toUpperCase() + last.slice(1) : 'Customer';
+  // A folder that already exists on disk is never reused for a new customer.
+  const used = (name) =>
+    !!db.prepare(`SELECT 1 FROM customers WHERE lower(folder_name) = lower(?) AND id <> ?`).get(name, c.id) ||
+    fs.existsSync(path.join(UPLOADS_DIR, name));
+  let name = base;
+  for (let i = 2; used(name); i++) name = `${base}-${i}`;
+  db.prepare(`UPDATE customers SET folder_name = ? WHERE id = ?`).run(name, c.id);
+  return name;
+}
+
+// "Contract.PDF" -> "contract-2640.pdf". The customer's first name is taken
+// out, and a name that already ends in this week's tag is not tagged twice.
+function readableFileName(filename, customer, day) {
+  const tag = yearWeekTag(day);
+  const raw = String(filename || '').split(/[\\/]/).pop();
+  const ext = (path.extname(raw) || '').toLowerCase().replace(/[^.a-z0-9]/g, '');
+  let base = raw.slice(0, raw.length - path.extname(raw).length);
+  const first = customer && String(customer.name || '').trim().split(/\s+/).length > 1 ? String(customer.name).trim().split(/\s+/)[0] : '';
+  if (first) base = base.replace(new RegExp(`(^|[^A-Za-z])${first.replace(/[^A-Za-z0-9]/g, '')}(?=$|[^A-Za-z])`, 'gi'), '$1');
+  let slug = base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  slug = slug.replace(new RegExp(`-${tag}$`), '') || 'file';
+  return `${slug}-${tag}${ext}`;
+}
+
+function customerTxt(c) {
+  return [
+    `Name: ${c.name || ''}`,
+    `Phone: ${c.phone || ''}`,
+    `Email: ${c.email || ''}`,
+    `Address: ${c.address || ''}`,
+    `Note: ${(c.notes || '').replace(/\r?\n/g, ' ')}`,
+    '',
+  ].join('\n');
+}
+// Rewrites customer.txt in the customer's readable folder, if that folder exists.
+function writeCustomerTxt(customer_id) {
+  const c = getCustomer(customer_id);
+  if (!c || !c.folder_name) return;
+  const dir = path.join(UPLOADS_DIR, c.folder_name);
+  if (!fs.existsSync(dir)) return;
+  fs.writeFileSync(path.join(dir, 'customer.txt'), customerTxt(c));
+}
+
+// The one writer for new customer files: picks the folder and the readable
+// name, writes the bytes, checks they landed, and creates the row whose
+// stored_name and original_name are that same name. Returns the new file id.
+function storeCustomerFile({ customer_id, job_id, filename, data, mime_type, note, assignment_status, suggested_customer_id }) {
+  const folder = customer_id ? customerFolderName(customer_id) : UNASSIGNED_FOLDER;
+  const dir = path.join(UPLOADS_DIR, folder);
+  fs.mkdirSync(dir, { recursive: true });
+  const u = uniqueFileName(readableFileName(filename, customer_id ? getCustomer(customer_id) : null), null, customer_id, dir);
+  const filePath = path.join(dir, u.name);
+  fs.writeFileSync(filePath, data);
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).size !== data.length) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw new Error('Upload bytes were not written to disk');
+  }
+  const id = newId();
+  try {
+    db.prepare(
+      `INSERT INTO customer_files (id, customer_id, job_id, stored_name, original_name, mime_type, size, note, created_at, assignment_status, suggested_customer_id, name_clash_of, folder)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(id, customer_id || null, job_id || null, u.name, u.name, mime_type || null, data.length, note || null, nowIso(), assignment_status || null, suggested_customer_id || null, u.clash ? readableFileName(filename, customer_id ? getCustomer(customer_id) : null) : null, folder);
+  } catch (e) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw e;
+  }
+  syncFileSearch(id);
+  if (customer_id) writeCustomerTxt(customer_id);
+  return id;
+}
+
+// A rename changes the visible name. For a readable-name file the file on disk
+// is renamed too, so the two names stay the same (FF-2640-021). The extension
+// is kept when the new name leaves it off.
 function renameCustomerFile(id, newName, actor) {
   const f = getCustomerFile(id);
   if (!f || f.deleted_at) throw new Error('File not found');
-  const wanted = String(newName || '').trim();
+  let wanted = String(newName || '').trim().replace(/[\\/:*?"<>|]+/g, '-');
   if (!wanted) throw new Error('A file needs a name');
+  if (f.folder) {
+    const ext = path.extname(f.original_name || '');
+    if (ext && !path.extname(wanted)) wanted += ext;
+    const dir = path.join(UPLOADS_DIR, f.folder);
+    const u = uniqueFileName(wanted, f.id, f.customer_id, dir);
+    const from = locateFileBytes(f);
+    if (from) fs.renameSync(from, path.join(dir, u.name));
+    db.prepare(`UPDATE customer_files SET original_name = ?, stored_name = ?, name_clash_of = ? WHERE id = ?`).run(u.name, u.name, u.clash ? wanted : null, f.id);
+    syncFileSearch(f.id);
+    logActivity({ entity_type: 'file', entity_id: f.id, customer_id: f.customer_id, field: 'renamed', old_value: f.original_name, new_value: u.name, actor });
+    return { file: getCustomerFile(f.id), clash: u.clash, asked_for: wanted };
+  }
   const u = uniqueFileName(wanted, f.id, f.customer_id);
   db.prepare(`UPDATE customer_files SET original_name = ?, name_clash_of = ? WHERE id = ?`).run(u.name, u.clash ? wanted : null, f.id);
   syncFileSearch(f.id);
   logActivity({ entity_type: 'file', entity_id: f.id, customer_id: f.customer_id, field: 'renamed', old_value: f.original_name, new_value: u.name, actor });
   return { file: getCustomerFile(f.id), clash: u.clash, asked_for: wanted };
 }
-// A copy is a new row with its own bytes on disk, on the same customer unless
-// another is given. The copy's name follows the clash rule, so it never shares
-// the original's visible name.
+// A copy is a new file with its own bytes on disk, on the same customer unless
+// another is given. A copy is a new file, so it gets a readable name, and the
+// clash rule keeps it from ever sharing the original's visible name.
 function copyCustomerFile(id, { customer_id, actor } = {}) {
   const f = getCustomerFile(id);
   if (!f || f.deleted_at) throw new Error('File not found');
   const src = locateFileBytes(f);
   if (!src) throw new Error('That file is missing from storage, so it cannot be copied');
   const target = customer_id === undefined ? f.customer_id : customer_id || null;
-  const stored = `${newId()}${path.extname(f.stored_name || '') || path.extname(f.original_name || '')}`;
-  const dir = uploadsDirFor(target);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.copyFileSync(src, path.join(dir, stored));
-  const newId_ = createCustomerFile({
+  const newId_ = storeCustomerFile({
     customer_id: target,
     job_id: target === f.customer_id ? f.job_id : null,
-    stored_name: stored,
-    original_name: f.original_name,
+    filename: f.original_name,
+    data: fs.readFileSync(src),
     mime_type: f.mime_type,
-    size: f.size,
     note: `Copy of "${f.original_name}"`,
     assignment_status: target ? 'confirmed' : 'unassigned',
   });
   logActivity({ entity_type: 'file', entity_id: newId_, customer_id: target, field: 'copied_from', new_value: f.original_name, actor });
   return getCustomerFile(newId_);
+}
+
+// ---- FF-2640-022: company documents. One shelf of files that belong to the
+// company, not to a customer: the warranty certificate, product pages,
+// handwritten referrals, insurance, the business license, and product photos.
+// A document can be ticked in the email box like a customer file. The bytes
+// live in uploads/_documents under a readable name.
+const DOCUMENT_CATEGORIES = {
+  warranty: 'Warranty certificate',
+  product_page: 'Product pages',
+  referral: 'Handwritten referrals',
+  insurance: 'Insurance',
+  license: 'Business license',
+  product_photo: 'Product photos',
+};
+const DOCUMENTS_FOLDER = '_documents';
+db.exec(`
+CREATE TABLE IF NOT EXISTS company_documents (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT '${DEFAULT_TENANT_ID}',
+  category TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  stored_name TEXT,
+  mime_type TEXT,
+  size INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  deleted_at TEXT
+);
+`);
+// The first insurance file. The PDF itself is not in the repo (GitHub is
+// public), so this row starts with no file and Andrew uploads the PDF into it
+// on the Documents page. The policy numbers and dates are copied from the
+// certificate Andrew has.
+(function seedInsuranceCertificate() {
+  const n = db.prepare(`SELECT COUNT(*) AS n FROM company_documents WHERE category = 'insurance'`).get().n;
+  if (n) return;
+  db.prepare(`INSERT INTO company_documents (id, category, title, description, created_by, created_at) VALUES (?,?,?,?,?,?)`).run(
+    newId(),
+    'insurance',
+    'Certificate of liability insurance',
+    'Erie Insurance. Commercial general liability policy Q61-0725519 and umbrella policy Q34-0270524, effective 10/02/2026 through 10/02/2027.',
+    'seed',
+    nowIso()
+  );
+})();
+function documentsDir() {
+  return path.join(UPLOADS_DIR, DOCUMENTS_FOLDER);
+}
+function documentPath(d) {
+  return d && d.stored_name ? path.join(documentsDir(), d.stored_name) : null;
+}
+function getDocument(id) {
+  const d = db.prepare(`SELECT * FROM company_documents WHERE id = ? AND deleted_at IS NULL`).get(id);
+  return d ? { ...d, has_file: !!(d.stored_name && fs.existsSync(documentPath(d))) } : null;
+}
+function listDocuments({ category } = {}) {
+  const rows = category
+    ? db.prepare(`SELECT id FROM company_documents WHERE deleted_at IS NULL AND category = ? ORDER BY created_at`).all(category)
+    : db.prepare(`SELECT id FROM company_documents WHERE deleted_at IS NULL ORDER BY category, created_at`).all();
+  return rows.map((r) => getDocument(r.id));
+}
+// Writes the bytes under a readable name ("warranty-certificate-2640.pdf").
+function writeDocumentBytes(filename, title, data) {
+  const dir = documentsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const ext = path.extname(String(filename || '')) || '';
+  let name = readableFileName(`${title || filename || 'document'}${ext}`, null);
+  const m = name.match(/^(.*?)(\.[^.]+)?$/);
+  for (let i = 2; fs.existsSync(path.join(dir, name)); i++) name = `${m[1]} (${i})${m[2] || ''}`;
+  fs.writeFileSync(path.join(dir, name), data);
+  return name;
+}
+function addDocument({ category, title, description, filename, mime_type, data, created_by }) {
+  if (!DOCUMENT_CATEGORIES[category]) throw new Error('Pick what kind of document this is');
+  const t = String(title || '').trim() || String(filename || '').replace(/\.[^.]+$/, '').trim();
+  if (!t) throw new Error('A document needs a title');
+  if (!data || !data.length) throw new Error('Choose a file first');
+  const stored = writeDocumentBytes(filename, t, data);
+  const id = newId();
+  db.prepare(
+    `INSERT INTO company_documents (id, category, title, description, stored_name, mime_type, size, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(id, category, t, String(description || '').trim() || null, stored, mime_type || null, data.length, created_by || null, nowIso());
+  return getDocument(id);
+}
+// Puts a file into a document row that has none yet (the seeded insurance row).
+function setDocumentFile(id, { filename, mime_type, data }) {
+  const d = getDocument(id);
+  if (!d) throw new Error('Document not found');
+  if (!data || !data.length) throw new Error('Choose a file first');
+  const stored = writeDocumentBytes(filename, d.title, data);
+  db.prepare(`UPDATE company_documents SET stored_name = ?, mime_type = ?, size = ? WHERE id = ?`).run(stored, mime_type || null, data.length, id);
+  return getDocument(id);
+}
+// The warranty certificate the Warranty button attaches: the newest one with a file.
+function warrantyCertificate() {
+  return listDocuments({ category: 'warranty' }).filter((d) => d.has_file).pop() || null;
+}
+
+// ---- FF-2640-023: the personal vault. Logins for Andrew only: each row has
+// the site name, the URL, the username, the email, the password, and a note.
+// A row belongs to the signed-in user and no one else ever reads it. The vault
+// is not in search, Foreman has no vault tool, and nothing here is in GitHub
+// except this code. The password is stored only in the database.
+db.exec(`
+CREATE TABLE IF NOT EXISTS vault_logins (
+  id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL REFERENCES users(id),
+  site_name TEXT NOT NULL,
+  url TEXT,
+  username TEXT,
+  email TEXT,
+  password TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`);
+const VAULT_FIELDS = ['site_name', 'url', 'username', 'email', 'password', 'note'];
+// The Clerk's Information System row Andrew asked for. The password is blank.
+// The note is kept out of the code because GitHub is public: on the laptop it
+// comes from data/vault-seed.local.json (never committed), and on live BOS
+// Andrew types it into the row once.
+const CIS_LOGIN = {
+  site_name: "Clerk's Information System",
+  url: 'https://cis.scc.virginia.gov/',
+  username: 'andrewkerwin',
+  email: 'andrew2481@aol.com',
+  password: '',
+};
+function localVaultNote(site) {
+  try {
+    const seed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'vault-seed.local.json'), 'utf8'));
+    return seed && seed[site] && typeof seed[site].note === 'string' ? seed[site].note : '';
+  } catch {
+    return '';
+  }
+}
+function seedVaultFor(user) {
+  if (!user || user.username !== defaultUsername()) return;
+  const flag = `vault_seed_cis_${user.id}`;
+  if (db.prepare(`SELECT value FROM company_counters WHERE tenant_id = ? AND name = ?`).get(user.tenant_id, flag)) return;
+  nextCompanyCounter(flag, user.tenant_id);
+  addVaultLogin(user, { ...CIS_LOGIN, note: localVaultNote(CIS_LOGIN.site_name) });
+}
+function listVaultLogins(user) {
+  if (!user) return [];
+  seedVaultFor(user);
+  return db.prepare(`SELECT * FROM vault_logins WHERE owner_user_id = ? ORDER BY site_name COLLATE NOCASE`).all(user.id);
+}
+function getVaultLogin(user, id) {
+  if (!user) return null;
+  return db.prepare(`SELECT * FROM vault_logins WHERE id = ? AND owner_user_id = ?`).get(id, user.id) || null;
+}
+function addVaultLogin(user, fields) {
+  if (!user) throw new Error('No user');
+  const v = {};
+  for (const k of VAULT_FIELDS) v[k] = String(fields[k] == null ? '' : fields[k]).trim();
+  if (!v.site_name) throw new Error('A login needs a site name');
+  const id = newId();
+  const ts = nowIso();
+  db.prepare(
+    `INSERT INTO vault_logins (id, owner_user_id, site_name, url, username, email, password, note, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(id, user.id, v.site_name, v.url || null, v.username || null, v.email || null, v.password || null, v.note || null, ts, ts);
+  return getVaultLogin(user, id);
+}
+function updateVaultLogin(user, id, fields) {
+  const r = getVaultLogin(user, id);
+  if (!r) return null;
+  const v = {};
+  for (const k of VAULT_FIELDS) v[k] = fields[k] === undefined ? r[k] : String(fields[k]).trim() || null;
+  if (!v.site_name) throw new Error('A login needs a site name');
+  db.prepare(`UPDATE vault_logins SET site_name = ?, url = ?, username = ?, email = ?, password = ?, note = ?, updated_at = ? WHERE id = ?`).run(
+    v.site_name, v.url, v.username, v.email, v.password, v.note, nowIso(), id
+  );
+  return getVaultLogin(user, id);
 }
 
 // ---- BF-2640-071: phone photos named image.jpg / image.jpeg get i001.jpg,
@@ -2859,21 +3188,30 @@ CREATE TABLE IF NOT EXISTS email_drafts (
   created_at TEXT NOT NULL
 );
 `);
-function createEmailDraft({ customer_id, to_address, subject, body, file_ids, created_by }) {
+// FF-2640-022: a draft can also carry company documents from the Documents shelf.
+(function draftDocColumn() {
+  const cols = new Set(db.prepare(`PRAGMA table_info(email_drafts)`).all().map((c) => c.name));
+  if (!cols.has('doc_ids')) db.exec(`ALTER TABLE email_drafts ADD COLUMN doc_ids TEXT NOT NULL DEFAULT '[]'`);
+})();
+function createEmailDraft({ customer_id, to_address, subject, body, file_ids, doc_ids, created_by }) {
   const own = new Set(listCustomerFiles(customer_id).map((f) => f.id));
   const ids = [].concat(file_ids || []).map(String).filter((id) => own.has(id));
+  const shelf = new Set(listDocuments().filter((d) => d.has_file).map((d) => d.id));
+  const docIds = [].concat(doc_ids || []).map(String).filter((id) => shelf.has(id));
   const id = newId();
   db.prepare(
-    `INSERT INTO email_drafts (id, customer_id, to_address, subject, body, file_ids, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)`
-  ).run(id, customer_id, to_address || null, subject || null, body || null, JSON.stringify(ids), created_by || null, nowIso());
+    `INSERT INTO email_drafts (id, customer_id, to_address, subject, body, file_ids, doc_ids, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(id, customer_id, to_address || null, subject || null, body || null, JSON.stringify(ids), JSON.stringify(docIds), created_by || null, nowIso());
   return getEmailDraft(id);
 }
 function getEmailDraft(id) {
   const d = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id);
   if (!d) return null;
   let ids = [];
+  let docIds = [];
   try { ids = JSON.parse(d.file_ids || '[]'); } catch {}
-  return { ...d, file_ids: Array.isArray(ids) ? ids : [] };
+  try { docIds = JSON.parse(d.doc_ids || '[]'); } catch {}
+  return { ...d, file_ids: Array.isArray(ids) ? ids : [], doc_ids: Array.isArray(docIds) ? docIds : [] };
 }
 
 // ---- BF-2640-083: the Today day page. Day items are small to-dos Andrew adds.
@@ -3510,6 +3848,23 @@ module.exports = {
   uniqueFileName,
   renameCustomerFile,
   copyCustomerFile,
+  yearWeekTag,
+  readableFileName,
+  customerFolderName,
+  storeCustomerFile,
+  writeCustomerTxt,
+  UPLOADS_DIR,
+  DOCUMENT_CATEGORIES,
+  getDocument,
+  listDocuments,
+  documentPath,
+  addDocument,
+  setDocumentFile,
+  warrantyCertificate,
+  listVaultLogins,
+  getVaultLogin,
+  addVaultLogin,
+  updateVaultLogin,
   phonePhotoName,
   createForemanNote,
   listForemanNotes,

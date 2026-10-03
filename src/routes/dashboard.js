@@ -236,7 +236,11 @@ function filesResultsHtml(q, { page = 1, user } = {}) {
   return `${heading}<div class="table-scroll"><table class="files-table" style="margin-top:8px"><tr><th>File</th><th>Description</th><th>Linked to</th><th>Uploaded</th></tr>${shown
     .map(
       (f) => `<tr data-file-kind="${f.kind}">
-        <td><a href="${escapeHtml(openHref(f))}">${escapeHtml(f.original_name)}</a></td>
+        <td><a href="${escapeHtml(openHref(f))}">${escapeHtml(f.original_name)}</a>${
+          f.kind === 'record'
+            ? ''
+            : `<details class="files-rename"><summary>Rename</summary><form method="POST" action="/dashboard/files/${f.id}/rename" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end"><input type="text" name="name" value="${escapeHtml(f.original_name)}" required aria-label="New name"><input type="hidden" name="return_to" value="${escapeHtml(back)}"><button class="btn small secondary" type="submit" data-files-rename>Rename</button></form></details>`
+        }</td>
         <td class="subtitle" style="margin:0">${escapeHtml(f.description || '')}</td>
         <td>${linkedTo(f)}</td>
         <td>${fmtDate(f.created_at)}</td>
@@ -304,32 +308,20 @@ function customerUploadsDir(customerId) {
 // Assistant chat upload.
 // BF-2639-064: throws if the bytes did not land on disk, and never keeps a row
 // whose bytes are missing - a file that would 404 is never shown as filed.
+// FF-2640-021: the file gets one readable name (db.storeCustomerFile), used
+// both in the customer's last-name folder and on the Files page.
 function saveUpload({ customer_id, job_id, upload, note, assignment_status, suggested_customer_id }) {
-  const ext = path.extname(upload.filename || '') || '';
-  const storedName = `${newId()}${ext}`;
-  const filePath = path.join(customerUploadsDir(customer_id), storedName);
-  fs.writeFileSync(filePath, upload.data);
-  if (!fs.existsSync(filePath) || fs.statSync(filePath).size !== upload.data.length) {
-    try { fs.unlinkSync(filePath); } catch {}
-    throw new Error('Upload bytes were not written to disk');
-  }
-  try {
-    return db.createCustomerFile({
-      customer_id,
-      job_id: job_id || null,
-      stored_name: storedName,
-      // BF-2640-071: generic phone-camera names become i001.jpg, i002.jpg, ...
-      original_name: db.phonePhotoName(upload.filename || storedName),
-      mime_type: upload.mimeType || null,
-      size: upload.data.length,
-      note: note || null,
-      assignment_status,
-      suggested_customer_id,
-    });
-  } catch (e) {
-    try { fs.unlinkSync(filePath); } catch {}
-    throw e;
-  }
+  return db.storeCustomerFile({
+    customer_id,
+    job_id: job_id || null,
+    // BF-2640-071: generic phone-camera names become i001, i002, ... first.
+    filename: db.phonePhotoName(upload.filename || 'file'),
+    data: upload.data,
+    mime_type: upload.mimeType || null,
+    note: note || null,
+    assignment_status,
+    suggested_customer_id,
+  });
 }
 
 
@@ -1049,6 +1041,23 @@ function register(router, requireAuth) {
       res.redirect(`${view}?err=${encodeURIComponent(e.message)}`);
     }
   });
+  // FF-2640-021: a rename on the Files page renames the file itself, so the
+  // folder and the Files page keep showing one name.
+  router.post('/dashboard/files/:fileId/rename', requireAuth, (req, res) => {
+    const f = db.getCustomerFile(req.params.fileId);
+    const back = safeReturnTo(req.body.return_to, '/dashboard/files');
+    const sep = back.includes('?') ? '&' : '?';
+    if (!f || f.deleted_at) return res.status(404).send('File not found');
+    try {
+      const out = db.renameCustomerFile(f.id, req.body.name, actorOf(req));
+      const msg = out.clash
+        ? `A different file named ${out.asked_for} is already stored, so this file was renamed ${out.file.original_name}.`
+        : `Renamed to ${out.file.original_name}`;
+      res.redirect(`${back}${sep}ok=${encodeURIComponent(msg)}`);
+    } catch (e) {
+      res.redirect(`${back}${sep}err=${encodeURIComponent(e.message)}`);
+    }
+  });
   router.post('/dashboard/customers/:id/files/:fileId/copy', requireAuth, (req, res) => {
     const f = ownFile(req);
     if (!f) return res.status(404).send('File not found');
@@ -1268,15 +1277,12 @@ function register(router, requireAuth) {
     }
 
     const buffer = Buffer.from(match[1], 'base64');
-    const storedName = `${newId()}.png`;
-    fs.writeFileSync(path.join(customerUploadsDir(c.id), storedName), buffer);
-    const fileId = db.createCustomerFile({
+    const fileId = db.storeCustomerFile({
       customer_id: c.id,
       job_id: original.job_id || null,
-      stored_name: storedName,
-      original_name: `signed-${original.original_name.replace(/\.[^.]+$/, '')}.png`,
+      filename: `signed-${original.original_name.replace(/\.[^.]+$/, '').replace(/-\d{4}$/, '')}.png`,
+      data: buffer,
       mime_type: 'image/png',
-      size: buffer.length,
       note: `Signed copy of "${original.original_name}".${where}`,
     });
     db.logActivity({
@@ -1508,27 +1514,25 @@ function register(router, requireAuth) {
     }
     const actor = actorOf(req);
     const stamp = fmtDateTime(new Date().toISOString()); // server clock, Eastern, ends with ET
-    const storedName = `${newId()}.png`;
-    const filePath = path.join(customerUploadsDir(c.id), storedName);
-    fs.writeFileSync(filePath, buffer);
+    // FF-2640-021: a readable name with no first name in it, written before the
+    // sale completes, so a failed completion leaves nothing behind.
+    const fileId = db.storeCustomerFile({
+      customer_id: c.id,
+      filename: 'sale-packet-signed.png',
+      data: buffer,
+      mime_type: 'image/png',
+      note: `Sale packet signed on this device by ${name}, ${stamp}. Files: ${files.map((f) => f.original_name).join(', ')}`,
+    });
     let done;
     try {
       done = await finishSalePacket(c, { via: 'signed on device', actor, notify: isTicked(req.body.notify_customer) });
     } catch (e) {
-      try { fs.unlinkSync(filePath); } catch {}
+      try { fs.unlinkSync(db.fileBytesPath(db.getCustomerFile(fileId))); } catch {}
+      db.deleteCustomerFile(fileId);
       console.error('sale packet sign failed', e);
       return res.status(500).json({ ok: false, error: 'Could not complete the sale. Nothing was saved.' });
     }
-    const safeName = name.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'customer';
-    const fileId = db.createCustomerFile({
-      customer_id: c.id,
-      job_id: done.result.job.id,
-      stored_name: storedName,
-      original_name: `sale-packet-signed-${safeName}-${etDateString()}.png`,
-      mime_type: 'image/png',
-      size: buffer.length,
-      note: `Sale packet signed on this device by ${name}, ${stamp}. Files: ${files.map((f) => f.original_name).join(', ')}`,
-    });
+    db.attachFileToJob(fileId, done.result.job.id);
     db.logActivity({ entity_type: 'file', entity_id: fileId, customer_id: c.id, field: 'sale_packet_signed', new_value: `${name} · ${stamp}`, actor });
     res.json({ ok: true, file_id: fileId, redirect: `/dashboard/customers/${c.id}?ok=${encodeURIComponent('Sale packet signed and saved. ' + done.summary)}` });
   });
@@ -1627,22 +1631,40 @@ function register(router, requireAuth) {
     const wanted = new Set(asArray(ids).map(String));
     return db.listCustomerFiles(c.id).filter((f) => wanted.has(f.id));
   };
+  // FF-2640-022: company documents from the Documents shelf can be ticked too.
+  const composeDocs = (ids) => {
+    const wanted = new Set(asArray(ids).map(String));
+    return db.listDocuments().filter((d) => d.has_file && wanted.has(d.id));
+  };
   const composeHash = (v) =>
-    crypto.createHash('sha256').update(JSON.stringify([v.to, v.subject, v.body, [...v.file_ids].sort()])).digest('hex');
+    crypto.createHash('sha256').update(JSON.stringify([v.to, v.subject, v.body, [...v.file_ids].sort(), [...v.doc_ids].sort()])).digest('hex');
   function composeValues(c, src) {
     return {
       to: String(src.to ?? c.email ?? '').trim(),
       subject: String(src.subject ?? '').trim(),
       body: String(src.body ?? '').replace(/\r\n/g, '\n'),
       file_ids: composeFiles(c, src.file_ids).map((f) => f.id),
+      doc_ids: composeDocs(src.doc_ids).map((d) => d.id),
     };
   }
+  // The description goes with a document, so each ticked document that has one
+  // gets a line under the body naming the attachment and describing it.
+  const docLines = (docs) => docs.filter((d) => d.description).map((d) => `Attached: ${d.stored_name} - ${d.description}`);
   function composePage(req, res, c, v, { review = false, err = '', status = 200 } = {}) {
     const files = db.listCustomerFiles(c.id);
     const ticked = new Set(v.file_ids);
     const chosen = files.filter((f) => ticked.has(f.id));
+    const docs = db.listDocuments().filter((d) => d.has_file);
+    const tickedDocs = new Set(v.doc_ids);
+    const chosenDocs = docs.filter((d) => tickedDocs.has(d.id));
+    // FF-2640-022: Warranty also ticks the warranty certificate on the shelf.
+    const warranty = db.warrantyCertificate();
     const snippet = (key, label) =>
-      `<button type="button" class="btn small secondary" data-canned="${key}" data-canned-text="${escapeHtml(EMAIL_SNIPPETS[key])}">${label}</button>`;
+      `<button type="button" class="btn small secondary" data-canned="${key}" data-canned-text="${escapeHtml(EMAIL_SNIPPETS[key])}"${key === 'warranty' && warranty ? ` data-attach-doc="${warranty.id}"` : ''}>${label}</button>`;
+    const docBox = (d) => `<div class="compose-file" data-compose-doc="${d.id}">
+                    <label style="display:flex;gap:8px;align-items:center;margin:0;flex:1"><input type="checkbox" name="doc_ids" value="${d.id}" style="width:auto"${tickedDocs.has(d.id) ? ' checked' : ''}> <span>${escapeHtml(d.title)}${d.description ? ` <span class="subtitle">${escapeHtml(d.description)}</span>` : ''}</span></label>
+                    <a class="btn small secondary" href="/dashboard/documents/${d.id}/file" target="_blank" rel="noopener">Open</a>
+                  </div>`;
     const body = `
       ${backLink(`/dashboard/customers/${c.id}`, c.name)}
       <h1>Email ${escapeHtml(c.name)}</h1>
@@ -1669,11 +1691,21 @@ function register(router, requireAuth) {
                 .join('')}</div>`
             : '<p class="subtitle">No files on this customer yet.</p>'
         }
+        <h3>Company documents</h3>
+        ${warranty ? '' : '<p class="subtitle" data-no-warranty>No warranty certificate is on the Documents shelf yet, so Warranty adds only the note.</p>'}
+        <div class="compose-files" id="compose-docs">${docs.map(docBox).join('') || '<p class="subtitle" data-no-docs>No documents on the shelf yet.</p>'}</div>
+        <div class="compose-photo" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">
+          <div><label for="compose-photo-file">Upload a product photo</label><input type="file" id="compose-photo-file" accept="image/*"></div>
+          <div style="flex:1 1 180px"><label for="compose-photo-desc">Photo description</label><input type="text" id="compose-photo-desc"></div>
+          <button type="button" class="btn small secondary" data-photo-upload>Upload and tick</button>
+        </div>
+        <p class="subtitle" id="compose-photo-status"></p>
         ${
           review
             ? `<div class="panel compose-review" id="compose-review">
                 <h2 style="margin-top:0">Send this email?</h2>
-                <p><strong>To:</strong> ${escapeHtml(v.to)}<br><strong>Subject:</strong> ${escapeHtml(v.subject)}<br><strong>Attachments:</strong> ${chosen.length ? chosen.map((f) => escapeHtml(f.original_name)).join(', ') : 'none'}</p>
+                <p><strong>To:</strong> ${escapeHtml(v.to)}<br><strong>Subject:</strong> ${escapeHtml(v.subject)}<br><strong>Attachments:</strong> ${chosen.length || chosenDocs.length ? [...chosen.map((f) => escapeHtml(f.original_name)), ...chosenDocs.map((d) => escapeHtml(d.stored_name))].join(', ') : 'none'}</p>
+                ${docLines(chosenDocs).length ? `<p data-doc-lines>${docLines(chosenDocs).map(escapeHtml).join('<br>')}</p>` : ''}
                 <div class="compose-review-body">${escapeHtml(v.body).replace(/\n/g, '<br>')}</div>
                 <input type="hidden" name="reviewed" value="${composeHash(v)}">
                 <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
@@ -1706,6 +1738,43 @@ function register(router, requireAuth) {
           });
           document.addEventListener('click', function (e) {
             var canned = e.target.closest('[data-canned]');
+            if (canned && canned.getAttribute('data-attach-doc')) {
+              var wb = form.querySelector('input[name="doc_ids"][value="' + canned.getAttribute('data-attach-doc') + '"]');
+              if (wb && !wb.checked) wb.checked = true;
+            }
+            var up = e.target.closest('[data-photo-upload]');
+            if (up) {
+              var fileEl = document.getElementById('compose-photo-file');
+              var status = document.getElementById('compose-photo-status');
+              if (!fileEl.files.length) { status.textContent = 'Choose a photo first.'; return; }
+              var fd = new FormData();
+              fd.append('category', 'product_photo');
+              fd.append('title', fileEl.files[0].name.replace(/\\.[^.]+$/, ''));
+              fd.append('description', document.getElementById('compose-photo-desc').value);
+              fd.append('file', fileEl.files[0]);
+              status.textContent = 'Uploading...';
+              fetch('/dashboard/documents?json=1', { method: 'POST', body: fd })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                  if (!data.ok) { status.textContent = data.error || 'The photo was not saved.'; return; }
+                  var d = data.document, list = document.getElementById('compose-docs');
+                  var none = list.querySelector('[data-no-docs]'); if (none) none.remove();
+                  var row = document.createElement('div');
+                  row.className = 'compose-file'; row.setAttribute('data-compose-doc', d.id);
+                  var label = document.createElement('label');
+                  label.style.cssText = 'display:flex;gap:8px;align-items:center;margin:0;flex:1';
+                  var cb = document.createElement('input');
+                  cb.type = 'checkbox'; cb.name = 'doc_ids'; cb.value = d.id; cb.checked = true; cb.style.width = 'auto';
+                  var span = document.createElement('span');
+                  span.textContent = d.title + (d.description ? ' - ' + d.description : '');
+                  label.appendChild(cb); label.appendChild(span); row.appendChild(label); list.appendChild(row);
+                  fileEl.value = ''; document.getElementById('compose-photo-desc').value = '';
+                  status.textContent = 'Photo saved on the Documents shelf and ticked.';
+                  form.dispatchEvent(new Event('input', { bubbles: true }));
+                })
+                .catch(function () { status.textContent = 'The photo was not saved.'; });
+              return;
+            }
             if (canned) {
               var text = canned.getAttribute('data-canned-text');
               var s = bodyEl.selectionStart, t = bodyEl.selectionEnd, v = bodyEl.value;
@@ -1742,7 +1811,7 @@ function register(router, requireAuth) {
     const c = db.getCustomer(req.params.id);
     if (!c) return res.status(404).send('Customer not found');
     const d = req.query.draft ? db.getEmailDraft(req.query.draft) : null;
-    const src = d && d.customer_id === c.id ? { to: d.to_address ?? undefined, subject: d.subject, body: d.body, file_ids: d.file_ids } : { file_ids: req.query.file_ids };
+    const src = d && d.customer_id === c.id ? { to: d.to_address ?? undefined, subject: d.subject, body: d.body, file_ids: d.file_ids, doc_ids: d.doc_ids } : { file_ids: req.query.file_ids, doc_ids: req.query.doc_ids };
     composePage(req, res, c, composeValues(c, src));
   });
 
@@ -1754,7 +1823,8 @@ function register(router, requireAuth) {
     if (!isValidEmail(v.to)) return again('Enter a valid To address. Nothing was sent.');
     if (!v.subject || !v.body.trim()) return again('The email needs a subject and a body. Nothing was sent.');
     const files = composeFiles(c, v.file_ids);
-    if (files.reduce((s, f) => s + (f.size || 0), 0) > MAX_PACKET_ATTACH_BYTES) return again('Those files are too big to email together. Nothing was sent.');
+    const docs = composeDocs(v.doc_ids);
+    if ([...files, ...docs].reduce((s, f) => s + (f.size || 0), 0) > MAX_PACKET_ATTACH_BYTES) return again('Those files are too big to email together. Nothing was sent.');
     // Confirm before send: the first Send shows the review; only "Yes, send"
     // on an unchanged email goes out.
     if (String(req.body.confirmed) !== '1' || req.body.reviewed !== composeHash(v)) {
@@ -1766,10 +1836,12 @@ function register(router, requireAuth) {
       if (!p) return again(`"${f.original_name}" is missing from storage. Nothing was sent.`);
       attachments.push({ filename: f.original_name, path: p });
     }
+    for (const d of docs) attachments.push({ filename: d.stored_name, path: db.documentPath(d) });
+    const lines = docLines(docs);
     const sent = await email.sendEmail({
       to: v.to,
       subject: v.subject,
-      html: `<p>${escapeHtml(v.body.trim()).replace(/\n/g, '<br>')}</p>`,
+      html: `<p>${escapeHtml(v.body.trim()).replace(/\n/g, '<br>')}</p>${lines.length ? `<p>${lines.map(escapeHtml).join('<br>')}</p>` : ''}`,
       customer_id: c.id,
       logMessage: db.logMessage,
       attachments,
@@ -1778,7 +1850,7 @@ function register(router, requireAuth) {
       const why = sent.reason === 'not_configured' ? "email isn't set up on this server" : sent.reason === 'no_email_address' ? 'no valid email address' : sent.error || 'send failed';
       return res.redirect(`/dashboard/customers/${c.id}?err=${encodeURIComponent(`The email was NOT sent (${why}). It is recorded in the communication history.`)}`);
     }
-    res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent(`Email sent to ${v.to}${files.length ? ` with ${files.length} attachment${files.length === 1 ? '' : 's'}` : ''}.`)}`);
+    res.redirect(`/dashboard/customers/${c.id}?ok=${encodeURIComponent(`Email sent to ${v.to}${attachments.length ? ` with ${attachments.length} attachment${attachments.length === 1 ? '' : 's'}` : ''}.`)}`);
   });
 
   router.post('/dashboard/customers/:id/message', requireAuth, async (req, res) => {
@@ -2742,6 +2814,9 @@ function register(router, requireAuth) {
     const date = todayDate(req.query.date);
     const t = db.todaySummary(date);
     const isToday = date === bosDayString();
+    // BF-2640-085: the heading and the title say Today, Tomorrow, or the date.
+    const isTomorrow = date === nextDateString(bosDayString());
+    const dayLabel = isToday ? 'Today' : isTomorrow ? 'Tomorrow' : fmtDate(`${date}T12:00:00.000Z`);
     const hidden = `<input type="hidden" name="date" value="${date}">`;
     const itemRow = (it, { unsorted } = {}) => `
       <li class="day-item${it.overdue ? ' overdue' : ''}${it.done ? ' done' : ''}" data-day-item="${it.id}"${it.overdue ? ' data-overdue="1"' : ''}>
@@ -2781,10 +2856,10 @@ function register(router, requireAuth) {
       </div>`;
     const body = `
       <style>.day-item.overdue .day-item-title,.day-item.overdue .day-item-due{color:#c62828;font-weight:600}.day-item.done .day-item-title{text-decoration:line-through;opacity:.6}.day-items,.routine-list{list-style:none;padding-left:0}.day-items li,.routine-list li{margin:6px 0}.routine-open{color:#c62828;font-weight:600}</style>
-      <h1>Today</h1>
+      <h1 data-day-heading>${escapeHtml(dayLabel)}</h1>
       <p class="subtitle">${escapeHtml(fmtDate(`${date}T12:00:00.000Z`))}${isToday ? '' : ` · <a href="/dashboard/today">Back to today</a>`}</p>
       <p class="subtitle">The BOS day runs until 5:00 AM Eastern, so after midnight this page still shows the day that just ended.</p>
-      <p><a class="btn small secondary" href="/dashboard/tomorrow" data-tomorrow>Tomorrow</a></p>
+      ${isTomorrow ? '' : `<p><a class="btn small secondary" href="/dashboard/today?date=${nextDateString(bosDayString())}" data-tomorrow>Tomorrow</a></p>`}
       ${t.morning_open ? `<p class="routine-open">Morning routine: ${t.morning_open} still open.</p>` : ''}
       ${t.evening_open ? `<p class="routine-open">Evening routine: ${t.evening_open} still open.</p>` : ''}
       <div class="panel" id="today-visits">
@@ -2821,29 +2896,181 @@ function register(router, requireAuth) {
       </div>
       ${routineBlock('morning', t.morning, t.morning_open)}
       ${routineBlock('evening', t.evening, t.evening_open)}`;
-    res.send(dashboardLayout({ title: 'Today', active: '/dashboard/today', body, flash: flashFromQuery(req.query) }));
+    res.send(dashboardLayout({ title: dayLabel, active: isTomorrow ? '/dashboard/tomorrow' : '/dashboard/today', body, flash: flashFromQuery(req.query) }));
   });
 
-  // FF-2640-015: tomorrow's visits, from the appointments BOS already stored.
-  // Tomorrow is the BOS day after today, on the same 5:00 AM Eastern boundary.
+  // BF-2640-085: Tomorrow is the day page for the next BOS day, not a separate
+  // list. The Menu's Tomorrow link and the Tomorrow button both land on
+  // /dashboard/today?date=<tomorrow>, which shows the visits BOS already stored
+  // for that date. A visit that exists only on the phone calendar is not in BOS.
   router.get('/dashboard/tomorrow', requireAuth, (req, res) => {
-    const date = nextDateString(bosDayString());
-    const visits = db.visitsOnDay(date);
-    const body = `
-      ${backLink('/dashboard/today', 'Back to Today')}
-      <h1>Tomorrow</h1>
-      <p class="subtitle">${escapeHtml(fmtDate(`${date}T12:00:00.000Z`))}. These are the visits already booked in BOS for tomorrow.</p>
-      <div class="panel" id="tomorrow-visits">
+    res.writeHead(302, { Location: `/dashboard/today?date=${nextDateString(bosDayString())}` });
+    res.end();
+  });
+
+  // ---------- FF-2640-022: company documents ----------
+  // One shelf for the company's own files: the warranty certificate, product
+  // pages, handwritten referrals, insurance, the business license, and product
+  // photos. Each document opens in the browser, and each can be ticked in the
+  // email box like a customer file.
+  router.get('/dashboard/documents', requireAuth, (req, res) => {
+    const docs = db.listDocuments();
+    const catOptions = (sel) =>
+      Object.entries(db.DOCUMENT_CATEGORIES)
+        .map(([k, label]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${escapeHtml(label)}</option>`)
+        .join('');
+    const docRow = (d) => `
+      <li data-document="${d.id}" style="margin:8px 0">
+        ${d.has_file ? `<a href="/dashboard/documents/${d.id}/file" target="_blank" rel="noopener" data-document-open>${escapeHtml(d.title)}</a>` : `<strong>${escapeHtml(d.title)}</strong> <span class="badge" data-document-missing>file not uploaded yet</span>`}
+        ${d.description ? `<div class="subtitle" style="margin:2px 0 0">${escapeHtml(d.description)}</div>` : ''}
         ${
-          visits.length
-            ? `<ul class="day-items" style="list-style:none;padding-left:0">${visits
-                .map((a) => `<li data-visit="${a.id}">${escapeHtml(fmtDateTime(a.scheduled_at))} · <a href="/dashboard/customers/${a.customer_id}">${escapeHtml(a.customer_name)}</a> · ${escapeHtml(a.type)}${a.customer_address ? ` · ${escapeHtml(a.customer_address)}` : ''}</li>`)
-                .join('')}</ul>`
-            : '<p class="subtitle">No visits booked for tomorrow.</p>'
+          d.has_file
+            ? ''
+            : `<form method="POST" action="/dashboard/documents/${d.id}/file" enctype="multipart/form-data" style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:4px">
+                <input type="file" name="file" required aria-label="File for ${escapeHtml(d.title)}">
+                <button class="btn small" type="submit">Upload the file</button>
+              </form>`
         }
-      </div>
-      <p><a class="btn small secondary" href="/dashboard/today?date=${date}">Open tomorrow's day page</a></p>`;
-    res.send(dashboardLayout({ title: 'Tomorrow', active: '/dashboard/tomorrow', body }));
+      </li>`;
+    const body = `
+      <h1>Documents</h1>
+      <p class="subtitle">The company's own files. Each one can be ticked in the email box on a customer.</p>
+      ${Object.entries(db.DOCUMENT_CATEGORIES)
+        .map(([k, label]) => {
+          const rows = docs.filter((d) => d.category === k);
+          return `<div class="panel" id="documents-${k}"><h2 style="margin-top:0">${escapeHtml(label)}</h2>${
+            rows.length ? `<ul style="list-style:none;padding-left:0">${rows.map(docRow).join('')}</ul>` : '<p class="subtitle">None yet.</p>'
+          }</div>`;
+        })
+        .join('')}
+      <div class="panel" id="documents-add">
+        <h2 style="margin-top:0">Add a document</h2>
+        <form method="POST" action="/dashboard/documents" enctype="multipart/form-data">
+          <div class="grid cols-2">
+            <div><label>Kind</label><select name="category" required>${catOptions('')}</select></div>
+            <div><label>Title</label><input type="text" name="title" placeholder="Warranty certificate"></div>
+            <div style="grid-column: span 2"><label>Description</label><input type="text" name="description"></div>
+            <div style="grid-column: span 2"><label>File</label><input type="file" name="file" required></div>
+          </div>
+          <div style="margin-top:10px"><button class="btn" type="submit">Add document</button></div>
+        </form>
+      </div>`;
+    res.send(dashboardLayout({ title: 'Documents', active: '/dashboard/documents', body, flash: flashFromQuery(req.query) }));
+  });
+
+  // Add a document. With json=1 (the product-photo upload in the email box) the
+  // answer is the new document as JSON, so the email page can tick it in place
+  // and the typed draft stays.
+  router.post('/dashboard/documents', requireAuth, (req, res) => {
+    const upload = (req.files || []).find((f) => f.fieldname === 'file');
+    const wantsJson = req.query.json === '1' || req.body.json === '1';
+    try {
+      const d = db.addDocument({
+        category: req.body.category,
+        title: req.body.title,
+        description: req.body.description,
+        filename: upload && upload.filename,
+        mime_type: upload && upload.mimeType,
+        data: upload && upload.data,
+        created_by: actorOf(req),
+      });
+      if (wantsJson) return res.json({ ok: true, document: { id: d.id, title: d.title, description: d.description || '', category: d.category } });
+      res.redirect(`/dashboard/documents?ok=${encodeURIComponent(`${d.title} added`)}#documents-${d.category}`);
+    } catch (e) {
+      if (wantsJson) return res.status(400).json({ ok: false, error: e.message });
+      res.redirect(`/dashboard/documents?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+
+  router.post('/dashboard/documents/:id/file', requireAuth, (req, res) => {
+    const upload = (req.files || []).find((f) => f.fieldname === 'file');
+    try {
+      const d = db.setDocumentFile(req.params.id, { filename: upload && upload.filename, mime_type: upload && upload.mimeType, data: upload && upload.data });
+      res.redirect(`/dashboard/documents?ok=${encodeURIComponent(`${d.title} uploaded`)}#documents-${d.category}`);
+    } catch (e) {
+      res.redirect(`/dashboard/documents?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+
+  router.get('/dashboard/documents/:id/file', requireAuth, (req, res) => {
+    const d = db.getDocument(req.params.id);
+    if (!d || !d.has_file) return res.status(404).send('Document not found');
+    res.writeHead(200, {
+      'Content-Type': d.mime_type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${String(d.stored_name).replace(/"/g, '')}"`,
+    });
+    fs.createReadStream(db.documentPath(d)).pipe(res);
+  });
+
+  // ---------- FF-2640-023: the personal vault ----------
+  // Logins for the signed-in user only. Passwords are shown hidden until Show
+  // is pressed. The vault is not in search, Foreman cannot read it, and it is
+  // never written to GitHub; the rows live only in the database.
+  const vaultUser = (req) => db.ensureUser(req.authUser || db.defaultUsername());
+  const vaultForm = (r) => `
+    <div class="grid cols-2">
+      <div><label>Site name</label><input type="text" name="site_name" value="${escapeHtml((r && r.site_name) || '')}" required></div>
+      <div><label>URL</label><input type="url" name="url" value="${escapeHtml((r && r.url) || '')}"></div>
+      <div><label>Username</label><input type="text" name="username" value="${escapeHtml((r && r.username) || '')}" autocomplete="off"></div>
+      <div><label>Email</label><input type="email" name="email" value="${escapeHtml((r && r.email) || '')}" autocomplete="off"></div>
+      <div><label>Password</label><input type="password" name="password" value="${escapeHtml((r && r.password) || '')}" autocomplete="new-password"></div>
+      <div><label>Note</label><input type="text" name="note" value="${escapeHtml((r && r.note) || '')}" autocomplete="off"></div>
+    </div>`;
+  router.get('/dashboard/vault', requireAuth, (req, res) => {
+    const rows = db.listVaultLogins(vaultUser(req));
+    const body = `
+      <h1>Vault</h1>
+      <p class="subtitle">Your logins. Only you can see this page. The vault is not in search, Foreman cannot read it, and it is never put in GitHub.</p>
+      ${rows
+        .map(
+          (r) => `
+        <details class="panel" data-vault-row="${r.id}">
+          <summary><strong>${escapeHtml(r.site_name)}</strong>${r.url ? ` · <a href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(r.url)}</a>` : ''}${r.username ? ` · ${escapeHtml(r.username)}` : ''}</summary>
+          <form method="POST" action="/dashboard/vault/${r.id}" style="margin-top:10px">
+            ${vaultForm(r)}
+            <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn" type="submit">Save</button>
+              <button class="btn secondary" type="button" data-vault-show>Show password</button>
+            </div>
+          </form>
+        </details>`
+        )
+        .join('')}
+      <details class="panel" id="vault-new"${rows.length ? '' : ' open'}>
+        <summary>Add a login</summary>
+        <form method="POST" action="/dashboard/vault" style="margin-top:10px">
+          ${vaultForm(null)}
+          <div style="margin-top:10px"><button class="btn" type="submit">Add login</button></div>
+        </form>
+      </details>
+      <script>
+        document.addEventListener('click', function (e) {
+          var b = e.target.closest('[data-vault-show]');
+          if (!b) return;
+          var input = b.closest('form').querySelector('input[name="password"]');
+          var show = input.type === 'password';
+          input.type = show ? 'text' : 'password';
+          b.textContent = show ? 'Hide password' : 'Show password';
+        });
+      </script>`;
+    res.send(dashboardLayout({ title: 'Vault', active: '/dashboard/vault', body, flash: flashFromQuery(req.query) }));
+  });
+  router.post('/dashboard/vault', requireAuth, (req, res) => {
+    try {
+      db.addVaultLogin(vaultUser(req), req.body);
+      res.redirect('/dashboard/vault?ok=Login added');
+    } catch (e) {
+      res.redirect(`/dashboard/vault?err=${encodeURIComponent(e.message)}`);
+    }
+  });
+  router.post('/dashboard/vault/:id', requireAuth, (req, res) => {
+    try {
+      const r = db.updateVaultLogin(vaultUser(req), req.params.id, req.body);
+      if (!r) return res.status(404).send('Login not found');
+      res.redirect('/dashboard/vault?ok=Saved');
+    } catch (e) {
+      res.redirect(`/dashboard/vault?err=${encodeURIComponent(e.message)}`);
+    }
   });
 
   // FF-2640-020: the grocery list, the project list, and the vehicle list. Andrew

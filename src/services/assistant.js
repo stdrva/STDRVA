@@ -783,6 +783,7 @@ const BASE_TOOLS = [
         subject: { type: 'string' },
         body: { type: 'string' },
         file_ids: { type: 'array', items: { type: 'string' }, description: "Ids of files already on this customer to attach" },
+        doc_ids: { type: 'array', items: { type: 'string' }, description: 'FF-2640-022: ids of company documents on the Documents shelf to attach (from list_documents)' },
       },
       required: ['customer_id'],
     },
@@ -840,6 +841,12 @@ const BASE_TOOLS = [
       },
       required: ['routine', 'title'],
     },
+  },
+  {
+    name: 'list_documents',
+    description:
+      "FF-2640-022: list the company documents on the Documents shelf (warranty certificate, product pages, handwritten referrals, insurance, business license, product photos) with their ids and descriptions. Pass a document id in fill_email_compose doc_ids to tick it in the email box; Andrew still confirms before send. Read only.",
+    input_schema: { type: 'object', properties: { category: { type: 'string' } } },
   },
   {
     name: 'save_raw_note',
@@ -937,6 +944,7 @@ const READ_ONLY_TOOLS = new Set([
   'get_record',
   'list_records_by_category',
   'read_today',
+  'list_documents',
 ]);
 
 // ---------- Tool execution - thin wrappers around db.js ----------
@@ -1574,13 +1582,14 @@ function runTool(name, input, ctx = {}) {
         subject: input.subject || null,
         body: input.body || null,
         file_ids: asked,
+        doc_ids: [].concat(input.doc_ids || []).map(String),
         created_by: ctx.username || 'assistant',
       });
       return {
         ok: true,
         __navigate: `/dashboard/customers/${c.id}/email?draft=${draft.id}`,
         customer_id: c.id,
-        filled: { to: draft.to_address, subject: draft.subject, body: draft.body, file_ids: draft.file_ids },
+        filled: { to: draft.to_address, subject: draft.subject, body: draft.body, file_ids: draft.file_ids, doc_ids: draft.doc_ids },
         skipped_file_ids: skipped,
         note: 'The compose window is open and filled. Nothing was sent. Andrew reviews it, presses Send, and confirms before it goes out.',
       };
@@ -1646,6 +1655,10 @@ function runTool(name, input, ctx = {}) {
       if (input.confirmed !== true) return { error: 'Not added yet - read this back to Andrew and wait for his yes, then call again with confirmed:true.', readback };
       const r = db.addRoutineItem({ routine: input.routine, title, created_by: `foreman:${ctx.username || db.defaultUsername()}` });
       return { ok: true, item_id: r.id, readback };
+    }
+    case 'list_documents': {
+      const docs = db.listDocuments(input.category ? { category: input.category } : {});
+      return { documents: docs.map((d) => ({ doc_id: d.id, category: d.category, title: d.title, description: d.description, has_file: d.has_file })) };
     }
     case 'save_raw_note': {
       const note = db.createForemanNote({ body: input.body, created_by: ctx.username || db.defaultUsername() });

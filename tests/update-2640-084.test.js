@@ -145,20 +145,21 @@ test('FF-2640-015 FF-2640-016 FF-2640-020: Menu contains Contacts and Tomorrow, 
   assert.match(sheet, /<a href="\/dashboard\/today">Today<\/a>/);
   assert.match(sheet, /<a href="\/dashboard\/lists">Lists<\/a>/);
   assert.ok(!/>Desk</.test(sheet));
-  assert.match(sheet, /BOS 1\.8\.4/);
+  assert.ok(sheet.includes(`BOS ${require('../package.json').version}`), 'the Menu reads the version in package.json');
 });
 
 // ================================================================ FF-2640-015
-test('FF-2640-015: Today has a Tomorrow button, and Tomorrow lists the visits BOS already stored for tomorrow', async () => {
-  const today = await (await srv.get('/dashboard/today')).text();
-  assert.match(today, /href="\/dashboard\/tomorrow" data-tomorrow>Tomorrow</);
+// BF-2640-085 replaced the separate Tomorrow list with the day page for tomorrow.
+test('FF-2640-015: Today has a Tomorrow button that opens the day page for tomorrow with the visits BOS already stored', async () => {
   const tomorrow = nextDateString(bosDayString());
+  const today = await (await srv.get('/dashboard/today')).text();
+  assert.match(today, new RegExp(`href="/dashboard/today\\?date=${tomorrow}" data-tomorrow>Tomorrow<`));
   const c = db.createCustomer({ name: 'Tomorrow Visit Person', phone: '+18045550844' });
   db.createAppointment({ customer_id: c.id, type: 'Consultation', scheduled_at: `${tomorrow}T15:00:00.000Z` });
   const other = db.createCustomer({ name: 'Today Only Person', phone: '+18045550845' });
   db.createAppointment({ customer_id: other.id, type: 'Consultation', scheduled_at: `${bosDayString()}T15:00:00.000Z` });
-  const html = await (await srv.get('/dashboard/tomorrow')).text();
-  const panel = html.slice(html.indexOf('id="tomorrow-visits"'));
+  const html = await (await srv.get(`/dashboard/today?date=${tomorrow}`)).text();
+  const panel = html.slice(html.indexOf('id="today-visits"'), html.indexOf('id="today-items"'));
   assert.match(panel, /Tomorrow Visit Person/);
   assert.ok(!/Today Only Person/.test(panel));
 });
@@ -219,8 +220,10 @@ test('FF-2640-017: BOS renames, copies, moves, and soft-deletes a file without o
 
   const copyRes = await srv.post(`/dashboard/customers/${c.id}/files/${a.id}/copy`);
   assert.equal(copyRes.status, 302);
-  const copies = db.listCustomerFiles(c.id).filter((f) => f.id !== a.id && /^b \(\d\)\.pdf$/.test(f.original_name));
+  // FF-2640-021: a copy is a new file, so it gets a readable name.
+  const copies = db.listCustomerFiles(c.id).filter((f) => f.note === 'Copy of "b (2).pdf"');
   assert.equal(copies.length, 1);
+  assert.equal(copies[0].original_name, `b-2-${db.yearWeekTag()}.pdf`);
   assert.notEqual(copies[0].original_name, db.getCustomerFile(a.id).original_name);
   assert.ok(fs.existsSync(db.fileBytesPath(copies[0])), 'the copy has its own bytes on disk');
 
@@ -245,7 +248,8 @@ test('FF-2640-017: Foreman renames, copies, and soft-deletes a file only after A
   assert.equal(db.listCustomerFiles(c.id).length, 1);
   const copy = await assistant.runTool('copy_file', { file_id: f.id, confirmed: true }, {});
   assert.equal(copy.ok, true);
-  assert.equal(copy.name, 'final quote (2).pdf');
+  assert.equal(copy.name, `final-quote-${db.yearWeekTag()}.pdf`, 'a copy is a new file with a readable name');
+  assert.notEqual(copy.name, 'final quote.pdf');
 
   const noDelete = await assistant.runTool('delete_file', { file_id: f.id }, {});
   assert.ok(noDelete.error);
