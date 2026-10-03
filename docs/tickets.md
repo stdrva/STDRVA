@@ -1,6 +1,6 @@
 docs/tickets.md
 
-Format: BF-YYWW-NNN for bugs and FF-YYWW-NNN for features. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Features use FF- names. Bugs use BF- names. Next unused BF- name: BF-2640-086. Next unused FF- name: FF-2640-025.
+Format: BF-YYWW-NNN for bugs and FF-YYWW-NNN for features. Year then ISO week of the Eastern report day. The last three digits only go up. Never reuse. Never use 001 again. Features use FF- names. Bugs use BF- names. Next unused BF- name: BF-2640-086. Next unused FF- name: FF-2640-026. Do not reuse BF-2640-073.
 
 Lessons are L1 L2 L3 L4. Old FF-3926-* names in CHANGELOG.md are history.
 
@@ -13,6 +13,14 @@ Open
 BF-2640-073 Retired. This was an Architect checklist problem. This is not a BOS job. Do not reuse this name.
 
 BF-2640-074 Handbook. We want start.md and docs/tickets.md on GitHub. Claude Code copies the Architect exact files. Claude Code does not rewrite them.
+
+Finished in BOS 1.8.6
+
+FF-2640-025 is committed and pushed to main in BOS 1.8.6. Live BOS gets it after Andrew runs Manual Deploy of main on Render.
+
+FF-2640-025 Five questions on the two design consultations. Now the five optional questions sit on Callback by Owner and More Info by Email, and the booked page asks them after any appointment. Short Design Consultation does not ask them on the booking page. We do not want that. Short Design Consultation and Long Design Consultation show the five questions on the booking page, before the visit is booked. The questions stay optional. The same five questions are the five-question form. That form is not a person. Callback by Owner does not show that form. More Info by Email does not show that form. Design Review does not show that form. Repair or Warranty does not show that form. No other visit type shows that form. The booked page does not ask the five questions again.
+
+The five questions are the questions BOS already asks. Question 1 asks where the customer wants a change, and the choices are Kitchen, Bathroom(s), Garage, Shop, Studio, Commercial, Hidden kick-panel, and Closet. Question 2 asks if the customer has pets, and a yes asks if a treat is ok and asks the pet name and breed. Question 3 asks if the customer has had pull-out shelves before, and a yes asks what they liked and what they did not like. Question 4 asks which products to show, using the product list BOS already has. Question 5 asks if there is anything else Andrew should know. Claude Code does not invent new questions.
 
 Finished in BOS 1.8.5
 
@@ -88,7 +96,7 @@ Finished in BOS 1.8.1
 
 BF-2639-049, BF-2639-050, BF-2639-051, BF-2639-053, BF-2639-054, BF-2639-055, BF-2639-056, BF-2639-058, BF-2639-060, BF-2639-064, BF-2639-065, BF-2639-066, BF-2639-067, BF-2639-068, BF-2639-069. History names also shipped: FF-3926-003, FF-3926-004, FF-3926-012, FF-3926-013, FF-3926-014.
 
-BF-2639-051 is the five-question form on Callback by Owner and More Info by Email only.
+BF-2639-051 was the old placement of the five-question form, on Callback by Owner and More Info by Email. FF-2640-025 is the placement Andrew locked on October 3, 2026: Short Design Consultation and Long Design Consultation show the five questions on the booking page, before the visit is booked, and no other visit type shows the form.
 
 Finished in BOS 1.8.0
 

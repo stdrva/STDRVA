@@ -255,23 +255,21 @@ test('BF-2639-050: Callback and More Info pages have #step-contact on the reques
 });
 
 // ================================================================ BF-2639-051
-test('BF-2639-051: request pages show the five questions; /book/booked hides them only when THIS appointment has answers', async () => {
+// FF-2640-025 replaced the BF-2639-051 placement: the request pages and the
+// booked page no longer show the five questions (see tests/ff-2640-025.test.js).
+test('BF-2639-051: replaced by FF-2640-025 - request pages and the booked page do not show the five questions', async () => {
   for (const t of ['Callback+by+Owner', 'More+Info+by+Email']) {
     const html = await (await srv.get(`/book?type=${t}`)).text();
-    assert.match(html, /class="wizard"/);
-    assert.match(html, /Question <span id="wq-num">1<\/span> of 5/);
-    assert.ok(!/action="\/book\/request"[^>]*data-autosave/.test(html), 'request form never autosaves');
+    assert.ok(!/class="wizard"/.test(html), t);
+    assert.match(html, /action="\/book\/request"/, 'the request form is still there');
   }
   const c = db.createCustomer({ name: 'Old Pets Note', phone: '+18045550151', notes: 'Pets: yes (Rex), treat OK: Yes' });
   const appt = db.createAppointment({ customer_id: c.id, type: 'Short Design Consultation', scheduled_at: new Date(Date.now() + 86400000).toISOString() });
-  let html = await (await srv.get(`/book/booked?appt=${appt.id}`)).text();
-  assert.match(html, /class="wizard"/, 'an old customer note mentioning Pets: does not hide it');
-
-  db.updateAppointment(appt.id, { notes: '[Discovery]\nRooms: Kitchen' }, { actor: 'test' });
-  html = await (await srv.get(`/book/booked?appt=${appt.id}`)).text();
-  assert.ok(!/class="wizard"/.test(html), 'this appointment already has answers -> omitted');
+  const html = await (await srv.get(`/book/booked?appt=${appt.id}`)).text();
+  assert.ok(!/class="wizard"/.test(html), 'the booked page does not ask again');
 });
 
+// A request form cached before FF-2640-025 can still send answers, and they are kept.
 test('BF-2639-051: a request with wizard answers files the question and the answers on one lead', async () => {
   const r = await srv.post('/book/request', {
     type: 'Callback by Owner', name: 'Wizard Request', phone: '8045550152', question: 'How much for 4 shelves?',

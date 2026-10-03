@@ -1,6 +1,6 @@
 {
   "name": "s2d-crm",
-  "version": "1.8.5",
+  "version": "1.8.6",
   "description": "Shelves to Drawers RVA - The BOS: funnel, texting, self-serve booking, job status tracking, basic finances. Pure Node.js core modules, with a single exception: nodemailer for Gmail SMTP.",
   "main": "src/server.js",
   "type": "commonjs",

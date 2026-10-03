@@ -315,7 +315,14 @@ const PUBLIC_TYPE_ORDER = [...db.APPT_TYPES.filter((t) => !db.INTERNAL_APPT_TYPE
 // A hand-typed ?type=Measure (or Install) must not open a public booking for an internal type.
 const publicType = (t) => (db.INTERNAL_APPT_TYPES.includes(t) ? PUBLIC_TYPE_ORDER[0] : t || PUBLIC_TYPE_ORDER[0]);
 
-// ---------- 5-question discovery wizard (asked on every booking / request form) ----------
+// ---------- The five-question form ----------
+// FF-2640-025: Andrew locked the placement on October 3, 2026. Only Short Design
+// Consultation and Long Design Consultation show the five questions, on the
+// confirm page, before the visit is booked. The questions stay optional.
+// Callback by Owner, More Info by Email, Design Review, Repair or Warranty, and
+// every other type do not show the form, and the booked page does not ask the
+// questions again. (BF-2639-051 was the old placement on the two request types.)
+const FIVE_QUESTION_TYPES = ['Short Design Consultation', 'Long Design Consultation'];
 const ROOM_OPTIONS = ['Kitchen', 'Bathroom(s)', 'Garage', 'Shop', 'Studio', 'Commercial', 'Hidden kick-panel', 'Closet'];
 
 const PRODUCT_LIST = [
@@ -343,7 +350,9 @@ const PRODUCT_LIST = [
   'Not sure yet - show me what you recommend',
 ];
 
-function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
+// embedded: the questions sit inside another form (the confirm page), so they
+// get Back and Next only; that form's own button sends the answers.
+function discoveryWizard(summaryHtml, skipLabel, submitLabel, { embedded = false } = {}) {
   return `
     <div class="wizard">
       ${summaryHtml ? `<div class="wizard-summary">${summaryHtml}</div>` : ''}
@@ -407,11 +416,15 @@ function discoveryWizard(summaryHtml, skipLabel, submitLabel) {
       <div class="wizard-nav">
         <button type="button" class="btn secondary" id="wq-back" onclick="wqNav(-1)" hidden>Back</button>
         <button type="button" class="btn" id="wq-next" onclick="wqNav(1)">Next</button>
-        <button type="submit" class="btn" id="wq-submit" hidden>${escapeHtml(submitLabel || 'Submit')}</button>
+        ${embedded ? '' : `<button type="submit" class="btn" id="wq-submit" hidden>${escapeHtml(submitLabel || 'Submit')}</button>`}
       </div>
-      <div class="wizard-skip">
+      ${
+        embedded
+          ? ''
+          : `<div class="wizard-skip">
         <button type="submit" class="btn-link">${escapeHtml(skipLabel || 'Skip all of this and continue')}</button>
-      </div>
+      </div>`
+      }
     </div>
     <script>
       (function() {
@@ -802,9 +815,8 @@ function register(router) {
             <label>Name *</label><input type="text" name="name" autocomplete="name" required>
             <label>Phone *</label><input type="tel" name="phone" autocomplete="tel" inputmode="tel" required placeholder="(804) 555-0100">
             <label>Email</label><input type="email" name="email" autocomplete="email" inputmode="email">
-            <!-- BF-2639-051: request types get the same five questions. -->
-            <h3>A few quick details (optional)</h3>
-            ${discoveryWizard('', 'Skip these and send my request', type === 'Callback by Owner' ? 'Request a callback' : 'Submit request')}
+            <!-- FF-2640-025: request types do not show the five-question form. -->
+            <div style="margin-top:14px"><button class="btn" type="submit">${type === 'Callback by Owner' ? 'Request a callback' : 'Submit request'}</button></div>
           </form>
         </div>
       `;
@@ -969,6 +981,15 @@ function register(router) {
           </details>
           <!-- Controls inside a closed <details> still submit, so no hidden
                duplicates are needed - and an edit here always wins (spec 7). -->
+          ${
+            FIVE_QUESTION_TYPES.includes(type)
+              ? `<div class="five-questions" data-five-questions>
+            <h3>A few quick details (optional)</h3>
+            <p class="subtitle" style="margin-top:0">This helps Andrew bring the right samples. Every question is optional; you can confirm without answering.</p>
+            ${discoveryWizard('', '', '', { embedded: true })}
+          </div>`
+              : ''
+          }
           <div style="margin-top:16px"><button class="btn btn-confirm" type="submit">Confirm Appointment</button></div>
           <p class="subtitle" style="margin-top:10px"><a href="/book?${backQS}">&larr; pick a different time</a></p>
         </form>
@@ -1035,6 +1056,10 @@ function register(router) {
       );
     }
 
+    // FF-2640-025: answers to the five questions, given on the confirm page
+    // before booking, go on the appointment and the customer.
+    if (FIVE_QUESTION_TYPES.includes(type)) saveDiscovery(result.appt.id, body);
+
     // Post-Redirect-Get so a refresh on the success page doesn't resubmit.
     return res.redirect(`/book/booked?appt=${encodeURIComponent(result.appt.id)}`);
   }
@@ -1052,9 +1077,7 @@ function register(router) {
     const customer = db.getCustomer(appt.customer_id);
     const when = new Date(appt.scheduled_at);
     const addr = parseAddress(customer && customer.address);
-    // BF-2639-051: hide the questions only when THIS appointment already has
-    // answers - never because an older note on the customer mentions pets/rooms.
-    const discoveryDone = (appt.notes || '').includes(DISCOVERY_MARKER) || /Rooms:|Interested in:|Pets:/.test(appt.notes || '');
+    // FF-2640-025: the booked page does not ask the five questions again.
 
     const body = `
       <div class="public-hero">
@@ -1068,44 +1091,37 @@ function register(router) {
       <div class="panel">
         <p>We've sent a confirmation${customer && customer.phone ? ' text' : ''}${customer && customer.phone && customer.email ? ' and' : ''}${customer && customer.email ? ' email' : ''}, and we'll remind you before your appointment.</p>
       </div>
-      ${
-        discoveryDone
-          ? ''
-          : `<div class="panel">
-        <h3 style="margin-top:0">A few quick details (optional)</h3>
-        <p class="subtitle" style="margin-top:0">This helps Andrew bring the right samples. You can skip it — your appointment is already set.</p>
-        <form method="POST" action="/book/discovery" data-autosave>
-          <input type="hidden" name="appt" value="${escapeHtml(appt.id)}">
-          ${discoveryWizard('', "Skip — I'm all set", 'Finished')}
-        </form>
-      </div>`
-      }
     `;
     return res.send(publicLayout({ title: 'Booked', body }));
   });
 
+  // Writes the five answers onto the appointment and the customer. Nothing is
+  // written when every question was skipped.
+  function saveDiscovery(apptId, body) {
+    const appt = db.getAppointment(apptId);
+    const { notesWithDiscovery } = discoveryFromBody(body || {});
+    if (!appt || !notesWithDiscovery) return;
+    try {
+      db.updateAppointment(appt.id, { notes: upsertDiscoverySection(appt.notes, notesWithDiscovery) }, { actor: 'public' });
+    } catch (e) {
+      console.error('discovery updateAppointment failed', e);
+    }
+    const customer = db.getCustomer(appt.customer_id);
+    if (customer) {
+      db.updateCustomer(
+        customer.id,
+        { name: customer.name, phone: customer.phone, email: customer.email, address: customer.address, notes: upsertDiscoverySection(customer.notes, notesWithDiscovery) },
+        { actor: 'public' }
+      );
+    }
+  }
+
+  // Kept so a booked page cached before FF-2640-025 can still send its answers.
   router.post('/book/discovery', (req, res) => {
     const isFetch = req.headers['x-requested-with'] === 'fetch';
     const appt = req.body.appt ? db.getAppointment(req.body.appt) : null;
     if (!appt) return isFetch ? res.status(400).json({ error: 'Appointment not found' }) : res.redirect('/book');
-    const { notesWithDiscovery } = discoveryFromBody(req.body);
-    if (notesWithDiscovery) {
-      const apptNotes = upsertDiscoverySection(appt.notes, notesWithDiscovery);
-      try {
-        db.updateAppointment(appt.id, { notes: apptNotes }, { actor: 'public' });
-      } catch (e) {
-        console.error('discovery updateAppointment failed', e);
-      }
-      const customer = db.getCustomer(appt.customer_id);
-      if (customer) {
-        const custNotes = upsertDiscoverySection(customer.notes, notesWithDiscovery);
-        db.updateCustomer(
-          customer.id,
-          { name: customer.name, phone: customer.phone, email: customer.email, address: customer.address, notes: custNotes },
-          { actor: 'public' }
-        );
-      }
-    }
+    saveDiscovery(appt.id, req.body);
     // A background save-on-Next (spec C6) just needs an ack - it must not
     // navigate the customer away from the wizard they're still filling out.
     if (isFetch) return res.json({ ok: true });
@@ -1373,4 +1389,5 @@ module.exports = {
   bookingContact,
   upsertDiscoverySection,
   discoveryFromBody,
+  FIVE_QUESTION_TYPES,
 };

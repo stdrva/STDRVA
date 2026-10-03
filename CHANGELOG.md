@@ -7,6 +7,12 @@ below that carry a `-beta.N` suffix predate that decision.
 
 ## Unreleased
 
+## 1.8.6 (2026-10-03) — Five questions on the two design consultations
+
+The Menu now reads BOS 1.8.6. No Twilio settings changed in this release. Tests: `tests/ff-2640-025.test.js`, plus an update to the BF-2639-051 test in `tests/update-181.test.js`, because FF-2640-025 replaces that placement.
+
+- **FF-2640-025 Five questions on the two design consultations.** Before this release, the five optional questions sat on Callback by Owner and More Info by Email, and the booked page asked them after any appointment, while Short Design Consultation did not ask them on the booking page. Now Short Design Consultation and Long Design Consultation show the five questions on the confirm page of the booking flow, before the visit is booked. The questions stay optional, and Confirm Appointment books the visit with or without answers. Answers go on the appointment and on the customer, the same place they went before. Callback by Owner, More Info by Email, Design Review, Repair or Warranty, and every other visit type do not show the form. The booked page does not ask the five questions again. The questions are the five BOS already asked, with the same choices; no question was added or changed. Andrew locked this placement on October 3, 2026, and it replaces the BF-2639-051 placement. An old booked page or request form that a browser cached before this release can still send its answers, and BOS keeps them.
+
 ## 1.8.5 (2026-10-02) — Tomorrow day page, Today on the phone bar, one file name, Documents, Vault
 
 The Menu now reads BOS 1.8.5. No Twilio settings changed in this release. Tests: `tests/update-2640-085.test.js`, plus updates to older tests where these tickets changed what they checked. `tests/helpers.js` now gives each test file its own throwaway folder and removes it afterward.
