@@ -2977,6 +2977,23 @@ CREATE TABLE IF NOT EXISTS company_documents (
     nowIso()
   );
 })();
+// The warranty certificate Andrew gave on October 3, 2026. The PDF is kept in
+// the repo at assets/documents/ and is put on the shelf, byte for byte, the
+// first time BOS starts without a warranty row. BOS never makes its own
+// certificate.
+const WARRANTY_PDF = path.join(__dirname, '..', 'assets', 'documents', 'Shelves-to-Drawers-RVA-Warranty.pdf');
+function seedWarrantyCertificate() {
+  const n = db.prepare(`SELECT COUNT(*) AS n FROM company_documents WHERE category = 'warranty'`).get().n;
+  if (n || !fs.existsSync(WARRANTY_PDF)) return;
+  addDocument({
+    category: 'warranty',
+    title: 'Warranty certificate',
+    filename: path.basename(WARRANTY_PDF),
+    mime_type: 'application/pdf',
+    data: fs.readFileSync(WARRANTY_PDF),
+    created_by: 'seed',
+  });
+}
 function documentsDir() {
   return path.join(UPLOADS_DIR, DOCUMENTS_FOLDER);
 }
@@ -3029,6 +3046,7 @@ function setDocumentFile(id, { filename, mime_type, data }) {
 function warrantyCertificate() {
   return listDocuments({ category: 'warranty' }).filter((d) => d.has_file).pop() || null;
 }
+seedWarrantyCertificate();
 
 // ---- FF-2640-023: the personal vault. Logins for Andrew only: each row has
 // the site name, the URL, the username, the email, the password, and a note.

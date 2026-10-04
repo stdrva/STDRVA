@@ -7,6 +7,8 @@ below that carry a `-beta.N` suffix predate that decision.
 
 ## Unreleased
 
+- **FF-2640-022 Warranty certificate.** The warranty certificate PDF Andrew gave on October 3, 2026 is now in the repo at `assets/documents/Shelves-to-Drawers-RVA-Warranty.pdf`, byte for byte. The first time BOS starts without a warranty row, BOS puts that file on the Documents shelf as the Warranty certificate, so Warranty in the email box attaches it. BOS did not make a new certificate. A new `.gitattributes` file tells git to store PDFs byte for byte.
+
 ## 1.8.6 (2026-10-03) — Five questions on the two design consultations
 
 The Menu now reads BOS 1.8.6. No Twilio settings changed in this release. Tests: `tests/ff-2640-025.test.js`, plus an update to the BF-2639-051 test in `tests/update-181.test.js`, because FF-2640-025 replaces that placement.

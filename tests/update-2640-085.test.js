@@ -191,7 +191,8 @@ test('FF-2640-022: Warranty attaches the warranty certificate, a product photo u
   await srv.post(`/dashboard/customers/${c.id}/email/send`, { ...form, confirmed: '1', reviewed: hash });
   const [m] = db.listMessagesForCustomer(c.id);
   assert.ok(m, 'recorded after the confirm');
-  assert.match(m.body, /\[Attachments: [^\]]*warranty-certificate-\d{4}\.pdf/);
+  // The real certificate on the shelf already holds the plain name, so this test copy may be "(2)".
+  assert.match(m.body, /\[Attachments: [^\]]*warranty-certificate-\d{4}( \(\d+\))?\.pdf/);
   assert.match(m.body, /\[Attachments: [^\]]*walnut-drawer-\d{4}\.png/);
   assert.match(m.body, /Walnut drawer with soft-close slides/);
 });
@@ -206,6 +207,20 @@ test('FF-2640-022: Foreman can tick a shelf document in the email box, and Andre
   const page = await (await srv.get(out.__navigate)).text();
   assert.match(page, new RegExp(`name="doc_ids" value="${doc.id}"[^>]* checked`));
   assert.equal(db.listMessagesForCustomer(c.id).length, 0, 'Foreman sends nothing');
+});
+
+test('FF-2640-022: the warranty certificate Andrew gave is on the Documents shelf byte for byte, and Documents opens it', async () => {
+  const pdfPath = path.join(__dirname, '..', 'assets', 'documents', 'Shelves-to-Drawers-RVA-Warranty.pdf');
+  const original = fs.readFileSync(pdfPath);
+  assert.equal(original.subarray(0, 5).toString(), '%PDF-');
+  const seeded = db.listDocuments({ category: 'warranty' }).find((d) => d.created_by === 'seed');
+  assert.ok(seeded && seeded.has_file, 'BOS put the warranty certificate on the shelf on its first start');
+  assert.equal(seeded.title, 'Warranty certificate');
+  assert.ok(fs.readFileSync(db.documentPath(seeded)).equals(original), 'the shelf copy is the same file, not a new certificate');
+  const res = await srv.get(`/dashboard/documents/${seeded.id}/file`);
+  assert.equal(res.status, 200);
+  assert.ok(Buffer.from(await res.arrayBuffer()).equals(original), 'Documents opens that file');
+  assert.equal(db.listDocuments({ category: 'warranty' }).filter((d) => d.created_by === 'seed').length, 1, 'placed once');
 });
 
 // ================================================================ FF-2640-023
